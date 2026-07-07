@@ -13,12 +13,27 @@ deleted, and deletion would also destroy the evidence. The question is:
      reproducible from the audit trail alone."
 
 Definition of "touched" (deliberately broad, documented, testable):
-a memory is tainted by actor X if ANY event in its custody chain names
-X as actor_id. Not just STORED — a poisoned source that REINFORCED a
-legitimate memory inflated its confidence, and that inflation is part
-of the incident. Analysts can REHABILITATE false positives; the
-rehabilitation is itself an audited custody event. Over-flagging with
-an audited reversal path is recoverable; under-flagging is not.
+a memory is tainted by actor X if any event in its custody chain names
+X as actor_id — EXCEPT CONTRADICTED_BY. Not just STORED — a poisoned
+source that REINFORCED a legitimate memory inflated its confidence,
+and that inflation is part of the incident. Analysts can REHABILITATE
+false positives; the rehabilitation is itself an audited custody
+event. Over-flagging with an audited reversal path is recoverable;
+under-flagging is not.
+
+The CONTRADICTED_BY carve-out is an explicit architecture decision,
+not a softening. When X stores a memory that contradicts memory V, the
+contradiction event lands on V's chain with X as its author — the one
+event type through which an actor writes its identity onto an
+ARBITRARY victim's chain. Counting it as "touched" hands an attacker a
+lever: contradict every truth you want suppressed, and the day you are
+quarantined, the sweep silences your victims for you — a validated
+truth silenced by an unverified claim, the exact outcome the rescue
+rule exists to refuse. Taint tracks INFLUENCE (events that created a
+memory or raised its standing); being attacked by X is not influence
+by X. The attacker's own contradicting memory is still flagged through
+its STORED event, and the victim's chain still carries the
+CONTRADICTED_BY evidence for any auditor to see.
 
 Determinism: the flagged set is derived from the custody_chain table by
 one SQL query with a total ORDER BY; the sweep seals
@@ -82,7 +97,9 @@ def quarantine_actor(
          sweep for the same incident would double-write custody events
          and split the evidence across two sweep ids).
       2. SELECT DISTINCT memory_id FROM custody_chain WHERE actor_id = X
-         ORDER BY memory_id — the deterministic flagged set.
+         AND event_type != 'CONTRADICTED_BY' ORDER BY memory_id — the
+         deterministic flagged set (see the module header for why being
+         contradicted by X is not being touched by X).
       3. For each: custody event TAINT_FLAGGED + custody_status update
          (only if currently CLEAN; QUARANTINED/SUPERSEDED memories keep
          their stronger status, but the custody event is still written —
@@ -116,7 +133,7 @@ def quarantine_actor(
 
     cur.execute(
         "SELECT DISTINCT memory_id FROM custody_chain WHERE actor_id = ? "
-        "ORDER BY memory_id ASC",
+        "AND event_type != 'CONTRADICTED_BY' ORDER BY memory_id ASC",
         (actor_id,),
     )
     flagged = [r[0] for r in cur.fetchall()]

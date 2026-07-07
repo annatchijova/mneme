@@ -186,6 +186,13 @@ store_memory(cur, "mem-touched", "the moon exists", "agent-1")
 custody.append_event(cur, memory_id="mem-touched", event_type="REINFORCED",
                      actor_id="pipeline-x", reason="corroboration",
                      payload={"note": "inflated"})
+# pipeline-x's poison also CONTRADICTED a legitimate memory: the event
+# lands on the victim's chain with pipeline-x as author, but being
+# attacked by X is not being touched by X — the sweep must NOT flag it
+store_memory(cur, "mem-victim", "the truth pipeline-x attacked", "agent-1")
+custody.append_event(cur, memory_id="mem-victim", event_type="CONTRADICTED_BY",
+                     actor_id="pipeline-x", reason="auto contradiction",
+                     payload={"other_memory_id": "mem-poison-1", "topic": "t"})
 ts = custody.now_ts()
 cur.execute("INSERT INTO cell_links (from_id, to_id, link_type, auto, created_at) "
             "VALUES ('mem-poison-1', 'mem-clean', 'RESONANT', 1, ?)", (ts,))
@@ -204,6 +211,10 @@ check("clean memory untouched",
       .fetchone()[0] == "CLEAN")
 check("resonant neighbour is advisory, not flagged",
       sweep.advisory_resonant_neighbours == ("mem-clean",))
+check("contradiction victim is not flagged (taint tracks influence, not enmity)",
+      "mem-victim" not in sweep.flagged_memory_ids and
+      cur.execute("SELECT custody_status FROM memories WHERE memory_id='mem-victim'")
+      .fetchone()[0] == "CLEAN")
 
 for mid in sweep.flagged_memory_ids:
     ok, errs = custody.verify_custody_chain(cur, mid)

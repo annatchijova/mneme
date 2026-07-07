@@ -96,6 +96,11 @@ field.store(cur, memory_id="mem-3", content="water is wet",
 for _ in range(3):
     field.reinforce(cur, memory_id="mem-1", actor_id="analyst-anna",
                     reason="verified")
+# pipeline-x also reinforced mem-3, so the sweep flags TWO memories
+# (mem-2, mem-3) — which lets the partial-export tests ship one flagged
+# memory without the other.
+field.reinforce(cur, memory_id="mem-3", actor_id="pipeline-x",
+                reason="corroboration")
 trust.quarantine_actor(cur, actor_id="pipeline-x",
                        initiated_by="analyst-anna", reason="incident")
 conn.commit()
@@ -106,15 +111,17 @@ honest = bundle.export_bundle(cur)
 print("[honest bundle]")
 agree("honest full export", honest, expect_ok=True)
 
+# Partial export: the sweep flagged mem-2 and mem-3 but mem-2 is absent,
+# so the exporter must DECLARE the sweep excluded (absence stated, never
+# implied) and both verifiers must accept the declared bundle.
 partial = bundle.export_bundle(cur, memory_ids=["mem-1", "mem-3"])
-ok_pkg, err_pkg, ok_off, err_off = both_verdicts(partial)
-# Partial export: the sweep's flagged memory (mem-2) is absent, so B5
-# must fail in BOTH verifiers — a partial bundle cannot silently claim
-# sweep evidence it does not carry.
-check("partial export: package flags missing sweep evidence",
-      not ok_pkg and "B5" in codes(err_pkg), str(err_pkg))
-check("partial export: offline agrees", not ok_off and "B5" in codes(err_off),
-      str(err_off))
+agree("honest partial export (sweep declared excluded)", partial, expect_ok=True)
+pbody = json.loads(partial)["body"]
+check("partial export: sweep declared excluded, not silently dropped",
+      len(pbody["excluded_sweeps"]) == 1 and pbody["sweeps"] == [],
+      str((pbody["sweeps"], pbody["excluded_sweeps"])))
+check("full export declares no exclusions",
+      json.loads(honest)["body"]["excluded_sweeps"] == [])
 
 # --------------------------------------------------------------- tampering
 print("[tampered bundles — every lie caught by BOTH verifiers]")
@@ -162,6 +169,38 @@ t["bundle_sha256"] = hashlib.sha256(body_c.encode("utf-8")).hexdigest()
 agree("sweep evidence denied", json.dumps(t), False, {"B5"})
 
 t = json.loads(honest)
+# exclude a sweep whose COMPLETE evidence is in the bundle — exclusion
+# must never be a way to dodge the seal check
+t["body"]["excluded_sweeps"] = t["body"]["sweeps"]
+t["body"]["sweeps"] = []
+body_c = offline.canonical_json(t["body"])
+t["bundle_sha256"] = hashlib.sha256(body_c.encode("utf-8")).hexdigest()
+agree("fully-evidenced sweep declared excluded", json.dumps(t), False, {"B5"})
+
+t = json.loads(partial)
+# drop the exclusion declaration while a TAINT_FLAGGED event (mem-3)
+# still references the sweep — absence implied is a lie
+t["body"]["excluded_sweeps"] = []
+body_c = offline.canonical_json(t["body"])
+t["bundle_sha256"] = hashlib.sha256(body_c.encode("utf-8")).hexdigest()
+agree("referenced sweep silently dropped", json.dumps(t), False, {"B5"})
+
+t = json.loads(partial)
+# same sweep in both lists — ambiguity refused
+t["body"]["sweeps"] = list(t["body"]["excluded_sweeps"])
+body_c = offline.canonical_json(t["body"])
+t["bundle_sha256"] = hashlib.sha256(body_c.encode("utf-8")).hexdigest()
+agree("sweep declared both included and excluded", json.dumps(t), False, {"B5"})
+
+t = json.loads(honest)
+# a bundle without the excluded_sweeps key (pre-declaration shape)
+# reads as excluding nothing and still verifies
+del t["body"]["excluded_sweeps"]
+body_c = offline.canonical_json(t["body"])
+t["bundle_sha256"] = hashlib.sha256(body_c.encode("utf-8")).hexdigest()
+agree("missing excluded_sweeps key reads as empty", json.dumps(t), True)
+
+t = json.loads(honest)
 # graft: give mem-3 the (internally consistent) chain of mem-1
 donor = [dict(r) for r in
          next(m for m in t["body"]["memories"] if m["memory_id"] == "mem-1")["custody"]]
@@ -189,6 +228,15 @@ r = subprocess.run([sys.executable,
                     os.path.join(os.path.dirname(__file__), "..", "verify_offline.py"),
                     honest_path], capture_output=True, text=True)
 check("CLI exits 0 on honest bundle", r.returncode == 0 and "VERIFIED" in r.stdout,
+      r.stdout + r.stderr)
+with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+    f.write(partial)
+    partial_path = f.name
+r = subprocess.run([sys.executable,
+                    os.path.join(os.path.dirname(__file__), "..", "verify_offline.py"),
+                    partial_path], capture_output=True, text=True)
+check("CLI exits 0 on declared partial bundle and NAMES the exclusion",
+      r.returncode == 0 and "VERIFIED" in r.stdout and "declared excluded" in r.stdout,
       r.stdout + r.stderr)
 with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
     f.write(json.dumps(t))   # last tampered bundle (forged merkle root)

@@ -26,7 +26,15 @@ Checks (normative statement in mneme/bundle.py's header):
   B3  content hashes to the seal in its STORED (birth) event
   B4  declared custody_status / field_state / confidence reproduce
       from replaying the chain's events
-  B5  every sweep's flagged set matches its count and seal
+  B5  sweep evidence — absence stated, never implied: no sweep_id in
+      both "sweeps" and "excluded_sweeps"; every included sweep's
+      flagged set matches its count and seal; an excluded sweep must
+      be genuinely partial (strictly fewer flagged memories carried
+      than its flagged_count); every sweep_id referenced by a
+      TAINT_FLAGGED event appears in one of the two lists. Excluded
+      sweeps' seals are NOT checked — exclusion is a declared claim
+      the auditor sees (this verifier names them on success), not a
+      verified one.
   B6  Merkle root over chain heads recomputes (leaves sorted by
       memory_id ASC, odd leaf promoted unpaired)
 """
@@ -226,7 +234,14 @@ def verify(bundle_json: str) -> tuple[bool, list[str]]:
                 if isinstance(sid, str):
                     tf_by_sweep.setdefault(sid, []).append(mid)
 
-    for sw in body.get("sweeps", []):
+    included = body.get("sweeps", [])
+    excluded = body.get("excluded_sweeps", [])  # absent key reads as empty
+    included_ids = {sw["sweep_id"] for sw in included}
+    excluded_ids = {sw["sweep_id"] for sw in excluded}
+    for sid in sorted(included_ids & excluded_ids):
+        errors.append(f"B5: sweep {sid}: declared both included and excluded "
+                      "— ambiguity refused.")
+    for sw in included:
         sid = sw["sweep_id"]
         flagged = sorted(tf_by_sweep.get(sid, []))
         if len(flagged) != sw["flagged_count"]:
@@ -235,6 +250,17 @@ def verify(bundle_json: str) -> tuple[bool, list[str]]:
         derived = sha256_hex(canonical_json({"memory_ids": flagged}).encode("utf-8"))
         if derived != sw["flagged_ids_sha256"]:
             errors.append(f"B5: sweep {sid}: flagged set does not hash to the seal.")
+    for sw in excluded:
+        sid = sw["sweep_id"]
+        carried = len(set(tf_by_sweep.get(sid, [])))
+        if carried >= sw["flagged_count"]:
+            errors.append(f"B5: sweep {sid}: declared excluded but the bundle "
+                          f"carries {carried} of {sw['flagged_count']} flagged "
+                          "memories — complete evidence must be included and "
+                          "checked, not excluded.")
+    for sid in sorted(set(tf_by_sweep) - included_ids - excluded_ids):
+        errors.append(f"B5: sweep {sid}: TAINT_FLAGGED events reference it but "
+                      "the bundle neither carries it nor declares it excluded.")
 
     if heads_merkle_root(heads) != body.get("heads_merkle_root"):
         errors.append("B6: heads_merkle_root does not recompute.")
@@ -247,9 +273,19 @@ def main() -> int:
         print(__doc__)
         return 2
     with open(sys.argv[1], encoding="utf-8") as f:
-        ok, errors = verify(f.read())
+        raw = f.read()
+    ok, errors = verify(raw)
     if ok:
         print("VERIFIED: every check (B1-B6) passed.")
+        # A declared exclusion is a claim the auditor must SEE, not
+        # something a passing verdict may bury.
+        try:
+            excluded = json.loads(raw)["body"].get("excluded_sweeps", [])
+        except Exception:
+            excluded = []
+        for sw in excluded:
+            print(f"  NOTE: sweep {sw['sweep_id']} declared excluded — its seal "
+                  "was NOT checked against evidence in this bundle.")
         return 0
     print(f"FAILED: {len(errors)} problem(s).")
     for e in errors:

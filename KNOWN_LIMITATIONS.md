@@ -101,14 +101,27 @@ together will fail those tests. If the agreement section is ever
 weakened, the duplication stops being a decision and becomes the bug
 this file warns about.
 
-## Partial bundles fail B5 when sweeps reference absent memories
+## Excluded sweeps are declared claims, not verified ones
 
-Emergent behaviour, examined and kept: exporting a subset of memories
-while the bundle carries a sweep whose flagged memories are outside the
-subset makes B5 fail in both verifiers — a bundle cannot silently claim
-sweep evidence it does not carry. The consequence is that honest
-partial exports of swept fields are currently impossible without
-shipping every swept memory. The clean fix is an explicit
-`excluded_sweeps` declaration in the bundle body (absence stated, not
-implied); until it exists, export the full field or expect B5 to say
-why not.
+(Successor to the former entry "Partial bundles fail B5 when sweeps
+reference absent memories" — the `excluded_sweeps` declaration that
+entry named as the clean fix now exists.) `export_bundle()` partitions
+sweep rows: a sweep whose entire flagged set travels in the bundle goes
+into `sweeps` and B5 checks its count and seal; any other sweep goes
+into `excluded_sweeps` — absence stated, never implied — and B5
+enforces that the exclusion is genuine (strictly fewer flagged
+memories carried than claimed), unambiguous (no sweep in both lists),
+and complete (every sweep_id referenced by a TAINT_FLAGGED event
+appears in one of the two lists). Honest partial exports of swept
+fields now verify, and the offline CLI names every declared exclusion
+on success.
+
+What remains, named: an excluded sweep's seal is NOT checked — its
+evidence lives outside the bundle, so exclusion is a claim the auditor
+sees and may act on (demand the full field), not a claim the verifier
+proves. And a sweep none of whose flagged memories are in the export
+leaves no referencing event behind, so a hostile exporter could omit
+it entirely rather than declare it; `export_bundle()` always declares,
+but the verifier cannot detect that omission. Partial exports prove
+what they carry, never what they omit — the full-field export is the
+only bundle that proves the absence of further sweeps.
