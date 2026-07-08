@@ -490,7 +490,10 @@ def recall(
 
       1. Load servable candidates: custody_status = 'CLEAN' only. The
          gate is a WHERE clause, not a post-filter — a tainted memory
-         cannot even become the BFS seed.
+         cannot even become the BFS seed, AND cannot be traversed as a
+         BFS intermediary: links are followed only between CLEAN
+         endpoints, so a non-CLEAN memory exerts zero influence on the
+         ranking of the memories that ARE served.
       2. Field-state filter: FORGOTTEN never scores (counted).
       3. Seed = exact-similarity argmax (squared comparison, sign-aware,
          memory_id tiebreak).
@@ -558,11 +561,23 @@ def recall(
     seed_id = best[0]
 
     # --- BFS from seed over links.
+    # The custody gate extends to the GRAPH, not only to serving: a
+    # non-CLEAN memory is invisible to the agent as a result AND as an
+    # influence. A link is traversable only if BOTH endpoints are CLEAN,
+    # so a quarantined / tainted / superseded node can neither inhibit
+    # nor resonate a served memory. Gating serving alone (the WHERE
+    # clause) left the ranking of clean memories perturbable by a
+    # quarantined node sitting on a resonant path — confirmed by
+    # induction and refused here. Gate on custody_status only: FORGOTTEN
+    # is a weak field_state, not an untrusted one, so its links stay.
+    cur.execute("SELECT memory_id FROM memories WHERE custody_status = 'CLEAN'")
+    servable_ids = {r[0] for r in cur.fetchall()}
     cur.execute("SELECT from_id, to_id, link_type FROM cell_links "
                 "ORDER BY from_id ASC, to_id ASC")
     links: dict[str, list[tuple[str, str]]] = {}
     for f, t, lt in cur.fetchall():
-        links.setdefault(f, []).append((t, lt))
+        if f in servable_ids and t in servable_ids:
+            links.setdefault(f, []).append((t, lt))
 
     hop_of: dict[str, int] = {}
     inhibited: set[str] = set()

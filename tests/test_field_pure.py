@@ -294,5 +294,42 @@ ok, errs = field.verify_receipts(cur)
 check("edited receipt evidence is self-revealing", not ok and len(errs) == 1,
       str(errs))
 
+# ------------------------------------------------- custody gate covers influence
+# Security audit Round 1, finding H2: a non-CLEAN memory must exert ZERO
+# influence on the recall of CLEAN memories — not merely be unserved. A
+# quarantined node sitting on a RESONANT path between a clean seed and a
+# clean target must not perturb the target's ranking. RESONANT links have
+# no public creation API in Phase 1, so we insert them by hand: the
+# invariant must hold for the Phase-2 state too.
+print("[custody gate covers influence, not just serving]")
+
+def _score_of_t(*, with_q: bool, quarantine: bool) -> str:
+    c = fresh_db()
+    cu = c.cursor()
+    ts = custody.now_ts()
+    field.store(cu, memory_id="mem-s", content="s", embedding=emb(1.0, 0.0),
+                embedding_model="d", actor_id="agent-1", reason="i")
+    field.store(cu, memory_id="mem-t", content="t", embedding=emb(0.0, 1.0),
+                embedding_model="d", actor_id="agent-1", reason="i")
+    if with_q:
+        field.store(cu, memory_id="mem-q", content="q", embedding=emb(0.5, 0.5),
+                    embedding_model="d", actor_id="agent-1", reason="i")
+        cu.execute("INSERT INTO cell_links VALUES ('mem-s','mem-q','RESONANT',1,?)", (ts,))
+        cu.execute("INSERT INTO cell_links VALUES ('mem-q','mem-t','RESONANT',1,?)", (ts,))
+        if quarantine:
+            trust.quarantine_memory(cu, memory_id="mem-q", actor_id="analyst-anna",
+                                    reason="poison on the resonant path")
+    c.commit()
+    hits, _ = field.recall(cu, query_embedding=emb(1.0, 1.0), top_k=5, hops=3)
+    return next(str(h.score) for h in hits if h.memory_id == "mem-t")
+
+absent = _score_of_t(with_q=False, quarantine=False)
+clean = _score_of_t(with_q=True, quarantine=False)
+quar = _score_of_t(with_q=True, quarantine=True)
+check("a quarantined intermediary exerts no influence (== its absence)",
+      quar == absent, f"absent={absent} clean={clean} quarantined={quar}")
+check("a genuinely CLEAN intermediary still resonates (mechanic intact)",
+      clean != absent, f"absent={absent} clean={clean}")
+
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

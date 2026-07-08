@@ -22,7 +22,7 @@ Checks (normative statement in mneme/bundle.py's header):
   B1  bundle seal recomputes
   B2  every custody chain: genesis bound to memory_id, dense seq,
       linkage, entry hashes recompute, closed vocabulary, canonical
-      payload bytes
+      payload bytes, canonical UTC timestamps that never run backwards
   B3  content hashes to the seal in its STORED (birth) event
   B4  declared custody_status / field_state / confidence reproduce
       from replaying the chain's events; supersession lineage is
@@ -56,6 +56,9 @@ EVENT_TYPES = frozenset({
     "QUARANTINED", "TAINT_FLAGGED", "REHABILITATED", "STATE_CHANGED",
 })
 INITIAL_CONFIDENCE = "0.5000000000"
+# Canonical timestamp shape (UTC, microseconds, +00:00). Verification
+# re-asserts it so lexicographic order equals chronological order.
+TS_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}\+00:00$")
 
 
 # --- canonical JSON (protocol transcription; floats are forbidden) ---------
@@ -90,6 +93,7 @@ def verify_chain(memory_id: str, chain: list[dict], errors: list[str]) -> bool:
         errors.append(f"B2: {memory_id}: empty custody chain — a memory without a birth event.")
         return False
     expected_prev = sha256_hex(GENESIS_PREFIX + memory_id.encode("utf-8"))
+    prev_ts = None
     for i, r in enumerate(chain):
         where = f"B2: {memory_id} seq {r.get('seq')}"
         if r.get("seq") != i:
@@ -122,6 +126,14 @@ def verify_chain(memory_id: str, chain: list[dict], errors: list[str]) -> bool:
         if recomputed != r["entry_hash"]:
             errors.append(f"{where}: entry_hash does not recompute — content tampered.")
             return False
+        ts = r["created_at"]
+        if not isinstance(ts, str) or not TS_PATTERN.match(ts):
+            errors.append(f"{where}: created_at {ts!r} is not canonical UTC "
+                          "microsecond ISO 8601 (…+00:00)."); return False
+        if prev_ts is not None and ts < prev_ts:
+            errors.append(f"{where}: created_at {ts} precedes the previous "
+                          f"event's {prev_ts} — chain runs backwards in time."); return False
+        prev_ts = ts
         expected_prev = r["entry_hash"]
     born = json.loads(chain[0]["payload_json"]).get("content_sha256", "")
     if not re.fullmatch(r"[0-9a-f]{64}", born or ""):

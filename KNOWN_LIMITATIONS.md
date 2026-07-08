@@ -88,6 +88,21 @@ REHABILITATED is valid only from TAINT_FLAGGED, so a chain that
 reversal path is designed it arrives as a protocol change (new replay
 rule, both verifiers, agreement tests), not as a loosened check.
 
+## Timestamps: order enforced, causal truth not proven
+
+(Source: security audit Round 1, H1.) Chain verification now requires
+`created_at` to be canonical UTC (`…+00:00`) and non-decreasing along
+`seq` — a hash-valid chain that runs backwards in time is refused by
+both verifiers. What this does NOT do: prove that the timestamps are
+*true*. An attacker who fabricates an entire field controls every field
+including `created_at`, and can emit a monotonic, canonical, entirely
+fake history (the "a hash proves integrity, not truth" boundary). The
+check closes the timestamp-only-tamper and accidental-impossibility
+classes and moves the canonical-timestamp discipline from write-time
+only to read-time too; binding time to an external, harder-to-forge
+reference (a notarised clock, a CRONOS trace) is a Phase-2 decision, not
+a Phase-1 promise.
+
 ## The embedding boundary is trusted
 
 `quantize_embedding()` makes model output exact *from that point on*;

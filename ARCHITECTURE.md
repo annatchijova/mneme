@@ -158,9 +158,15 @@ KNOWN_LIMITATIONS.md.
 
 **The gate is a WHERE clause, not a post-filter**: candidates load with
 `custody_status = 'CLEAN'`, so a tainted memory cannot even become the
-BFS seed. Every exclusion is counted in the recall receipt — a sealed
-object (digest over canonical JSON) recording query hash, seed, served
-ids in order, and the withheld counts by cause. Recall itself is
+BFS seed. The gate extends to the GRAPH, not only to serving: a link is
+traversed during BFS only when both endpoints are CLEAN, so a non-CLEAN
+memory can neither inhibit nor resonate a served one — invisible to the
+agent as a *result* and as an *influence* (security audit Round 1, H2;
+gating serving alone left a quarantined node on a resonant path able to
+perturb a clean memory's ranking). Every exclusion is counted in the
+recall receipt — a sealed object (digest over canonical JSON) recording
+query hash, seed, served ids in order, and the withheld counts by
+cause. Recall itself is
 read-only (serving is not a state transition); reinforcement driven by
 recall is the caller's explicit audited act.
 
@@ -205,7 +211,7 @@ with one root, an ambiguity we refuse), and a bundle seal.
 | Check | Proves |
 |---|---|
 | B1 | the bundle as shipped is the bundle as sealed |
-| B2 | every chain: genesis binding, density, linkage, recomputation, closed vocabulary, canonical payload bytes |
+| B2 | every chain: genesis binding, density, linkage, recomputation, closed vocabulary, canonical payload bytes, canonical UTC timestamps non-decreasing along seq (integrity + order is not temporal plausibility) |
 | B3 | the content shipped is the content born (STORED seal) |
 | B4 | declared custody_status / field_state / confidence reproduce from replaying the chain — **state is derivable from evidence**; supersession lineage is bilateral when both parties travel in the bundle |
 | B5 | every included sweep's flagged set matches its count and seal; a sweep not fully evidenced must be *declared* excluded — declaring away a fully-evidenced sweep, double-declaring, or referencing an undeclared sweep all fail |

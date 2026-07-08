@@ -76,6 +76,8 @@ What neither had, and MNEME adds:
                           nothing else
     demo.py               narrated end-to-end incident: poison, sweep,
                           gated recall, sealed export, hostile audit
+    SECURITY_AUDIT.md     Round-1 adversarial audit (A–D–I): findings
+                          confirmed by induction, and discarded vectors
     tests/                pure suites: no pip installs, no infrastructure,
                           SQLite :memory: only
 
@@ -97,11 +99,14 @@ recomputes seals, relinks chains, and replays state from evidence.
 ## Quick start
 
 ```bash
-python3 tests/test_custody_pure.py   # 34 checks: chains, grafting, forks
-python3 tests/test_field_pure.py     # 39 checks: gate, exact ranking,
-                                     #   rescue, supersession, receipts
-python3 tests/test_bundle_pure.py    # 82 checks: bundles, declared partial
-                                     #   exports, lineage, verifier agreement
+python3 tests/test_custody_pure.py   # 37 checks: chains, grafting, forks,
+                                     #   temporal plausibility
+python3 tests/test_field_pure.py     # 41 checks: gate (serving AND
+                                     #   influence), exact ranking, rescue,
+                                     #   supersession, receipts
+python3 tests/test_bundle_pure.py    # 87 checks: bundles, declared partial
+                                     #   exports, lineage, backward-time,
+                                     #   verifier agreement
 python3 demo.py                      # one poisoned-RAG incident, end to
                                      #   end, narrated
 ```
@@ -127,6 +132,7 @@ caught, in both verifiers:
 | Edit a memory's content | B1 (seal), or B3 after resealing |
 | Edit any custody event, however old | B2 — entry hash does not recompute |
 | Drop or reorder events | B2 — seq density / linkage |
+| Rehash a chain to run backwards in time | B2 — timestamps must be canonical UTC and non-decreasing |
 | Graft memory A's chain onto memory B | B2 — genesis binding fails at seq 0 |
 | Fork a chain (two events, one parent) | `UNIQUE(memory_id, prev_hash)` at write time |
 | Un-taint by editing the status column | B4 — replay disagrees |
@@ -139,8 +145,8 @@ caught, in both verifiers:
 
 ## Status
 
-Phase 1: core complete, 155/155 pure checks passing, demo harness
-included. Not yet built: HTTP API, k-NN graph for large corpora, STDP
+Phase 1: core complete, 165/165 pure checks passing, demo harness and
+a Round-1 security audit (`SECURITY_AUDIT.md`) included. Not yet built: HTTP API, k-NN graph for large corpora, STDP
 synaptic dynamics, stylometric authorship checks (see
 `KNOWN_LIMITATIONS.md` — every absence there is a decision with a
 rationale, not an oversight).

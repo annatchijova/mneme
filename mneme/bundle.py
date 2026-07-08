@@ -19,7 +19,10 @@ that makes disagreement loud):
   B1  bundle_sha256 recomputes over the canonical body.
   B2  every custody chain verifies: genesis bound to its memory_id,
       dense seq, linkage, entry hashes recompute, closed vocabulary,
-      payloads stored in canonical form.
+      payloads stored in canonical form, and created_at values that are
+      canonical UTC form and non-decreasing along seq (a hash-valid
+      chain that runs backwards in time is a history that cannot have
+      happened).
   B3  content integrity: sha256(content) equals the content_sha256
       sealed in the STORED event — the content shipped is the content
       born.

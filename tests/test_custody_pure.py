@@ -174,6 +174,54 @@ except sqlite3.IntegrityError:
     check("fork violates UNIQUE(memory_id, prev_hash)", True)
 conn.rollback()
 
+# ---------------------------------------------------------------- temporal
+# A hash-valid chain still cannot run backwards in time, nor carry a
+# non-UTC timestamp offset (which would make lexicographic ordering a
+# lie). Security audit Round 1, finding H1: integrity + insertion order
+# is not the same as temporal plausibility.
+print("[temporal plausibility]")
+def _forge(mid, events):
+    """events: list of (event_type, actor, reason, created_at, payload)."""
+    prev = custody.genesis_hash(mid)
+    out = []
+    for seq, (et, actor, reason, ts, payload) in enumerate(events):
+        eh, pj = custody.compute_entry_hash(
+            prev_hash=prev, memory_id=mid, seq=seq, event_type=et,
+            actor_id=actor, reason=reason, created_at=ts, payload=payload)
+        out.append({"memory_id": mid, "seq": seq, "event_type": et,
+                    "actor_id": actor, "reason": reason, "created_at": ts,
+                    "payload_json": pj, "prev_hash": prev, "entry_hash": eh})
+        prev = eh
+    return out
+
+_csha = custody.content_sha256("x")
+backward = _forge("mem-t", [
+    ("STORED", "agent-1", "birth", "2026-07-08T12:00:00.000000+00:00",
+     {"content_sha256": _csha}),
+    ("REINFORCED", "agent-1", "r", "2026-07-08T11:00:00.000000+00:00",
+     {"confidence_before": "0.5000000000", "confidence_after": "0.6250000000"}),
+])
+ok, errs = custody.verify_custody_rows("mem-t", backward)
+check("hash-valid backward-in-time chain is refused",
+      not ok and "backwards" in errs[0], str(errs))
+
+rogue_tz = _forge("mem-z", [
+    ("STORED", "agent-1", "birth", "2026-07-08T12:00:00.000000+05:00",
+     {"content_sha256": _csha}),
+])
+ok, errs = custody.verify_custody_rows("mem-z", rogue_tz)
+check("non-UTC timestamp offset is refused",
+      not ok and "canonical UTC" in errs[0], str(errs))
+
+# Equal timestamps along a chain are legal (same-transaction events).
+same_ts = _forge("mem-eq", [
+    ("STORED", "agent-1", "birth", "2026-07-08T12:00:00.000000+00:00",
+     {"content_sha256": _csha}),
+    ("QUARANTINED", "agent-1", "q", "2026-07-08T12:00:00.000000+00:00", {}),
+])
+ok, errs = custody.verify_custody_rows("mem-eq", same_ts)
+check("equal timestamps along a chain are accepted", ok, str(errs))
+
 # ---------------------------------------------------------------- taint
 print("[taint propagation]")
 conn = fresh_db()

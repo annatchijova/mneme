@@ -12,6 +12,7 @@ one place and not the other, this file screams.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -171,6 +172,38 @@ conn3.commit()
 agree("SUPERSEDED_BY naming a non-consenting successor",
       bundle.export_bundle(cur3), False, {"B4"})
 
+# ------------------------------------------------- backward-in-time chain (H1)
+# Both verifiers must reject a hash-valid chain that runs backwards in
+# time. Build a single-memory field, then rewrite its 2nd event to an
+# earlier timestamp with a recomputed entry_hash, recompute the Merkle
+# root and reseal so ONLY the timestamp rule (B2) is left to catch it.
+conn4 = sqlite3.connect(":memory:")
+with open(os.path.join(os.path.dirname(__file__), "..", "mneme", "schema.sql")) as f:
+    conn4.executescript(f.read())
+cur4 = conn4.cursor()
+cur4.execute("INSERT INTO actors (actor_id, display_name, kind, created_at) "
+             "VALUES ('agent-1', 'agent-1', 'AGENT', ?)", (custody.now_ts(),))
+field.store(cur4, memory_id="m-z", content="z", embedding=emb(1.0, 0.0),
+            embedding_model="dev", actor_id="agent-1", reason="ingestion")
+trust.quarantine_memory(cur4, memory_id="m-z", actor_id="agent-1",
+                        reason="direct")
+conn4.commit()
+tb = json.loads(bundle.export_bundle(cur4))
+ch = next(m for m in tb["body"]["memories"] if m["memory_id"] == "m-z")["custody"]
+# rewrite seq 1 to one hour BEFORE seq 0, recompute its entry_hash
+ch[1]["created_at"] = "2000-01-01T00:00:00.000000+00:00"
+eh, _ = custody.compute_entry_hash(
+    prev_hash=ch[1]["prev_hash"], memory_id="m-z", seq=1,
+    event_type=ch[1]["event_type"], actor_id=ch[1]["actor_id"],
+    reason=ch[1]["reason"], created_at=ch[1]["created_at"],
+    payload=json.loads(ch[1]["payload_json"]))
+ch[1]["entry_hash"] = eh
+tb["body"]["heads_merkle_root"] = offline.heads_merkle_root({"m-z": eh})
+tb["bundle_sha256"] = hashlib.sha256(
+    offline.canonical_json(tb["body"]).encode("utf-8")).hexdigest()
+agree("hash-valid backward-in-time chain in a bundle", json.dumps(tb),
+      False, {"B2"})
+
 # --------------------------------------------------------------- tampering
 print("[tampered bundles — every lie caught by BOTH verifiers]")
 doc = json.loads(honest)
@@ -181,7 +214,6 @@ agree("edited content, reseal not attempted", json.dumps(t), False, {"B1"})
 
 t = json.loads(honest)
 t["body"]["memories"][0]["content"] = "the sky is RED, always was"
-import hashlib
 body_c = offline.canonical_json(t["body"])
 t["bundle_sha256"] = hashlib.sha256(body_c.encode("utf-8")).hexdigest()
 agree("edited content + reseal", json.dumps(t), False, {"B3"})
