@@ -21,17 +21,22 @@ later (hop-limited with decay-weighted thresholds is the obvious
 candidate), it must arrive with its own invariant, not as a loop
 someone added.
 
-## Recall receipts are produced, not yet persisted
+## Recall receipts persist only by the caller's explicit act
 
-`recall()` returns a sealed `RecallReceipt` but Phase 1 has no receipts
-table; persisting them (or forwarding them to a CRONOS-style tracer) is
-the caller's job. Rationale: recall is read-only by design — serving is
-not a state transition, so forcing a write into every recall would
-quietly convert the hottest read path into a write path and invert M2's
-intent. The Phase 2 CRONOS integration is where receipts become
-first-class trace events. Until then, "why did the agent remember this"
-is answerable for any recall whose receipt the caller kept, and for the
-memory's full history always.
+`recall()` returns a sealed `RecallReceipt` and stays read-only by
+design — serving is not a state transition, so forcing a write into
+every recall would quietly convert the hottest read path into a write
+path and invert M2's intent. What Phase 1 now provides is the explicit
+path: `field.persist_receipt()` writes the receipt into the
+append-only `recall_receipts` table (digest recomputed before insert;
+a receipt that does not recompute is refused), and
+`field.verify_receipts()` re-derives every stored digest from its own
+columns. What it still does not provide: receipts are not custody
+events, not in evidence bundles, and not linked to the decisions they
+served — that is the Phase 2 CRONOS integration, where receipts become
+first-class trace events. Until then, "why did the agent remember
+this" is answerable for any recall whose receipt the caller persisted
+or kept, and for the memory's full history always.
 
 ## Linear exact scan; no k-NN graph, no vector index
 
@@ -68,6 +73,20 @@ Absent from Phase 1, each with a reason beyond "later":
 - **Spectral resonance/coherence metadata** — raven reports these
   without letting them touch the score; MNEME can adopt them the same
   way, but Phase 1 ships nothing it does not verify.
+
+## Direct quarantine has no reversal path
+
+`trust.quarantine_memory()` records direct evidence against one memory;
+`rehabilitate_memory()` deliberately reverses TAINT_FLAGGED only. The
+asymmetry is the point — a sweep's false positive is a statistical
+casualty with a lightweight audited reversal, while un-quarantining a
+directly-incriminated memory is a stronger claim whose review path
+(who may reverse, on what evidence, leaving what event) has not been
+designed. The replay state machine (B4) enforces the same asymmetry:
+REHABILITATED is valid only from TAINT_FLAGGED, so a chain that
+"un-quarantines" is invalid evidence in both verifiers. When a
+reversal path is designed it arrives as a protocol change (new replay
+rule, both verifiers, agreement tests), not as a loosened check.
 
 ## The embedding boundary is trusted
 

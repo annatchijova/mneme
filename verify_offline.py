@@ -25,7 +25,10 @@ Checks (normative statement in mneme/bundle.py's header):
       payload bytes
   B3  content hashes to the seal in its STORED (birth) event
   B4  declared custody_status / field_state / confidence reproduce
-      from replaying the chain's events
+      from replaying the chain's events; supersession lineage is
+      bilateral when both parties travel in the bundle (a STORED
+      "supersedes": X needs X's chain to name this memory back in a
+      SUPERSEDED_BY event, and vice versa)
   B5  sweep evidence — absence stated, never implied: no sweep_id in
       both "sweeps" and "excluded_sweeps"; every included sweep's
       flagged set matches its count and seal; an excluded sweep must
@@ -203,6 +206,8 @@ def verify(bundle_json: str) -> tuple[bool, list[str]]:
 
     heads: dict[str, str] = {}
     tf_by_sweep: dict[str, list[str]] = {}
+    stored_supersedes: dict[str, str] = {}   # successor -> claimed predecessor
+    successors: dict[str, set[str]] = {}     # predecessor -> SUPERSEDED_BY names
 
     for mem in body.get("memories", []):
         mid = mem["memory_id"]
@@ -211,7 +216,10 @@ def verify(bundle_json: str) -> tuple[bool, list[str]]:
             continue
         heads[mid] = chain[-1]["entry_hash"]
 
-        born = json.loads(chain[0]["payload_json"])["content_sha256"]
+        birth = json.loads(chain[0]["payload_json"])
+        if isinstance(birth.get("supersedes"), str):
+            stored_supersedes[mid] = birth["supersedes"]
+        born = birth["content_sha256"]
         if sha256_hex(mem["content"].encode("utf-8")) != born:
             errors.append(f"B3: {mid}: content does not hash to the STORED seal.")
         if mem.get("content_sha256") != born:
@@ -233,6 +241,20 @@ def verify(bundle_json: str) -> tuple[bool, list[str]]:
                 sid = json.loads(r["payload_json"]).get("sweep_id")
                 if isinstance(sid, str):
                     tf_by_sweep.setdefault(sid, []).append(mid)
+            elif r["event_type"] == "SUPERSEDED_BY":
+                succ = json.loads(r["payload_json"]).get("successor_memory_id")
+                if isinstance(succ, str):
+                    successors.setdefault(mid, set()).add(succ)
+
+    for s, x in sorted(stored_supersedes.items()):
+        if x in heads and s not in successors.get(x, set()):
+            errors.append(f"B4: {s}: STORED claims it supersedes {x}, but "
+                          f"{x}'s chain has no SUPERSEDED_BY naming {s}.")
+    for x in sorted(successors):
+        for s in sorted(successors[x]):
+            if s in heads and stored_supersedes.get(s) != x:
+                errors.append(f"B4: {x}: SUPERSEDED_BY names {s}, but {s}'s "
+                              f"STORED does not claim to supersede {x}.")
 
     included = body.get("sweeps", [])
     excluded = body.get("excluded_sweeps", [])  # absent key reads as empty

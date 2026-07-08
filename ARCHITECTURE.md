@@ -102,10 +102,10 @@ fails at seq 0 by construction.
 
 | Event | Semantics | Payload contract |
 |---|---|---|
-| `STORED` | birth; seq 0 only, once | `content_sha256` (mandatory), `embedding_model`, optional `topic`/`claim` |
+| `STORED` | birth; seq 0 only, once | `content_sha256` (mandatory), `embedding_model`, optional `topic`/`claim`, optional `supersedes` (written by `supersede()`, checked bilaterally in B4) |
 | `REINFORCED` | confidence raised | `confidence_before`, `confidence_after` (both replayed, B4) |
 | `CONTRADICTED_BY` | conflict detected | `other_memory_id`, `topic` — written on BOTH chains |
-| `SUPERSEDED_BY` | newer memory replaces this | successor id |
+| `SUPERSEDED_BY` | newer memory replaces this | `successor_memory_id` — written together with the successor's STORED, one transaction |
 | `QUARANTINED` | direct action against this memory | — |
 | `TAINT_FLAGGED` | transitive: an actor in this chain was quarantined | `sweep_id` (ties evidence to its sweep, B5) |
 | `REHABILITATED` | audited reversal of TAINT_FLAGGED | `from_status` |
@@ -207,7 +207,7 @@ with one root, an ambiguity we refuse), and a bundle seal.
 | B1 | the bundle as shipped is the bundle as sealed |
 | B2 | every chain: genesis binding, density, linkage, recomputation, closed vocabulary, canonical payload bytes |
 | B3 | the content shipped is the content born (STORED seal) |
-| B4 | declared custody_status / field_state / confidence reproduce from replaying the chain — **state is derivable from evidence** |
+| B4 | declared custody_status / field_state / confidence reproduce from replaying the chain — **state is derivable from evidence**; supersession lineage is bilateral when both parties travel in the bundle |
 | B5 | every included sweep's flagged set matches its count and seal; a sweep not fully evidenced must be *declared* excluded — declaring away a fully-evidenced sweep, double-declaring, or referencing an undeclared sweep all fail |
 | B6 | the cross-memory commitment recomputes |
 

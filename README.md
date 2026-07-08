@@ -60,11 +60,14 @@ What neither had, and MNEME adds:
                           genesis bound to memory_id, append (caller owns
                           the transaction), pure verification
     mneme/trust.py        actor quarantine, deterministic taint sweeps
-                          sealed by hash, audited rehabilitation
+                          sealed by hash, direct memory quarantine,
+                          audited rehabilitation
     mneme/field.py        store with bilateral contradiction events,
-                          exact reinforcement c' = c + α(1−c),
+                          bilateral supersession (M1's path for new
+                          content), exact reinforcement c' = c + α(1−c),
                           custody-gated recall with exact ranking and
-                          sealed recall receipts
+                          sealed recall receipts, persisted only by the
+                          caller's explicit act
     mneme/bundle.py       evidence bundle export + verification (B1–B6)
     mneme/schema.sql      SQLite WAL, Phase 1; written to port to
                           CockroachDB mechanically
@@ -94,10 +97,11 @@ recomputes seals, relinks chains, and replays state from evidence.
 ## Quick start
 
 ```bash
-python3 tests/test_custody_pure.py   # 30 checks: chains, grafting, forks
-python3 tests/test_field_pure.py     # 28 checks: gate, exact ranking, rescue
-python3 tests/test_bundle_pure.py    # 69 checks: bundles, declared partial
-                                     #   exports, verifier agreement
+python3 tests/test_custody_pure.py   # 34 checks: chains, grafting, forks
+python3 tests/test_field_pure.py     # 39 checks: gate, exact ranking,
+                                     #   rescue, supersession, receipts
+python3 tests/test_bundle_pure.py    # 82 checks: bundles, declared partial
+                                     #   exports, lineage, verifier agreement
 python3 demo.py                      # one poisoned-RAG incident, end to
                                      #   end, narrated
 ```
@@ -127,6 +131,7 @@ caught, in both verifiers:
 | Fork a chain (two events, one parent) | `UNIQUE(memory_id, prev_hash)` at write time |
 | Un-taint by editing the status column | B4 — replay disagrees |
 | Inflate confidence without events | B4 — REINFORCED arithmetic replayed |
+| Claim supersession lineage the other chain never consented to | B4 — lineage is bilateral, both directions checked |
 | Deny a sweep flagged what it flagged | B5 — flagged set hashes to the seal |
 | Ship partial sweep evidence without declaring it | B5 — a referenced sweep is carried in full or declared excluded, never implied absent |
 | Dodge a sweep's seal check by declaring it excluded | B5 — a fully-evidenced sweep may not be excluded |
@@ -134,7 +139,7 @@ caught, in both verifiers:
 
 ## Status
 
-Phase 1: core complete, 127/127 pure checks passing, demo harness
+Phase 1: core complete, 155/155 pure checks passing, demo harness
 included. Not yet built: HTTP API, k-NN graph for large corpora, STDP
 synaptic dynamics, stylometric authorship checks (see
 `KNOWN_LIMITATIONS.md` — every absence there is a decision with a

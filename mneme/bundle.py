@@ -27,6 +27,12 @@ that makes disagreement loud):
       through the documented state machine reproduces the declared
       custody_status, field_state and confidence. A hand-edited status
       column without its corresponding event is self-revealing.
+      Supersession lineage is bilateral, like contradiction: when both
+      parties travel in the bundle, a STORED payload naming
+      "supersedes": X requires a SUPERSEDED_BY event on X's chain
+      naming this memory back, and vice versa. (With one party absent
+      — a partial export — the cross-check has nothing to compare and
+      is skipped; each chain still verifies alone.)
   B5  sweep evidence — absence stated, never implied. The body
       partitions sweep rows into "sweeps" (flagged evidence carried in
       full) and "excluded_sweeps" (evidence declared absent: a partial
@@ -256,6 +262,8 @@ def verify_bundle(bundle_json: str) -> tuple[bool, list[str]]:
 
     heads: dict[str, str] = {}
     tf_by_sweep: dict[str, list[str]] = {}
+    stored_supersedes: dict[str, str] = {}   # successor -> claimed predecessor
+    successors: dict[str, set[str]] = {}     # predecessor -> SUPERSEDED_BY names
 
     for mem in body.get("memories", []):
         mid = mem["memory_id"]
@@ -269,7 +277,10 @@ def verify_bundle(bundle_json: str) -> tuple[bool, list[str]]:
         heads[mid] = chain[-1]["entry_hash"]
 
         # B3 — content integrity against the birth seal
-        born = json.loads(chain[0]["payload_json"])["content_sha256"]
+        birth = json.loads(chain[0]["payload_json"])
+        if isinstance(birth.get("supersedes"), str):
+            stored_supersedes[mid] = birth["supersedes"]
+        born = birth["content_sha256"]
         if custody.content_sha256(mem["content"]) != born:
             errors.append(f"B3: {mid}: content does not hash to the STORED seal.")
         if mem.get("content_sha256") != born:
@@ -293,6 +304,21 @@ def verify_bundle(bundle_json: str) -> tuple[bool, list[str]]:
                 sid = json.loads(r["payload_json"]).get("sweep_id")
                 if isinstance(sid, str):
                     tf_by_sweep.setdefault(sid, []).append(mid)
+            elif r["event_type"] == "SUPERSEDED_BY":
+                succ = json.loads(r["payload_json"]).get("successor_memory_id")
+                if isinstance(succ, str):
+                    successors.setdefault(mid, set()).add(succ)
+
+    # B4 — supersession lineage is bilateral when both parties are present
+    for s, x in sorted(stored_supersedes.items()):
+        if x in heads and s not in successors.get(x, set()):
+            errors.append(f"B4: {s}: STORED claims it supersedes {x}, but "
+                          f"{x}'s chain has no SUPERSEDED_BY naming {s}.")
+    for x in sorted(successors):
+        for s in sorted(successors[x]):
+            if s in heads and stored_supersedes.get(s) != x:
+                errors.append(f"B4: {x}: SUPERSEDED_BY names {s}, but {s}'s "
+                              f"STORED does not claim to supersede {x}.")
 
     # B5 — sweep evidence (normative rules in the module header)
     included = body.get("sweeps", [])

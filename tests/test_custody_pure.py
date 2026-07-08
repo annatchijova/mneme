@@ -246,6 +246,24 @@ raises("rehabilitating a CLEAN memory refused",
                                          actor_id="analyst-anna", reason="r"),
        ValueError, "TAINT_FLAGGED only")
 
+# direct quarantine of ONE memory: evidence against the memory itself
+trust.quarantine_memory(cur, memory_id="mem-clean", actor_id="analyst-anna",
+                        reason="directly incriminated in incident review")
+conn.commit()
+check("directly quarantined memory is QUARANTINED",
+      cur.execute("SELECT custody_status FROM memories WHERE memory_id='mem-clean'")
+      .fetchone()[0] == "QUARANTINED")
+ok, errs = custody.verify_custody_chain(cur, "mem-clean")
+check("chain verifies after direct quarantine", ok, str(errs))
+raises("double direct quarantine refused",
+       lambda: trust.quarantine_memory(cur, memory_id="mem-clean",
+                                       actor_id="analyst-anna", reason="again"),
+       ValueError, "already QUARANTINED")
+raises("rehabilitating a QUARANTINED memory refused (stronger claim)",
+       lambda: trust.rehabilitate_memory(cur, memory_id="mem-clean",
+                                         actor_id="analyst-anna", reason="r"),
+       ValueError, "TAINT_FLAGGED only")
+
 # tamper with sweep evidence -> verify_sweep catches it
 cur.execute("UPDATE taint_sweeps SET flagged_count = flagged_count + 1")
 conn.commit()

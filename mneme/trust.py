@@ -192,6 +192,53 @@ def quarantine_actor(
     )
 
 
+def quarantine_memory(
+    cur,
+    *,
+    memory_id: str,
+    actor_id: str,
+    reason: str,
+    created_at: str | None = None,
+) -> None:
+    """
+    Direct quarantine of ONE memory: the analyst has evidence against
+    this memory itself (not merely against an actor in its chain).
+    QUARANTINED custody event + status update, one transaction, the
+    caller's.
+
+    Allowed from any status except QUARANTINED itself: upgrading a
+    TAINT_FLAGGED memory records that suspicion became direct evidence,
+    and quarantining a SUPERSEDED memory records incrimination the
+    supersession must not bury. Re-quarantining is refused — the second
+    incident's evidence belongs in the first event's chain succession,
+    not in a duplicate status write.
+
+    There is deliberately NO reversal here: rehabilitate_memory()
+    reverses TAINT_FLAGGED only. Undoing a direct quarantine is a
+    stronger claim with no designed review path yet — named in
+    KNOWN_LIMITATIONS, arriving with its own invariant or not at all.
+    """
+    cur.execute("SELECT custody_status FROM memories WHERE memory_id = ?",
+                (memory_id,))
+    row = cur.fetchone()
+    if row is None:
+        raise ValueError(f"Unknown memory {memory_id!r}.")
+    if row[0] == "QUARANTINED":
+        raise ValueError(
+            f"{memory_id} is already QUARANTINED — a duplicate quarantine "
+            "would add a status write with no new evidence."
+        )
+    ts = created_at if created_at is not None else custody.now_ts()
+    custody.append_event(
+        cur, memory_id=memory_id, event_type="QUARANTINED",
+        actor_id=actor_id, reason=reason, payload={}, created_at=ts,
+    )
+    cur.execute(
+        "UPDATE memories SET custody_status = 'QUARANTINED' WHERE memory_id = ?",
+        (memory_id,),
+    )
+
+
 def rehabilitate_memory(
     cur,
     *,

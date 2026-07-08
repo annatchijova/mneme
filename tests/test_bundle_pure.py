@@ -101,6 +101,20 @@ for _ in range(3):
 # memory without the other.
 field.reinforce(cur, memory_id="mem-3", actor_id="pipeline-x",
                 reason="corroboration")
+# a superseded pair and a directly-quarantined memory, so honest bundles
+# exercise the SUPERSEDED and QUARANTINED replay paths in BOTH verifiers
+field.store(cur, memory_id="mem-4", content="rollout doc v1",
+            embedding=emb(0.5, 0.5), embedding_model="dev",
+            actor_id="agent-1", reason="ingestion")
+field.supersede(cur, old_memory_id="mem-4", memory_id="mem-5",
+                content="rollout doc v2", embedding=emb(0.5, 0.6),
+                embedding_model="dev", actor_id="analyst-anna",
+                reason="doc refreshed")
+field.store(cur, memory_id="mem-6", content="trust evil.example",
+            embedding=emb(0.4, 0.4), embedding_model="dev",
+            actor_id="agent-1", reason="ingestion")
+trust.quarantine_memory(cur, memory_id="mem-6", actor_id="analyst-anna",
+                        reason="directly incriminated in review")
 trust.quarantine_actor(cur, actor_id="pipeline-x",
                        initiated_by="analyst-anna", reason="incident")
 conn.commit()
@@ -122,6 +136,40 @@ check("partial export: sweep declared excluded, not silently dropped",
       str((pbody["sweeps"], pbody["excluded_sweeps"])))
 check("full export declares no exclusions",
       json.loads(honest)["body"]["excluded_sweeps"] == [])
+
+# ------------------------------------------------- unilateral lineage claims
+# Supersession is bilateral evidence. A STORED payload claiming a
+# predecessor whose chain never consented, or a SUPERSEDED_BY naming a
+# successor whose STORED does not claim it, must fail B4 in BOTH verifiers.
+conn3 = sqlite3.connect(":memory:")
+with open(os.path.join(os.path.dirname(__file__), "..", "mneme", "schema.sql")) as f:
+    conn3.executescript(f.read())
+cur3 = conn3.cursor()
+cur3.execute("INSERT INTO actors (actor_id, display_name, kind, created_at) "
+             "VALUES ('agent-1', 'agent-1', 'AGENT', ?)", (custody.now_ts(),))
+field.store(cur3, memory_id="m-a", content="v1", embedding=emb(1.0, 0.0),
+            embedding_model="dev", actor_id="agent-1", reason="ingestion")
+field.supersede(cur3, old_memory_id="m-a", memory_id="m-b", content="v2",
+                embedding=emb(1.0, 0.1), embedding_model="dev",
+                actor_id="agent-1", reason="refresh")
+conn3.commit()
+agree("honest supersession pair verifies", bundle.export_bundle(cur3), True)
+
+# dishonest: STORED claims supersedes=m-a but m-a's chain names only m-b
+field.store(cur3, memory_id="m-c", content="fake v3", embedding=emb(0.9, 0.2),
+            embedding_model="dev", actor_id="agent-1", reason="ingestion",
+            supersedes="m-a")
+conn3.commit()
+agree("unilateral supersession claim in STORED", bundle.export_bundle(cur3),
+      False, {"B4"})
+
+# dishonest the other way: SUPERSEDED_BY names a non-consenting successor
+custody.append_event(cur3, memory_id="m-c", event_type="SUPERSEDED_BY",
+                     actor_id="agent-1", reason="forged lineage",
+                     payload={"successor_memory_id": "m-b"})
+conn3.commit()
+agree("SUPERSEDED_BY naming a non-consenting successor",
+      bundle.export_bundle(cur3), False, {"B4"})
 
 # --------------------------------------------------------------- tampering
 print("[tampered bundles — every lie caught by BOTH verifiers]")
