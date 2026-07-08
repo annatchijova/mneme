@@ -21,17 +21,22 @@ later (hop-limited with decay-weighted thresholds is the obvious
 candidate), it must arrive with its own invariant, not as a loop
 someone added.
 
-## Recall receipts are produced, not yet persisted
+## Recall receipts persist only by the caller's explicit act
 
-`recall()` returns a sealed `RecallReceipt` but Phase 1 has no receipts
-table; persisting them (or forwarding them to a CRONOS-style tracer) is
-the caller's job. Rationale: recall is read-only by design — serving is
-not a state transition, so forcing a write into every recall would
-quietly convert the hottest read path into a write path and invert M2's
-intent. The Phase 2 CRONOS integration is where receipts become
-first-class trace events. Until then, "why did the agent remember this"
-is answerable for any recall whose receipt the caller kept, and for the
-memory's full history always.
+`recall()` returns a sealed `RecallReceipt` and stays read-only by
+design — serving is not a state transition, so forcing a write into
+every recall would quietly convert the hottest read path into a write
+path and invert M2's intent. What Phase 1 now provides is the explicit
+path: `field.persist_receipt()` writes the receipt into the
+append-only `recall_receipts` table (digest recomputed before insert;
+a receipt that does not recompute is refused), and
+`field.verify_receipts()` re-derives every stored digest from its own
+columns. What it still does not provide: receipts are not custody
+events, not in evidence bundles, and not linked to the decisions they
+served — that is the Phase 2 CRONOS integration, where receipts become
+first-class trace events. Until then, "why did the agent remember
+this" is answerable for any recall whose receipt the caller persisted
+or kept, and for the memory's full history always.
 
 ## Linear exact scan; no k-NN graph, no vector index
 
@@ -69,6 +74,35 @@ Absent from Phase 1, each with a reason beyond "later":
   without letting them touch the score; MNEME can adopt them the same
   way, but Phase 1 ships nothing it does not verify.
 
+## Direct quarantine has no reversal path
+
+`trust.quarantine_memory()` records direct evidence against one memory;
+`rehabilitate_memory()` deliberately reverses TAINT_FLAGGED only. The
+asymmetry is the point — a sweep's false positive is a statistical
+casualty with a lightweight audited reversal, while un-quarantining a
+directly-incriminated memory is a stronger claim whose review path
+(who may reverse, on what evidence, leaving what event) has not been
+designed. The replay state machine (B4) enforces the same asymmetry:
+REHABILITATED is valid only from TAINT_FLAGGED, so a chain that
+"un-quarantines" is invalid evidence in both verifiers. When a
+reversal path is designed it arrives as a protocol change (new replay
+rule, both verifiers, agreement tests), not as a loosened check.
+
+## Timestamps: order enforced, causal truth not proven
+
+(Source: security audit Round 1, H1.) Chain verification now requires
+`created_at` to be canonical UTC (`…+00:00`) and non-decreasing along
+`seq` — a hash-valid chain that runs backwards in time is refused by
+both verifiers. What this does NOT do: prove that the timestamps are
+*true*. An attacker who fabricates an entire field controls every field
+including `created_at`, and can emit a monotonic, canonical, entirely
+fake history (the "a hash proves integrity, not truth" boundary). The
+check closes the timestamp-only-tamper and accidental-impossibility
+classes and moves the canonical-timestamp discipline from write-time
+only to read-time too; binding time to an external, harder-to-forge
+reference (a notarised clock, a CRONOS trace) is a Phase-2 decision, not
+a Phase-1 promise.
+
 ## The embedding boundary is trusted
 
 `quantize_embedding()` makes model output exact *from that point on*;
@@ -101,14 +135,27 @@ together will fail those tests. If the agreement section is ever
 weakened, the duplication stops being a decision and becomes the bug
 this file warns about.
 
-## Partial bundles fail B5 when sweeps reference absent memories
+## Excluded sweeps are declared claims, not verified ones
 
-Emergent behaviour, examined and kept: exporting a subset of memories
-while the bundle carries a sweep whose flagged memories are outside the
-subset makes B5 fail in both verifiers — a bundle cannot silently claim
-sweep evidence it does not carry. The consequence is that honest
-partial exports of swept fields are currently impossible without
-shipping every swept memory. The clean fix is an explicit
-`excluded_sweeps` declaration in the bundle body (absence stated, not
-implied); until it exists, export the full field or expect B5 to say
-why not.
+(Successor to the former entry "Partial bundles fail B5 when sweeps
+reference absent memories" — the `excluded_sweeps` declaration that
+entry named as the clean fix now exists.) `export_bundle()` partitions
+sweep rows: a sweep whose entire flagged set travels in the bundle goes
+into `sweeps` and B5 checks its count and seal; any other sweep goes
+into `excluded_sweeps` — absence stated, never implied — and B5
+enforces that the exclusion is genuine (strictly fewer flagged
+memories carried than claimed), unambiguous (no sweep in both lists),
+and complete (every sweep_id referenced by a TAINT_FLAGGED event
+appears in one of the two lists). Honest partial exports of swept
+fields now verify, and the offline CLI names every declared exclusion
+on success.
+
+What remains, named: an excluded sweep's seal is NOT checked — its
+evidence lives outside the bundle, so exclusion is a claim the auditor
+sees and may act on (demand the full field), not a claim the verifier
+proves. And a sweep none of whose flagged memories are in the export
+leaves no referencing event behind, so a hostile exporter could omit
+it entirely rather than declare it; `export_bundle()` always declares,
+but the verifier cannot detect that omission. Partial exports prove
+what they carry, never what they omit — the full-field export is the
+only bundle that proves the absence of further sweeps.

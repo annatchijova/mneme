@@ -39,8 +39,10 @@ What neither had, and MNEME adds:
 2. **Taint propagation.** Quarantine an actor and one deterministic,
    sealed sweep flags every memory that actor ever touched — including
    legitimate memories it merely REINFORCED, because that inflation is
-   part of the incident. False positives are REHABILITATED by audited
-   event, never by column edit.
+   part of the incident. Being *contradicted* by the actor is not being
+   touched: taint tracks influence, not enmity, so quarantining an
+   attacker never silences the memories it attacked. False positives
+   are REHABILITATED by audited event, never by column edit.
 3. **Exact recall ranking.** raven bought determinism by pinning BLAS
    to one thread. MNEME removes the problem: ranking is exact rational
    arithmetic (`Fraction`), so the same database state and query yield
@@ -58,17 +60,24 @@ What neither had, and MNEME adds:
                           genesis bound to memory_id, append (caller owns
                           the transaction), pure verification
     mneme/trust.py        actor quarantine, deterministic taint sweeps
-                          sealed by hash, audited rehabilitation
+                          sealed by hash, direct memory quarantine,
+                          audited rehabilitation
     mneme/field.py        store with bilateral contradiction events,
-                          exact reinforcement c' = c + α(1−c),
+                          bilateral supersession (M1's path for new
+                          content), exact reinforcement c' = c + α(1−c),
                           custody-gated recall with exact ranking and
-                          sealed recall receipts
+                          sealed recall receipts, persisted only by the
+                          caller's explicit act
     mneme/bundle.py       evidence bundle export + verification (B1–B6)
     mneme/schema.sql      SQLite WAL, Phase 1; written to port to
                           CockroachDB mechanically
     verify_offline.py     standalone stdlib-only verifier — send this
                           file plus a bundle to an auditor; they need
                           nothing else
+    demo.py               narrated end-to-end incident: poison, sweep,
+                          gated recall, sealed export, hostile audit
+    SECURITY_AUDIT.md     Round-1 adversarial audit (A–D–I): findings
+                          confirmed by induction, and discarded vectors
     tests/                pure suites: no pip installs, no infrastructure,
                           SQLite :memory: only
 
@@ -90,9 +99,16 @@ recomputes seals, relinks chains, and replays state from evidence.
 ## Quick start
 
 ```bash
-python3 tests/test_custody_pure.py   # 29 checks: chains, grafting, forks
-python3 tests/test_field_pure.py     # 28 checks: gate, exact ranking, rescue
-python3 tests/test_bundle_pure.py    # 47 checks: bundles + verifier agreement
+python3 tests/test_custody_pure.py   # 37 checks: chains, grafting, forks,
+                                     #   temporal plausibility
+python3 tests/test_field_pure.py     # 41 checks: gate (serving AND
+                                     #   influence), exact ranking, rescue,
+                                     #   supersession, receipts
+python3 tests/test_bundle_pure.py    # 87 checks: bundles, declared partial
+                                     #   exports, lineage, backward-time,
+                                     #   verifier agreement
+python3 demo.py                      # one poisoned-RAG incident, end to
+                                     #   end, narrated
 ```
 
 No dependencies. If a test file imports something you had to install,
@@ -116,17 +132,21 @@ caught, in both verifiers:
 | Edit a memory's content | B1 (seal), or B3 after resealing |
 | Edit any custody event, however old | B2 — entry hash does not recompute |
 | Drop or reorder events | B2 — seq density / linkage |
+| Rehash a chain to run backwards in time | B2 — timestamps must be canonical UTC and non-decreasing |
 | Graft memory A's chain onto memory B | B2 — genesis binding fails at seq 0 |
 | Fork a chain (two events, one parent) | `UNIQUE(memory_id, prev_hash)` at write time |
 | Un-taint by editing the status column | B4 — replay disagrees |
 | Inflate confidence without events | B4 — REINFORCED arithmetic replayed |
+| Claim supersession lineage the other chain never consented to | B4 — lineage is bilateral, both directions checked |
 | Deny a sweep flagged what it flagged | B5 — flagged set hashes to the seal |
-| Ship a partial bundle claiming full sweeps | B5 — evidence absent, claim present |
+| Ship partial sweep evidence without declaring it | B5 — a referenced sweep is carried in full or declared excluded, never implied absent |
+| Dodge a sweep's seal check by declaring it excluded | B5 — a fully-evidenced sweep may not be excluded |
 | Forge the cross-memory commitment | B6 — Merkle root over heads |
 
 ## Status
 
-Phase 1: core complete, 104/104 pure checks passing. Not yet built:
-HTTP API, demo harness, k-NN graph for large corpora, STDP synaptic
-dynamics, stylometric authorship checks (see `KNOWN_LIMITATIONS.md` —
-every absence there is a decision with a rationale, not an oversight).
+Phase 1: core complete, 165/165 pure checks passing, demo harness and
+a Round-1 security audit (`SECURITY_AUDIT.md`) included. Not yet built: HTTP API, k-NN graph for large corpora, STDP
+synaptic dynamics, stylometric authorship checks (see
+`KNOWN_LIMITATIONS.md` — every absence there is a decision with a
+rationale, not an oversight).

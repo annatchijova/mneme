@@ -13,12 +13,27 @@ deleted, and deletion would also destroy the evidence. The question is:
      reproducible from the audit trail alone."
 
 Definition of "touched" (deliberately broad, documented, testable):
-a memory is tainted by actor X if ANY event in its custody chain names
-X as actor_id. Not just STORED — a poisoned source that REINFORCED a
-legitimate memory inflated its confidence, and that inflation is part
-of the incident. Analysts can REHABILITATE false positives; the
-rehabilitation is itself an audited custody event. Over-flagging with
-an audited reversal path is recoverable; under-flagging is not.
+a memory is tainted by actor X if any event in its custody chain names
+X as actor_id — EXCEPT CONTRADICTED_BY. Not just STORED — a poisoned
+source that REINFORCED a legitimate memory inflated its confidence,
+and that inflation is part of the incident. Analysts can REHABILITATE
+false positives; the rehabilitation is itself an audited custody
+event. Over-flagging with an audited reversal path is recoverable;
+under-flagging is not.
+
+The CONTRADICTED_BY carve-out is an explicit architecture decision,
+not a softening. When X stores a memory that contradicts memory V, the
+contradiction event lands on V's chain with X as its author — the one
+event type through which an actor writes its identity onto an
+ARBITRARY victim's chain. Counting it as "touched" hands an attacker a
+lever: contradict every truth you want suppressed, and the day you are
+quarantined, the sweep silences your victims for you — a validated
+truth silenced by an unverified claim, the exact outcome the rescue
+rule exists to refuse. Taint tracks INFLUENCE (events that created a
+memory or raised its standing); being attacked by X is not influence
+by X. The attacker's own contradicting memory is still flagged through
+its STORED event, and the victim's chain still carries the
+CONTRADICTED_BY evidence for any auditor to see.
 
 Determinism: the flagged set is derived from the custody_chain table by
 one SQL query with a total ORDER BY; the sweep seals
@@ -82,7 +97,9 @@ def quarantine_actor(
          sweep for the same incident would double-write custody events
          and split the evidence across two sweep ids).
       2. SELECT DISTINCT memory_id FROM custody_chain WHERE actor_id = X
-         ORDER BY memory_id — the deterministic flagged set.
+         AND event_type != 'CONTRADICTED_BY' ORDER BY memory_id — the
+         deterministic flagged set (see the module header for why being
+         contradicted by X is not being touched by X).
       3. For each: custody event TAINT_FLAGGED + custody_status update
          (only if currently CLEAN; QUARANTINED/SUPERSEDED memories keep
          their stronger status, but the custody event is still written —
@@ -116,7 +133,7 @@ def quarantine_actor(
 
     cur.execute(
         "SELECT DISTINCT memory_id FROM custody_chain WHERE actor_id = ? "
-        "ORDER BY memory_id ASC",
+        "AND event_type != 'CONTRADICTED_BY' ORDER BY memory_id ASC",
         (actor_id,),
     )
     flagged = [r[0] for r in cur.fetchall()]
@@ -172,6 +189,53 @@ def quarantine_actor(
         flagged_memory_ids=tuple(flagged),
         flagged_ids_sha256=seal,
         advisory_resonant_neighbours=tuple(neighbours),
+    )
+
+
+def quarantine_memory(
+    cur,
+    *,
+    memory_id: str,
+    actor_id: str,
+    reason: str,
+    created_at: str | None = None,
+) -> None:
+    """
+    Direct quarantine of ONE memory: the analyst has evidence against
+    this memory itself (not merely against an actor in its chain).
+    QUARANTINED custody event + status update, one transaction, the
+    caller's.
+
+    Allowed from any status except QUARANTINED itself: upgrading a
+    TAINT_FLAGGED memory records that suspicion became direct evidence,
+    and quarantining a SUPERSEDED memory records incrimination the
+    supersession must not bury. Re-quarantining is refused — the second
+    incident's evidence belongs in the first event's chain succession,
+    not in a duplicate status write.
+
+    There is deliberately NO reversal here: rehabilitate_memory()
+    reverses TAINT_FLAGGED only. Undoing a direct quarantine is a
+    stronger claim with no designed review path yet — named in
+    KNOWN_LIMITATIONS, arriving with its own invariant or not at all.
+    """
+    cur.execute("SELECT custody_status FROM memories WHERE memory_id = ?",
+                (memory_id,))
+    row = cur.fetchone()
+    if row is None:
+        raise ValueError(f"Unknown memory {memory_id!r}.")
+    if row[0] == "QUARANTINED":
+        raise ValueError(
+            f"{memory_id} is already QUARANTINED — a duplicate quarantine "
+            "would add a status write with no new evidence."
+        )
+    ts = created_at if created_at is not None else custody.now_ts()
+    custody.append_event(
+        cur, memory_id=memory_id, event_type="QUARANTINED",
+        actor_id=actor_id, reason=reason, payload={}, created_at=ts,
+    )
+    cur.execute(
+        "UPDATE memories SET custody_status = 'QUARANTINED' WHERE memory_id = ?",
+        (memory_id,),
     )
 
 

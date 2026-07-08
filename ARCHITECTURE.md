@@ -102,10 +102,10 @@ fails at seq 0 by construction.
 
 | Event | Semantics | Payload contract |
 |---|---|---|
-| `STORED` | birth; seq 0 only, once | `content_sha256` (mandatory), `embedding_model`, optional `topic`/`claim` |
+| `STORED` | birth; seq 0 only, once | `content_sha256` (mandatory), `embedding_model`, optional `topic`/`claim`, optional `supersedes` (written by `supersede()`, checked bilaterally in B4) |
 | `REINFORCED` | confidence raised | `confidence_before`, `confidence_after` (both replayed, B4) |
 | `CONTRADICTED_BY` | conflict detected | `other_memory_id`, `topic` — written on BOTH chains |
-| `SUPERSEDED_BY` | newer memory replaces this | successor id |
+| `SUPERSEDED_BY` | newer memory replaces this | `successor_memory_id` — written together with the successor's STORED, one transaction |
 | `QUARANTINED` | direct action against this memory | — |
 | `TAINT_FLAGGED` | transitive: an actor in this chain was quarantined | `sweep_id` (ties evidence to its sweep, B5) |
 | `REHABILITATED` | audited reversal of TAINT_FLAGGED | `from_status` |
@@ -118,11 +118,23 @@ the other party's export hide it.
 ## Taint model
 
 **Definition of "touched"** (deliberately broad): a memory is tainted
-by actor X if any event in its custody chain names X. Not only STORED —
-a poisoned source that REINFORCED a legitimate memory inflated its
-confidence, and that inflation is part of the incident. The remedy for
-over-flagging is audited rehabilitation; there is no remedy for
-under-flagging.
+by actor X if any event in its custody chain names X — except
+`CONTRADICTED_BY`. Not only STORED — a poisoned source that REINFORCED
+a legitimate memory inflated its confidence, and that inflation is
+part of the incident. The remedy for over-flagging is audited
+rehabilitation; there is no remedy for under-flagging.
+
+The `CONTRADICTED_BY` carve-out is itself an architecture decision:
+when X's memory contradicts memory V, the event lands on V's chain
+authored by X — the one event type through which an actor writes its
+identity onto an arbitrary victim's chain. Counting it would let an
+attacker contradict every truth it wants suppressed and have the
+eventual quarantine sweep silence the victims — a validated truth
+silenced by an unverified claim, which the rescue rule exists to
+refuse. Taint tracks *influence* (events that created a memory or
+raised its standing); being attacked by X is not influence by X. X's
+own contradicting memory is still flagged via its STORED event, and
+V's chain keeps the CONTRADICTED_BY evidence in plain sight.
 
 **Determinism and sealing**: the flagged set is one SQL query with a
 total ORDER BY; the sweep row seals
@@ -146,9 +158,15 @@ KNOWN_LIMITATIONS.md.
 
 **The gate is a WHERE clause, not a post-filter**: candidates load with
 `custody_status = 'CLEAN'`, so a tainted memory cannot even become the
-BFS seed. Every exclusion is counted in the recall receipt — a sealed
-object (digest over canonical JSON) recording query hash, seed, served
-ids in order, and the withheld counts by cause. Recall itself is
+BFS seed. The gate extends to the GRAPH, not only to serving: a link is
+traversed during BFS only when both endpoints are CLEAN, so a non-CLEAN
+memory can neither inhibit nor resonate a served one — invisible to the
+agent as a *result* and as an *influence* (security audit Round 1, H2;
+gating serving alone left a quarantined node on a resonant path able to
+perturb a clean memory's ranking). Every exclusion is counted in the
+recall receipt — a sealed object (digest over canonical JSON) recording
+query hash, seed, served ids in order, and the withheld counts by
+cause. Recall itself is
 read-only (serving is not a state transition); reinforcement driven by
 recall is the caller's explicit audited act.
 
@@ -183,18 +201,20 @@ it would launder taint into confidence.
 ## Evidence bundles (B1–B6)
 
 One canonical JSON file: memories (content + declared final state +
-full chains), sweeps, a Merkle root over chain heads (leaves sorted by
-memory_id; odd leaf promoted unpaired — duplicating the last leaf
-admits two leaf sets with one root, an ambiguity we refuse), and a
-bundle seal.
+full chains), sweeps — partitioned into `sweeps` (flagged evidence
+carried in full, seal checked) and `excluded_sweeps` (evidence
+declared absent, for partial exports: absence stated, never implied) —
+a Merkle root over chain heads (leaves sorted by memory_id; odd leaf
+promoted unpaired — duplicating the last leaf admits two leaf sets
+with one root, an ambiguity we refuse), and a bundle seal.
 
 | Check | Proves |
 |---|---|
 | B1 | the bundle as shipped is the bundle as sealed |
-| B2 | every chain: genesis binding, density, linkage, recomputation, closed vocabulary, canonical payload bytes |
+| B2 | every chain: genesis binding, density, linkage, recomputation, closed vocabulary, canonical payload bytes, canonical UTC timestamps non-decreasing along seq (integrity + order is not temporal plausibility) |
 | B3 | the content shipped is the content born (STORED seal) |
-| B4 | declared custody_status / field_state / confidence reproduce from replaying the chain — **state is derivable from evidence** |
-| B5 | each sweep's flagged set matches its count and seal; a partial bundle cannot silently claim sweep evidence it does not carry |
+| B4 | declared custody_status / field_state / confidence reproduce from replaying the chain — **state is derivable from evidence**; supersession lineage is bilateral when both parties travel in the bundle |
+| B5 | every included sweep's flagged set matches its count and seal; a sweep not fully evidenced must be *declared* excluded — declaring away a fully-evidenced sweep, double-declaring, or referencing an undeclared sweep all fail |
 | B6 | the cross-memory commitment recomputes |
 
 The normative replay state machine is stated once, in
@@ -219,8 +239,10 @@ Inherited unchanged: refuse loudly at the boundary with our words
 before SQL objects with its own; name leftover work instead of hiding
 it; a limitation named is a decision, a limitation hidden is a bug
 waiting for a better moment. Where behaviour emerged from tests rather
-than intent (the partial-bundle B5 failure), it was examined, judged
-correct, and promoted to documented behaviour.
+than intent (the original partial-bundle B5 failure), it was examined,
+judged correct, promoted to documented behaviour — and later replaced
+by design (the `excluded_sweeps` declaration), the full arc a
+limitation is supposed to travel.
 
 ## Phase 2 sketch (not designed, only reserved)
 

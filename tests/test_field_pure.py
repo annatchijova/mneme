@@ -11,6 +11,10 @@ The claims under test, one section per claim:
   - reinforcement follows the closed form c + α(1−c) exactly and
     promotes at the exact threshold, all under verifying custody chains
   - receipts are deterministic: same state + same query ⇒ same digest
+  - supersession is bilateral evidence: successor's STORED and
+    predecessor's SUPERSEDED_BY are written together, lineage never forks
+  - persisted receipts recompute from their own columns; edits are
+    self-revealing
 """
 
 from __future__ import annotations
@@ -211,6 +215,121 @@ try:
     check("reinforcing tainted memory refused", False)
 except ValueError as e:
     check("reinforcing tainted memory refused", "launder" in str(e))
+
+# ---------------------------------------------------------------- supersession
+print("[supersession]")
+import json
+
+conn = fresh_db()
+cur = conn.cursor()
+field.store(cur, memory_id="mem-old", content="v1 of the doc",
+            embedding=emb(1.0, 0.0), embedding_model="dev",
+            actor_id="agent-1", reason="ingestion")
+field.supersede(cur, old_memory_id="mem-old", memory_id="mem-new",
+                content="v2 of the doc", embedding=emb(1.0, 0.05),
+                embedding_model="dev", actor_id="analyst-anna",
+                reason="doc refreshed")
+conn.commit()
+row = cur.execute("SELECT custody_status, superseded_by FROM memories "
+                  "WHERE memory_id='mem-old'").fetchone()
+check("predecessor is SUPERSEDED and points forward",
+      row == ("SUPERSEDED", "mem-new"), str(row))
+last = cur.execute("SELECT event_type, payload_json FROM custody_chain "
+                   "WHERE memory_id='mem-old' ORDER BY seq DESC LIMIT 1").fetchone()
+check("SUPERSEDED_BY names the successor",
+      last[0] == "SUPERSEDED_BY"
+      and json.loads(last[1])["successor_memory_id"] == "mem-new", str(last))
+birth = cur.execute("SELECT payload_json FROM custody_chain "
+                    "WHERE memory_id='mem-new' AND seq=0").fetchone()[0]
+check("successor's STORED names its predecessor",
+      json.loads(birth).get("supersedes") == "mem-old")
+check("both chains verify",
+      custody.verify_custody_chain(cur, "mem-old")[0]
+      and custody.verify_custody_chain(cur, "mem-new")[0])
+
+hits, receipt = field.recall(cur, query_embedding=emb(1.0, 0.0), top_k=5)
+check("recall serves the successor, never the superseded",
+      [h.memory_id for h in hits] == ["mem-new"]
+      and receipt.excluded_custody == 1,
+      str(([h.memory_id for h in hits], receipt.excluded_custody)))
+
+try:
+    field.supersede(cur, old_memory_id="mem-old", memory_id="mem-new-2",
+                    content="v3", embedding=emb(1.0, 0.1),
+                    embedding_model="dev", actor_id="agent-1", reason="again")
+    check("second supersession refused — lineage never forks", False)
+except ValueError as e:
+    check("second supersession refused — lineage never forks",
+          "SUPERSEDED" in str(e), str(e))
+
+try:
+    field.reinforce(cur, memory_id="mem-old", actor_id="agent-1", reason="r")
+    check("reinforcing a superseded memory refused", False)
+except ValueError:
+    check("reinforcing a superseded memory refused", True)
+
+# ---------------------------------------------------------------- receipts
+print("[receipt persistence]")
+import dataclasses
+
+forged = dataclasses.replace(receipt, served=("mem-else",))
+try:
+    field.persist_receipt(cur, forged)
+    check("forged receipt refused at persist", False)
+except ValueError as e:
+    check("forged receipt refused at persist", "recompute" in str(e), str(e))
+
+field.persist_receipt(cur, receipt)
+field.persist_receipt(cur, receipt)   # same evidence, same digest, one row
+conn.commit()
+n = cur.execute("SELECT COUNT(*) FROM recall_receipts").fetchone()[0]
+check("persist is idempotent by digest", n == 1, str(n))
+ok, errs = field.verify_receipts(cur)
+check("persisted receipt recomputes from its columns", ok, str(errs))
+
+cur.execute("UPDATE recall_receipts SET served_json = ?",
+            (json.dumps({"served": ["mem-old"]}, separators=(",", ":")),))
+conn.commit()
+ok, errs = field.verify_receipts(cur)
+check("edited receipt evidence is self-revealing", not ok and len(errs) == 1,
+      str(errs))
+
+# ------------------------------------------------- custody gate covers influence
+# Security audit Round 1, finding H2: a non-CLEAN memory must exert ZERO
+# influence on the recall of CLEAN memories — not merely be unserved. A
+# quarantined node sitting on a RESONANT path between a clean seed and a
+# clean target must not perturb the target's ranking. RESONANT links have
+# no public creation API in Phase 1, so we insert them by hand: the
+# invariant must hold for the Phase-2 state too.
+print("[custody gate covers influence, not just serving]")
+
+def _score_of_t(*, with_q: bool, quarantine: bool) -> str:
+    c = fresh_db()
+    cu = c.cursor()
+    ts = custody.now_ts()
+    field.store(cu, memory_id="mem-s", content="s", embedding=emb(1.0, 0.0),
+                embedding_model="d", actor_id="agent-1", reason="i")
+    field.store(cu, memory_id="mem-t", content="t", embedding=emb(0.0, 1.0),
+                embedding_model="d", actor_id="agent-1", reason="i")
+    if with_q:
+        field.store(cu, memory_id="mem-q", content="q", embedding=emb(0.5, 0.5),
+                    embedding_model="d", actor_id="agent-1", reason="i")
+        cu.execute("INSERT INTO cell_links VALUES ('mem-s','mem-q','RESONANT',1,?)", (ts,))
+        cu.execute("INSERT INTO cell_links VALUES ('mem-q','mem-t','RESONANT',1,?)", (ts,))
+        if quarantine:
+            trust.quarantine_memory(cu, memory_id="mem-q", actor_id="analyst-anna",
+                                    reason="poison on the resonant path")
+    c.commit()
+    hits, _ = field.recall(cu, query_embedding=emb(1.0, 1.0), top_k=5, hops=3)
+    return next(str(h.score) for h in hits if h.memory_id == "mem-t")
+
+absent = _score_of_t(with_q=False, quarantine=False)
+clean = _score_of_t(with_q=True, quarantine=False)
+quar = _score_of_t(with_q=True, quarantine=True)
+check("a quarantined intermediary exerts no influence (== its absence)",
+      quar == absent, f"absent={absent} clean={clean} quarantined={quar}")
+check("a genuinely CLEAN intermediary still resonates (mechanic intact)",
+      clean != absent, f"absent={absent} clean={clean}")
 
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

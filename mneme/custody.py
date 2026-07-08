@@ -111,6 +111,15 @@ _ID_PATTERN = re.compile(r"^[a-zA-Z0-9_\-.:]+$")
 
 _GENESIS_PREFIX = b"MNEME_CUSTODY_GENESIS:"
 
+# The canonical timestamp form that format_ts() emits: UTC, microsecond
+# precision, explicit +00:00 offset. Verification re-asserts this shape so
+# that (a) a lexicographic comparison of two created_at strings equals a
+# chronological one — true only for a fixed-width UTC format, which is why
+# a rogue offset like +05:00 is refused — and (b) the discipline enforced
+# at WRITE is also enforced at READ, not merely trusted.
+_TS_PATTERN = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}\+00:00$")
+
 
 def genesis_hash(memory_id: str) -> str:
     """
@@ -325,6 +334,11 @@ def verify_custody_rows(memory_id: str, rows: list[dict[str, Any]]) -> tuple[boo
       4. recomputation: every entry_hash re-derives from its fields
       5. vocabulary: every event_type is known
       6. payload is valid JSON whose canonical form matches stored bytes
+      7. created_at is canonical UTC form AND non-decreasing along seq —
+         a chain cannot run backwards in time. Integrity and insertion
+         order are not enough: a hash-valid chain whose seq-1 event is
+         timestamped before its seq-0 birth is a history that cannot have
+         happened, and evidence that cannot have happened is not evidence.
     """
     import json as _json
 
@@ -333,6 +347,7 @@ def verify_custody_rows(memory_id: str, rows: list[dict[str, Any]]) -> tuple[boo
         return False, [f"{memory_id}: empty custody chain — a memory without a birth event."]
 
     expected_prev = genesis_hash(memory_id)
+    prev_ts: str | None = None
     for i, r in enumerate(rows):
         where = f"{memory_id} seq {r.get('seq')}"
         if r.get("seq") != i:
@@ -377,6 +392,19 @@ def verify_custody_rows(memory_id: str, rows: list[dict[str, Any]]) -> tuple[boo
         if recomputed != r["entry_hash"]:
             errors.append(f"{where}: entry_hash does not recompute — content tampered.")
             return False, errors
+
+        ts = r["created_at"]
+        if not isinstance(ts, str) or not _TS_PATTERN.match(ts):
+            errors.append(f"{where}: created_at {ts!r} is not canonical UTC "
+                          "microsecond ISO 8601 (…+00:00) — a rogue offset "
+                          "would make timestamp ordering a lie.")
+            return False, errors
+        if prev_ts is not None and ts < prev_ts:
+            errors.append(f"{where}: created_at {ts} precedes the previous "
+                          f"event's {prev_ts} — a custody chain cannot run "
+                          "backwards in time.")
+            return False, errors
+        prev_ts = ts
         expected_prev = r["entry_hash"]
 
     return True, []

@@ -174,6 +174,54 @@ except sqlite3.IntegrityError:
     check("fork violates UNIQUE(memory_id, prev_hash)", True)
 conn.rollback()
 
+# ---------------------------------------------------------------- temporal
+# A hash-valid chain still cannot run backwards in time, nor carry a
+# non-UTC timestamp offset (which would make lexicographic ordering a
+# lie). Security audit Round 1, finding H1: integrity + insertion order
+# is not the same as temporal plausibility.
+print("[temporal plausibility]")
+def _forge(mid, events):
+    """events: list of (event_type, actor, reason, created_at, payload)."""
+    prev = custody.genesis_hash(mid)
+    out = []
+    for seq, (et, actor, reason, ts, payload) in enumerate(events):
+        eh, pj = custody.compute_entry_hash(
+            prev_hash=prev, memory_id=mid, seq=seq, event_type=et,
+            actor_id=actor, reason=reason, created_at=ts, payload=payload)
+        out.append({"memory_id": mid, "seq": seq, "event_type": et,
+                    "actor_id": actor, "reason": reason, "created_at": ts,
+                    "payload_json": pj, "prev_hash": prev, "entry_hash": eh})
+        prev = eh
+    return out
+
+_csha = custody.content_sha256("x")
+backward = _forge("mem-t", [
+    ("STORED", "agent-1", "birth", "2026-07-08T12:00:00.000000+00:00",
+     {"content_sha256": _csha}),
+    ("REINFORCED", "agent-1", "r", "2026-07-08T11:00:00.000000+00:00",
+     {"confidence_before": "0.5000000000", "confidence_after": "0.6250000000"}),
+])
+ok, errs = custody.verify_custody_rows("mem-t", backward)
+check("hash-valid backward-in-time chain is refused",
+      not ok and "backwards" in errs[0], str(errs))
+
+rogue_tz = _forge("mem-z", [
+    ("STORED", "agent-1", "birth", "2026-07-08T12:00:00.000000+05:00",
+     {"content_sha256": _csha}),
+])
+ok, errs = custody.verify_custody_rows("mem-z", rogue_tz)
+check("non-UTC timestamp offset is refused",
+      not ok and "canonical UTC" in errs[0], str(errs))
+
+# Equal timestamps along a chain are legal (same-transaction events).
+same_ts = _forge("mem-eq", [
+    ("STORED", "agent-1", "birth", "2026-07-08T12:00:00.000000+00:00",
+     {"content_sha256": _csha}),
+    ("QUARANTINED", "agent-1", "q", "2026-07-08T12:00:00.000000+00:00", {}),
+])
+ok, errs = custody.verify_custody_rows("mem-eq", same_ts)
+check("equal timestamps along a chain are accepted", ok, str(errs))
+
 # ---------------------------------------------------------------- taint
 print("[taint propagation]")
 conn = fresh_db()
@@ -186,6 +234,13 @@ store_memory(cur, "mem-touched", "the moon exists", "agent-1")
 custody.append_event(cur, memory_id="mem-touched", event_type="REINFORCED",
                      actor_id="pipeline-x", reason="corroboration",
                      payload={"note": "inflated"})
+# pipeline-x's poison also CONTRADICTED a legitimate memory: the event
+# lands on the victim's chain with pipeline-x as author, but being
+# attacked by X is not being touched by X — the sweep must NOT flag it
+store_memory(cur, "mem-victim", "the truth pipeline-x attacked", "agent-1")
+custody.append_event(cur, memory_id="mem-victim", event_type="CONTRADICTED_BY",
+                     actor_id="pipeline-x", reason="auto contradiction",
+                     payload={"other_memory_id": "mem-poison-1", "topic": "t"})
 ts = custody.now_ts()
 cur.execute("INSERT INTO cell_links (from_id, to_id, link_type, auto, created_at) "
             "VALUES ('mem-poison-1', 'mem-clean', 'RESONANT', 1, ?)", (ts,))
@@ -204,6 +259,10 @@ check("clean memory untouched",
       .fetchone()[0] == "CLEAN")
 check("resonant neighbour is advisory, not flagged",
       sweep.advisory_resonant_neighbours == ("mem-clean",))
+check("contradiction victim is not flagged (taint tracks influence, not enmity)",
+      "mem-victim" not in sweep.flagged_memory_ids and
+      cur.execute("SELECT custody_status FROM memories WHERE memory_id='mem-victim'")
+      .fetchone()[0] == "CLEAN")
 
 for mid in sweep.flagged_memory_ids:
     ok, errs = custody.verify_custody_chain(cur, mid)
@@ -231,6 +290,24 @@ check("rehabilitation is on the chain and chain verifies",
       ok and last_event == "REHABILITATED", str(errs))
 
 raises("rehabilitating a CLEAN memory refused",
+       lambda: trust.rehabilitate_memory(cur, memory_id="mem-clean",
+                                         actor_id="analyst-anna", reason="r"),
+       ValueError, "TAINT_FLAGGED only")
+
+# direct quarantine of ONE memory: evidence against the memory itself
+trust.quarantine_memory(cur, memory_id="mem-clean", actor_id="analyst-anna",
+                        reason="directly incriminated in incident review")
+conn.commit()
+check("directly quarantined memory is QUARANTINED",
+      cur.execute("SELECT custody_status FROM memories WHERE memory_id='mem-clean'")
+      .fetchone()[0] == "QUARANTINED")
+ok, errs = custody.verify_custody_chain(cur, "mem-clean")
+check("chain verifies after direct quarantine", ok, str(errs))
+raises("double direct quarantine refused",
+       lambda: trust.quarantine_memory(cur, memory_id="mem-clean",
+                                       actor_id="analyst-anna", reason="again"),
+       ValueError, "already QUARANTINED")
+raises("rehabilitating a QUARANTINED memory refused (stronger claim)",
        lambda: trust.rehabilitate_memory(cur, memory_id="mem-clean",
                                          actor_id="analyst-anna", reason="r"),
        ValueError, "TAINT_FLAGGED only")

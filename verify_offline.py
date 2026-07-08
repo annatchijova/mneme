@@ -22,11 +22,22 @@ Checks (normative statement in mneme/bundle.py's header):
   B1  bundle seal recomputes
   B2  every custody chain: genesis bound to memory_id, dense seq,
       linkage, entry hashes recompute, closed vocabulary, canonical
-      payload bytes
+      payload bytes, canonical UTC timestamps that never run backwards
   B3  content hashes to the seal in its STORED (birth) event
   B4  declared custody_status / field_state / confidence reproduce
-      from replaying the chain's events
-  B5  every sweep's flagged set matches its count and seal
+      from replaying the chain's events; supersession lineage is
+      bilateral when both parties travel in the bundle (a STORED
+      "supersedes": X needs X's chain to name this memory back in a
+      SUPERSEDED_BY event, and vice versa)
+  B5  sweep evidence — absence stated, never implied: no sweep_id in
+      both "sweeps" and "excluded_sweeps"; every included sweep's
+      flagged set matches its count and seal; an excluded sweep must
+      be genuinely partial (strictly fewer flagged memories carried
+      than its flagged_count); every sweep_id referenced by a
+      TAINT_FLAGGED event appears in one of the two lists. Excluded
+      sweeps' seals are NOT checked — exclusion is a declared claim
+      the auditor sees (this verifier names them on success), not a
+      verified one.
   B6  Merkle root over chain heads recomputes (leaves sorted by
       memory_id ASC, odd leaf promoted unpaired)
 """
@@ -45,6 +56,9 @@ EVENT_TYPES = frozenset({
     "QUARANTINED", "TAINT_FLAGGED", "REHABILITATED", "STATE_CHANGED",
 })
 INITIAL_CONFIDENCE = "0.5000000000"
+# Canonical timestamp shape (UTC, microseconds, +00:00). Verification
+# re-asserts it so lexicographic order equals chronological order.
+TS_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}\+00:00$")
 
 
 # --- canonical JSON (protocol transcription; floats are forbidden) ---------
@@ -79,6 +93,7 @@ def verify_chain(memory_id: str, chain: list[dict], errors: list[str]) -> bool:
         errors.append(f"B2: {memory_id}: empty custody chain — a memory without a birth event.")
         return False
     expected_prev = sha256_hex(GENESIS_PREFIX + memory_id.encode("utf-8"))
+    prev_ts = None
     for i, r in enumerate(chain):
         where = f"B2: {memory_id} seq {r.get('seq')}"
         if r.get("seq") != i:
@@ -111,6 +126,14 @@ def verify_chain(memory_id: str, chain: list[dict], errors: list[str]) -> bool:
         if recomputed != r["entry_hash"]:
             errors.append(f"{where}: entry_hash does not recompute — content tampered.")
             return False
+        ts = r["created_at"]
+        if not isinstance(ts, str) or not TS_PATTERN.match(ts):
+            errors.append(f"{where}: created_at {ts!r} is not canonical UTC "
+                          "microsecond ISO 8601 (…+00:00)."); return False
+        if prev_ts is not None and ts < prev_ts:
+            errors.append(f"{where}: created_at {ts} precedes the previous "
+                          f"event's {prev_ts} — chain runs backwards in time."); return False
+        prev_ts = ts
         expected_prev = r["entry_hash"]
     born = json.loads(chain[0]["payload_json"]).get("content_sha256", "")
     if not re.fullmatch(r"[0-9a-f]{64}", born or ""):
@@ -195,6 +218,8 @@ def verify(bundle_json: str) -> tuple[bool, list[str]]:
 
     heads: dict[str, str] = {}
     tf_by_sweep: dict[str, list[str]] = {}
+    stored_supersedes: dict[str, str] = {}   # successor -> claimed predecessor
+    successors: dict[str, set[str]] = {}     # predecessor -> SUPERSEDED_BY names
 
     for mem in body.get("memories", []):
         mid = mem["memory_id"]
@@ -203,7 +228,10 @@ def verify(bundle_json: str) -> tuple[bool, list[str]]:
             continue
         heads[mid] = chain[-1]["entry_hash"]
 
-        born = json.loads(chain[0]["payload_json"])["content_sha256"]
+        birth = json.loads(chain[0]["payload_json"])
+        if isinstance(birth.get("supersedes"), str):
+            stored_supersedes[mid] = birth["supersedes"]
+        born = birth["content_sha256"]
         if sha256_hex(mem["content"].encode("utf-8")) != born:
             errors.append(f"B3: {mid}: content does not hash to the STORED seal.")
         if mem.get("content_sha256") != born:
@@ -225,8 +253,29 @@ def verify(bundle_json: str) -> tuple[bool, list[str]]:
                 sid = json.loads(r["payload_json"]).get("sweep_id")
                 if isinstance(sid, str):
                     tf_by_sweep.setdefault(sid, []).append(mid)
+            elif r["event_type"] == "SUPERSEDED_BY":
+                succ = json.loads(r["payload_json"]).get("successor_memory_id")
+                if isinstance(succ, str):
+                    successors.setdefault(mid, set()).add(succ)
 
-    for sw in body.get("sweeps", []):
+    for s, x in sorted(stored_supersedes.items()):
+        if x in heads and s not in successors.get(x, set()):
+            errors.append(f"B4: {s}: STORED claims it supersedes {x}, but "
+                          f"{x}'s chain has no SUPERSEDED_BY naming {s}.")
+    for x in sorted(successors):
+        for s in sorted(successors[x]):
+            if s in heads and stored_supersedes.get(s) != x:
+                errors.append(f"B4: {x}: SUPERSEDED_BY names {s}, but {s}'s "
+                              f"STORED does not claim to supersede {x}.")
+
+    included = body.get("sweeps", [])
+    excluded = body.get("excluded_sweeps", [])  # absent key reads as empty
+    included_ids = {sw["sweep_id"] for sw in included}
+    excluded_ids = {sw["sweep_id"] for sw in excluded}
+    for sid in sorted(included_ids & excluded_ids):
+        errors.append(f"B5: sweep {sid}: declared both included and excluded "
+                      "— ambiguity refused.")
+    for sw in included:
         sid = sw["sweep_id"]
         flagged = sorted(tf_by_sweep.get(sid, []))
         if len(flagged) != sw["flagged_count"]:
@@ -235,6 +284,17 @@ def verify(bundle_json: str) -> tuple[bool, list[str]]:
         derived = sha256_hex(canonical_json({"memory_ids": flagged}).encode("utf-8"))
         if derived != sw["flagged_ids_sha256"]:
             errors.append(f"B5: sweep {sid}: flagged set does not hash to the seal.")
+    for sw in excluded:
+        sid = sw["sweep_id"]
+        carried = len(set(tf_by_sweep.get(sid, [])))
+        if carried >= sw["flagged_count"]:
+            errors.append(f"B5: sweep {sid}: declared excluded but the bundle "
+                          f"carries {carried} of {sw['flagged_count']} flagged "
+                          "memories — complete evidence must be included and "
+                          "checked, not excluded.")
+    for sid in sorted(set(tf_by_sweep) - included_ids - excluded_ids):
+        errors.append(f"B5: sweep {sid}: TAINT_FLAGGED events reference it but "
+                      "the bundle neither carries it nor declares it excluded.")
 
     if heads_merkle_root(heads) != body.get("heads_merkle_root"):
         errors.append("B6: heads_merkle_root does not recompute.")
@@ -247,9 +307,19 @@ def main() -> int:
         print(__doc__)
         return 2
     with open(sys.argv[1], encoding="utf-8") as f:
-        ok, errors = verify(f.read())
+        raw = f.read()
+    ok, errors = verify(raw)
     if ok:
         print("VERIFIED: every check (B1-B6) passed.")
+        # A declared exclusion is a claim the auditor must SEE, not
+        # something a passing verdict may bury.
+        try:
+            excluded = json.loads(raw)["body"].get("excluded_sweeps", [])
+        except Exception:
+            excluded = []
+        for sw in excluded:
+            print(f"  NOTE: sweep {sw['sweep_id']} declared excluded — its seal "
+                  "was NOT checked against evidence in this bundle.")
         return 0
     print(f"FAILED: {len(errors)} problem(s).")
     for e in errors:

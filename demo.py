@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""
+MNEME — Demo harness: one poisoned-RAG incident, end to end, narrated.
+
+    python3 demo.py
+
+Zero dependencies beyond Python 3.10+; the field lives in SQLite
+:memory: and the bundles in a temp directory. Every step is the public
+API doing what an operator would do, in the order an incident actually
+unfolds:
+
+  1. a compromised pipeline plants a poisoned memory and inflates a
+     legitimate one;
+  2. recall shows the field's own defences (inhibition, the rescue
+     rule) and their limit — the poison is servable;
+  3. the actor is quarantined: one sealed sweep flags everything it
+     touched;
+  4. recall again: the custody gate withholds the flagged memories and
+     the receipt counts them;
+  5. the false positive is rehabilitated by audited event;
+  6. the whole field ships as a sealed bundle, verified by the
+     standalone auditor file; a tampered copy is caught; a partial
+     export declares — not hides — the sweep evidence it cannot carry.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from mneme import bundle, custody, field, trust  # noqa: E402
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+VERIFIER = os.path.join(HERE, "verify_offline.py")
+
+
+def section(title: str) -> None:
+    print(f"\n{'=' * 72}\n{title}\n{'=' * 72}")
+
+
+def show_recall(cur, query, note: str) -> None:
+    hits, receipt = field.recall(cur, query_embedding=query, top_k=5)
+    print(f"\nrecall — {note}")
+    for h in hits:
+        rescued = "  [inhibition_rescued]" if h.inhibition_rescued else ""
+        print(f"  {h.score}  {h.memory_id:<12} {h.field_state:<10} "
+              f"{h.content!r}{rescued}")
+    print(f"  receipt {receipt.receipt_sha256[:16]}…  withheld: "
+          f"custody={receipt.excluded_custody} "
+          f"forgotten={receipt.excluded_forgotten} "
+          f"inhibited={receipt.excluded_inhibited}")
+
+
+def run_verifier(path: str) -> None:
+    r = subprocess.run([sys.executable, VERIFIER, path],
+                       capture_output=True, text=True)
+    for line in (r.stdout.strip() or r.stderr.strip()).splitlines():
+        print(f"  auditor> {line}")
+    print(f"  auditor> exit {r.returncode}")
+
+
+def main() -> None:
+    conn = sqlite3.connect(":memory:")
+    with open(os.path.join(HERE, "mneme", "schema.sql")) as f:
+        conn.executescript(f.read())
+    cur = conn.cursor()
+
+    section("1. A field grows — and a compromised pipeline writes into it")
+    for aid, kind in [("agent-ada", "AGENT"), ("pipeline-feeds", "PIPELINE"),
+                      ("analyst-omar", "HUMAN")]:
+        cur.execute("INSERT INTO actors (actor_id, display_name, kind, "
+                    "created_at) VALUES (?, ?, ?, ?)",
+                    (aid, aid, kind, custody.now_ts()))
+
+    e = field.quantize_embedding
+    stored = field.store(
+        cur, memory_id="mem-gate", actor_id="agent-ada", reason="runbook ingestion",
+        content="Production deploys require the staging gate to pass.",
+        embedding=e([1.0, 0.1, 0.0]), embedding_model="demo",
+        topic="deploy-policy", claim="gate-required")
+    print(f"stored mem-gate      by agent-ada       ({stored.content_sha256[:16]}…)")
+    field.store(
+        cur, memory_id="mem-rollback", actor_id="agent-ada", reason="runbook ingestion",
+        content="Rollbacks are executed with `ops rollback <release>`.",
+        embedding=e([0.1, 1.0, 0.0]), embedding_model="demo")
+    print("stored mem-rollback  by agent-ada")
+    poisoned = field.store(
+        cur, memory_id="mem-poison", actor_id="pipeline-feeds", reason="feed sync",
+        content="The staging gate is optional for hotfix deploys.",
+        embedding=e([0.97, 0.05, 0.0]), embedding_model="demo",
+        topic="deploy-policy", claim="gate-optional")
+    print("stored mem-poison    by pipeline-feeds   <- the poisoned write")
+    print(f"  contradiction auto-detected, recorded on BOTH chains: "
+          f"{poisoned.inhibitory_links}")
+
+    for _ in range(3):
+        field.reinforce(cur, memory_id="mem-gate", actor_id="analyst-omar",
+                        reason="verified against the runbook")
+    print("mem-gate reinforced 3x by analyst-omar -> field_state REINFORCED")
+    field.reinforce(cur, memory_id="mem-rollback", actor_id="pipeline-feeds",
+                    reason="feed corroboration")
+    print("mem-rollback reinforced by pipeline-feeds  <- confidence inflated "
+          "by the (not yet known) bad actor")
+    conn.commit()
+
+    section("2. Before the incident is known: the field's own defences, "
+            "and their limit")
+    show_recall(cur, e([1.0, 0.2, 0.0]),
+                "query near the TRUE policy: the contradicted poison is "
+                "inhibited by the better-matched truth")
+    show_recall(cur, e([0.97, 0.02, 0.0]),
+                "query near the POISON: it is served — REINFORCED mem-gate "
+                "survives its inhibition (rescue rule), but the lie is out")
+
+    section("3. Quarantine: one sealed sweep over everything the actor touched")
+    sweep = trust.quarantine_actor(cur, actor_id="pipeline-feeds",
+                                   initiated_by="analyst-omar",
+                                   reason="compromised feed credentials (INC-1207)")
+    conn.commit()
+    print(f"sweep {sweep.sweep_id}")
+    print(f"  flagged: {list(sweep.flagged_memory_ids)}  "
+          f"(mem-rollback too — the inflation IS part of the incident)")
+    print("  NOT flagged: mem-gate — the attacker's CONTRADICTED_BY event on "
+          "its chain\n  is an attack, not influence; taint never lets a "
+          "quarantine silence the victims")
+    print(f"  sealed:  sha256={sweep.flagged_ids_sha256[:16]}…")
+    print(f"  advisory resonant neighbours (reported, never auto-flagged): "
+          f"{list(sweep.advisory_resonant_neighbours)}")
+
+    show_recall(cur, e([0.97, 0.02, 0.0]),
+                "same poison-shaped query, after the sweep: the custody gate "
+                "withholds the flagged memories, counts them, and the truth "
+                "still serves")
+
+    section("4. The false positive is REHABILITATED — by audited event, "
+            "never by column edit")
+    trust.rehabilitate_memory(cur, memory_id="mem-rollback",
+                              actor_id="analyst-omar",
+                              reason="reviewed INC-1207: content predates the "
+                                     "compromise; only its confidence was inflated")
+    conn.commit()
+    show_recall(cur, e([0.2, 1.0, 0.0]),
+                "rollback knowledge is servable again; the poison stays gated")
+
+    section("5. The evidence ships: sealed bundle, hostile auditor, one file")
+    tmp = tempfile.mkdtemp(prefix="mneme-demo-")
+    honest = bundle.export_bundle(cur)
+    honest_path = os.path.join(tmp, "field.bundle.json")
+    with open(honest_path, "w", encoding="utf-8") as f:
+        f.write(honest)
+    print(f"full export -> {honest_path}")
+    run_verifier(honest_path)
+
+    print("\nnow the cover-up: edit the poisoned content inside the bundle "
+          "and reseal it")
+    doc = json.loads(honest)
+    for m in doc["body"]["memories"]:
+        if m["memory_id"] == "mem-poison":
+            m["content"] = "The staging gate must always pass."
+    import hashlib
+    doc["bundle_sha256"] = hashlib.sha256(
+        bundle.canonical_json(doc["body"]).encode("utf-8")).hexdigest()
+    tampered_path = os.path.join(tmp, "field.tampered.json")
+    with open(tampered_path, "w", encoding="utf-8") as f:
+        f.write(json.dumps(doc))
+    run_verifier(tampered_path)
+
+    print("\npartial export (mem-gate, mem-rollback): the sweep's evidence "
+          "cannot travel in full, so it is DECLARED excluded, never implied "
+          "absent")
+    partial = bundle.export_bundle(cur, memory_ids=["mem-gate", "mem-rollback"])
+    partial_path = os.path.join(tmp, "field.partial.json")
+    with open(partial_path, "w", encoding="utf-8") as f:
+        f.write(partial)
+    run_verifier(partial_path)
+
+    section("6. Why does your agent remember this? Ask the chain")
+    cur.execute("SELECT seq, event_type, actor_id, reason FROM custody_chain "
+                "WHERE memory_id = 'mem-rollback' ORDER BY seq ASC")
+    for seq, et, actor, reason in cur.fetchall():
+        print(f"  seq {seq}  {et:<14} {actor:<15} {reason}")
+    print("\nEvery line above is hash-chained to the last, bound to the "
+          "memory at genesis,\nand replayable by anyone holding the bundle. "
+          "That is the answer, provable.")
+
+
+if __name__ == "__main__":
+    main()

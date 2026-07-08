@@ -128,3 +128,23 @@ CREATE TABLE IF NOT EXISTS taint_sweeps (
     flagged_count      INTEGER NOT NULL CHECK (flagged_count >= 0),
     flagged_ids_sha256 TEXT NOT NULL CHECK (length(flagged_ids_sha256) = 64)
 );
+
+-- -----------------------------------------------------------------------------
+-- recall_receipts — OPTIONAL, caller-persisted evidence of what recall
+-- served and withheld. Recall itself stays read-only (serving is not a
+-- state transition); field.persist_receipt() is the caller's explicit,
+-- separate act. The primary key IS the receipt's digest, so a row that
+-- does not recompute from its own columns is self-revealing
+-- (field.verify_receipts checks). served_json holds the served ids in
+-- rank order, canonical JSON. Append-only; no ON DELETE anywhere.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS recall_receipts (
+    receipt_sha256     TEXT PRIMARY KEY CHECK (length(receipt_sha256) = 64),
+    query_sha256       TEXT NOT NULL CHECK (length(query_sha256) = 64),
+    seed_memory_id     TEXT REFERENCES memories(memory_id),
+    served_json        TEXT NOT NULL,
+    excluded_custody   INTEGER NOT NULL CHECK (excluded_custody >= 0),
+    excluded_forgotten INTEGER NOT NULL CHECK (excluded_forgotten >= 0),
+    excluded_inhibited INTEGER NOT NULL CHECK (excluded_inhibited >= 0),
+    persisted_at       TEXT NOT NULL
+);

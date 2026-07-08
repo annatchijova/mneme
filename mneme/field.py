@@ -155,6 +155,7 @@ def store(
     reason: str,
     topic: str | None = None,
     claim: str | None = None,
+    supersedes: str | None = None,
     created_at: str | None = None,
 ) -> StoredMemory:
     """
@@ -166,6 +167,13 @@ def store(
     addition — a CONTRADICTED_BY custody event on BOTH chains. A
     contradiction is a fact about both parties' history; recording it
     on one chain only would let the other party's export hide it.
+
+    `supersedes` names a predecessor in the STORED payload. Callers do
+    not pass it directly — supersede() is the path, and it writes the
+    matching SUPERSEDED_BY event on the predecessor's chain in the same
+    transaction. A STORED payload claiming supersession that the named
+    predecessor's chain does not corroborate fails bundle check B4:
+    lineage is a bilateral fact, like contradiction.
     """
     ts = created_at if created_at is not None else custody.now_ts()
     csha = custody.content_sha256(content)
@@ -182,6 +190,8 @@ def store(
         payload["topic"] = topic
     if claim is not None:
         payload["claim"] = claim
+    if supersedes is not None:
+        payload["supersedes"] = supersedes
     custody.append_event(
         cur, memory_id=memory_id, event_type="STORED", actor_id=actor_id,
         reason=reason, payload=payload, created_at=ts,
@@ -220,6 +230,72 @@ def store(
 
     return StoredMemory(memory_id=memory_id, content_sha256=csha,
                         inhibitory_links=tuple(contradicted))
+
+
+def supersede(
+    cur,
+    *,
+    old_memory_id: str,
+    memory_id: str,
+    content: str,
+    embedding: list[Decimal],
+    embedding_model: str,
+    actor_id: str,
+    reason: str,
+    topic: str | None = None,
+    claim: str | None = None,
+    created_at: str | None = None,
+) -> StoredMemory:
+    """
+    The M1 path for new content: content is immutable, so an "update"
+    is a NEW memory plus evidence on both chains, in one transaction —
+      - the successor's STORED payload names its predecessor
+        ("supersedes"), and
+      - the predecessor's chain gains SUPERSEDED_BY naming the
+        successor, its custody_status becomes SUPERSEDED (invisible to
+        recall, preserved as evidence — M4), and memories.superseded_by
+        points forward.
+
+    Refused for a non-CLEAN predecessor: a SUPERSEDED memory already
+    has a successor (two would fork the lineage), and a TAINT_FLAGGED /
+    QUARANTINED memory is incident evidence — correcting the record is
+    rehabilitation's job or a fresh store, not a supersession that
+    would overwrite the incident's most-recent-status.
+
+    If the successor shares the predecessor's topic with a different
+    claim, the automatic contradiction rule fires as usual and both
+    chains also record CONTRADICTED_BY — truthful, kept: superseding a
+    claim IS disagreeing with it.
+    """
+    cur.execute("SELECT custody_status FROM memories WHERE memory_id = ?",
+                (old_memory_id,))
+    row = cur.fetchone()
+    if row is None:
+        raise ValueError(f"Unknown memory {old_memory_id!r} — nothing to supersede.")
+    if row[0] != "CLEAN":
+        raise ValueError(
+            f"{old_memory_id} has custody_status {row[0]!r}; only a CLEAN "
+            "memory can be superseded (a second successor would fork the "
+            "lineage; tainted memories are incident evidence)."
+        )
+    ts = created_at if created_at is not None else custody.now_ts()
+
+    stored = store(
+        cur, memory_id=memory_id, content=content, embedding=embedding,
+        embedding_model=embedding_model, actor_id=actor_id, reason=reason,
+        topic=topic, claim=claim, supersedes=old_memory_id, created_at=ts,
+    )
+    custody.append_event(
+        cur, memory_id=old_memory_id, event_type="SUPERSEDED_BY",
+        actor_id=actor_id, reason=reason,
+        payload={"successor_memory_id": memory_id}, created_at=ts,
+    )
+    cur.execute(
+        "UPDATE memories SET custody_status = 'SUPERSEDED', superseded_by = ? "
+        "WHERE memory_id = ?",
+        (memory_id, old_memory_id),
+    )
+    return stored
 
 
 def reinforce(cur, *, memory_id: str, actor_id: str, reason: str,
@@ -322,6 +398,86 @@ def _receipt(query_sha: str, seed: str | None, served: list[str],
                          receipt_sha256=digest)
 
 
+def persist_receipt(cur, receipt: RecallReceipt, *,
+                    persisted_at: str | None = None) -> None:
+    """
+    The caller's explicit act of keeping a recall receipt. Recall
+    itself stays read-only — forcing a write into every recall would
+    quietly convert the hottest read path into a write path — so
+    persistence is a separate, deliberate call, made in the caller's
+    transaction like every other write.
+
+    The digest is recomputed here before insert: this table can never
+    hold a receipt that does not recompute from its own fields.
+    Persisting the same receipt twice is a no-op (same evidence, same
+    digest, one row).
+    """
+    body = {
+        "query_sha256": receipt.query_sha256,
+        "seed_memory_id": receipt.seed_memory_id,
+        "served": list(receipt.served),
+        "excluded_custody": receipt.excluded_custody,
+        "excluded_forgotten": receipt.excluded_forgotten,
+        "excluded_inhibited": receipt.excluded_inhibited,
+    }
+    import hashlib
+    digest = hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
+    if digest != receipt.receipt_sha256:
+        raise ValueError(
+            "Receipt digest does not recompute from its fields — refusing "
+            "to persist a receipt that is already a lie."
+        )
+    cur.execute("SELECT 1 FROM recall_receipts WHERE receipt_sha256 = ?",
+                (digest,))
+    if cur.fetchone() is not None:
+        return
+    ts = persisted_at if persisted_at is not None else custody.now_ts()
+    cur.execute(
+        "INSERT INTO recall_receipts (receipt_sha256, query_sha256, "
+        "seed_memory_id, served_json, excluded_custody, excluded_forgotten, "
+        "excluded_inhibited, persisted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (digest, receipt.query_sha256, receipt.seed_memory_id,
+         canonical_json({"served": list(receipt.served)}),
+         receipt.excluded_custody, receipt.excluded_forgotten,
+         receipt.excluded_inhibited, ts),
+    )
+
+
+def verify_receipts(cur) -> tuple[bool, list[str]]:
+    """
+    Recompute every persisted receipt's digest from its own columns.
+    A row whose primary key does not re-derive has been edited — the
+    same state-is-derivable-from-evidence discipline as bundle check
+    B4, applied to recall evidence.
+    """
+    errors: list[str] = []
+    cur.execute(
+        "SELECT receipt_sha256, query_sha256, seed_memory_id, served_json, "
+        "excluded_custody, excluded_forgotten, excluded_inhibited "
+        "FROM recall_receipts ORDER BY receipt_sha256 ASC")
+    for row in cur.fetchall():
+        digest, qsha, seed, served_json, exc_c, exc_f, exc_i = row
+        try:
+            served = json.loads(served_json)["served"]
+        except Exception:
+            errors.append(f"receipt {digest}: served_json is not valid JSON.")
+            continue
+        body = {
+            "query_sha256": qsha,
+            "seed_memory_id": seed,
+            "served": served,
+            "excluded_custody": int(exc_c),
+            "excluded_forgotten": int(exc_f),
+            "excluded_inhibited": int(exc_i),
+        }
+        import hashlib
+        if hashlib.sha256(
+                canonical_json(body).encode("utf-8")).hexdigest() != digest:
+            errors.append(f"receipt {digest}: does not recompute from its "
+                          "columns — receipt evidence edited.")
+    return (not errors), errors
+
+
 def recall(
     cur,
     *,
@@ -334,7 +490,10 @@ def recall(
 
       1. Load servable candidates: custody_status = 'CLEAN' only. The
          gate is a WHERE clause, not a post-filter — a tainted memory
-         cannot even become the BFS seed.
+         cannot even become the BFS seed, AND cannot be traversed as a
+         BFS intermediary: links are followed only between CLEAN
+         endpoints, so a non-CLEAN memory exerts zero influence on the
+         ranking of the memories that ARE served.
       2. Field-state filter: FORGOTTEN never scores (counted).
       3. Seed = exact-similarity argmax (squared comparison, sign-aware,
          memory_id tiebreak).
@@ -402,11 +561,23 @@ def recall(
     seed_id = best[0]
 
     # --- BFS from seed over links.
+    # The custody gate extends to the GRAPH, not only to serving: a
+    # non-CLEAN memory is invisible to the agent as a result AND as an
+    # influence. A link is traversable only if BOTH endpoints are CLEAN,
+    # so a quarantined / tainted / superseded node can neither inhibit
+    # nor resonate a served memory. Gating serving alone (the WHERE
+    # clause) left the ranking of clean memories perturbable by a
+    # quarantined node sitting on a resonant path — confirmed by
+    # induction and refused here. Gate on custody_status only: FORGOTTEN
+    # is a weak field_state, not an untrusted one, so its links stay.
+    cur.execute("SELECT memory_id FROM memories WHERE custody_status = 'CLEAN'")
+    servable_ids = {r[0] for r in cur.fetchall()}
     cur.execute("SELECT from_id, to_id, link_type FROM cell_links "
                 "ORDER BY from_id ASC, to_id ASC")
     links: dict[str, list[tuple[str, str]]] = {}
     for f, t, lt in cur.fetchall():
-        links.setdefault(f, []).append((t, lt))
+        if f in servable_ids and t in servable_ids:
+            links.setdefault(f, []).append((t, lt))
 
     hop_of: dict[str, int] = {}
     inhibited: set[str] = set()

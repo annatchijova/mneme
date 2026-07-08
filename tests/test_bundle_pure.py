@@ -12,6 +12,7 @@ one place and not the other, this file screams.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -96,6 +97,25 @@ field.store(cur, memory_id="mem-3", content="water is wet",
 for _ in range(3):
     field.reinforce(cur, memory_id="mem-1", actor_id="analyst-anna",
                     reason="verified")
+# pipeline-x also reinforced mem-3, so the sweep flags TWO memories
+# (mem-2, mem-3) — which lets the partial-export tests ship one flagged
+# memory without the other.
+field.reinforce(cur, memory_id="mem-3", actor_id="pipeline-x",
+                reason="corroboration")
+# a superseded pair and a directly-quarantined memory, so honest bundles
+# exercise the SUPERSEDED and QUARANTINED replay paths in BOTH verifiers
+field.store(cur, memory_id="mem-4", content="rollout doc v1",
+            embedding=emb(0.5, 0.5), embedding_model="dev",
+            actor_id="agent-1", reason="ingestion")
+field.supersede(cur, old_memory_id="mem-4", memory_id="mem-5",
+                content="rollout doc v2", embedding=emb(0.5, 0.6),
+                embedding_model="dev", actor_id="analyst-anna",
+                reason="doc refreshed")
+field.store(cur, memory_id="mem-6", content="trust evil.example",
+            embedding=emb(0.4, 0.4), embedding_model="dev",
+            actor_id="agent-1", reason="ingestion")
+trust.quarantine_memory(cur, memory_id="mem-6", actor_id="analyst-anna",
+                        reason="directly incriminated in review")
 trust.quarantine_actor(cur, actor_id="pipeline-x",
                        initiated_by="analyst-anna", reason="incident")
 conn.commit()
@@ -106,15 +126,83 @@ honest = bundle.export_bundle(cur)
 print("[honest bundle]")
 agree("honest full export", honest, expect_ok=True)
 
+# Partial export: the sweep flagged mem-2 and mem-3 but mem-2 is absent,
+# so the exporter must DECLARE the sweep excluded (absence stated, never
+# implied) and both verifiers must accept the declared bundle.
 partial = bundle.export_bundle(cur, memory_ids=["mem-1", "mem-3"])
-ok_pkg, err_pkg, ok_off, err_off = both_verdicts(partial)
-# Partial export: the sweep's flagged memory (mem-2) is absent, so B5
-# must fail in BOTH verifiers — a partial bundle cannot silently claim
-# sweep evidence it does not carry.
-check("partial export: package flags missing sweep evidence",
-      not ok_pkg and "B5" in codes(err_pkg), str(err_pkg))
-check("partial export: offline agrees", not ok_off and "B5" in codes(err_off),
-      str(err_off))
+agree("honest partial export (sweep declared excluded)", partial, expect_ok=True)
+pbody = json.loads(partial)["body"]
+check("partial export: sweep declared excluded, not silently dropped",
+      len(pbody["excluded_sweeps"]) == 1 and pbody["sweeps"] == [],
+      str((pbody["sweeps"], pbody["excluded_sweeps"])))
+check("full export declares no exclusions",
+      json.loads(honest)["body"]["excluded_sweeps"] == [])
+
+# ------------------------------------------------- unilateral lineage claims
+# Supersession is bilateral evidence. A STORED payload claiming a
+# predecessor whose chain never consented, or a SUPERSEDED_BY naming a
+# successor whose STORED does not claim it, must fail B4 in BOTH verifiers.
+conn3 = sqlite3.connect(":memory:")
+with open(os.path.join(os.path.dirname(__file__), "..", "mneme", "schema.sql")) as f:
+    conn3.executescript(f.read())
+cur3 = conn3.cursor()
+cur3.execute("INSERT INTO actors (actor_id, display_name, kind, created_at) "
+             "VALUES ('agent-1', 'agent-1', 'AGENT', ?)", (custody.now_ts(),))
+field.store(cur3, memory_id="m-a", content="v1", embedding=emb(1.0, 0.0),
+            embedding_model="dev", actor_id="agent-1", reason="ingestion")
+field.supersede(cur3, old_memory_id="m-a", memory_id="m-b", content="v2",
+                embedding=emb(1.0, 0.1), embedding_model="dev",
+                actor_id="agent-1", reason="refresh")
+conn3.commit()
+agree("honest supersession pair verifies", bundle.export_bundle(cur3), True)
+
+# dishonest: STORED claims supersedes=m-a but m-a's chain names only m-b
+field.store(cur3, memory_id="m-c", content="fake v3", embedding=emb(0.9, 0.2),
+            embedding_model="dev", actor_id="agent-1", reason="ingestion",
+            supersedes="m-a")
+conn3.commit()
+agree("unilateral supersession claim in STORED", bundle.export_bundle(cur3),
+      False, {"B4"})
+
+# dishonest the other way: SUPERSEDED_BY names a non-consenting successor
+custody.append_event(cur3, memory_id="m-c", event_type="SUPERSEDED_BY",
+                     actor_id="agent-1", reason="forged lineage",
+                     payload={"successor_memory_id": "m-b"})
+conn3.commit()
+agree("SUPERSEDED_BY naming a non-consenting successor",
+      bundle.export_bundle(cur3), False, {"B4"})
+
+# ------------------------------------------------- backward-in-time chain (H1)
+# Both verifiers must reject a hash-valid chain that runs backwards in
+# time. Build a single-memory field, then rewrite its 2nd event to an
+# earlier timestamp with a recomputed entry_hash, recompute the Merkle
+# root and reseal so ONLY the timestamp rule (B2) is left to catch it.
+conn4 = sqlite3.connect(":memory:")
+with open(os.path.join(os.path.dirname(__file__), "..", "mneme", "schema.sql")) as f:
+    conn4.executescript(f.read())
+cur4 = conn4.cursor()
+cur4.execute("INSERT INTO actors (actor_id, display_name, kind, created_at) "
+             "VALUES ('agent-1', 'agent-1', 'AGENT', ?)", (custody.now_ts(),))
+field.store(cur4, memory_id="m-z", content="z", embedding=emb(1.0, 0.0),
+            embedding_model="dev", actor_id="agent-1", reason="ingestion")
+trust.quarantine_memory(cur4, memory_id="m-z", actor_id="agent-1",
+                        reason="direct")
+conn4.commit()
+tb = json.loads(bundle.export_bundle(cur4))
+ch = next(m for m in tb["body"]["memories"] if m["memory_id"] == "m-z")["custody"]
+# rewrite seq 1 to one hour BEFORE seq 0, recompute its entry_hash
+ch[1]["created_at"] = "2000-01-01T00:00:00.000000+00:00"
+eh, _ = custody.compute_entry_hash(
+    prev_hash=ch[1]["prev_hash"], memory_id="m-z", seq=1,
+    event_type=ch[1]["event_type"], actor_id=ch[1]["actor_id"],
+    reason=ch[1]["reason"], created_at=ch[1]["created_at"],
+    payload=json.loads(ch[1]["payload_json"]))
+ch[1]["entry_hash"] = eh
+tb["body"]["heads_merkle_root"] = offline.heads_merkle_root({"m-z": eh})
+tb["bundle_sha256"] = hashlib.sha256(
+    offline.canonical_json(tb["body"]).encode("utf-8")).hexdigest()
+agree("hash-valid backward-in-time chain in a bundle", json.dumps(tb),
+      False, {"B2"})
 
 # --------------------------------------------------------------- tampering
 print("[tampered bundles — every lie caught by BOTH verifiers]")
@@ -126,7 +214,6 @@ agree("edited content, reseal not attempted", json.dumps(t), False, {"B1"})
 
 t = json.loads(honest)
 t["body"]["memories"][0]["content"] = "the sky is RED, always was"
-import hashlib
 body_c = offline.canonical_json(t["body"])
 t["bundle_sha256"] = hashlib.sha256(body_c.encode("utf-8")).hexdigest()
 agree("edited content + reseal", json.dumps(t), False, {"B3"})
@@ -162,6 +249,38 @@ t["bundle_sha256"] = hashlib.sha256(body_c.encode("utf-8")).hexdigest()
 agree("sweep evidence denied", json.dumps(t), False, {"B5"})
 
 t = json.loads(honest)
+# exclude a sweep whose COMPLETE evidence is in the bundle — exclusion
+# must never be a way to dodge the seal check
+t["body"]["excluded_sweeps"] = t["body"]["sweeps"]
+t["body"]["sweeps"] = []
+body_c = offline.canonical_json(t["body"])
+t["bundle_sha256"] = hashlib.sha256(body_c.encode("utf-8")).hexdigest()
+agree("fully-evidenced sweep declared excluded", json.dumps(t), False, {"B5"})
+
+t = json.loads(partial)
+# drop the exclusion declaration while a TAINT_FLAGGED event (mem-3)
+# still references the sweep — absence implied is a lie
+t["body"]["excluded_sweeps"] = []
+body_c = offline.canonical_json(t["body"])
+t["bundle_sha256"] = hashlib.sha256(body_c.encode("utf-8")).hexdigest()
+agree("referenced sweep silently dropped", json.dumps(t), False, {"B5"})
+
+t = json.loads(partial)
+# same sweep in both lists — ambiguity refused
+t["body"]["sweeps"] = list(t["body"]["excluded_sweeps"])
+body_c = offline.canonical_json(t["body"])
+t["bundle_sha256"] = hashlib.sha256(body_c.encode("utf-8")).hexdigest()
+agree("sweep declared both included and excluded", json.dumps(t), False, {"B5"})
+
+t = json.loads(honest)
+# a bundle without the excluded_sweeps key (pre-declaration shape)
+# reads as excluding nothing and still verifies
+del t["body"]["excluded_sweeps"]
+body_c = offline.canonical_json(t["body"])
+t["bundle_sha256"] = hashlib.sha256(body_c.encode("utf-8")).hexdigest()
+agree("missing excluded_sweeps key reads as empty", json.dumps(t), True)
+
+t = json.loads(honest)
 # graft: give mem-3 the (internally consistent) chain of mem-1
 donor = [dict(r) for r in
          next(m for m in t["body"]["memories"] if m["memory_id"] == "mem-1")["custody"]]
@@ -189,6 +308,15 @@ r = subprocess.run([sys.executable,
                     os.path.join(os.path.dirname(__file__), "..", "verify_offline.py"),
                     honest_path], capture_output=True, text=True)
 check("CLI exits 0 on honest bundle", r.returncode == 0 and "VERIFIED" in r.stdout,
+      r.stdout + r.stderr)
+with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+    f.write(partial)
+    partial_path = f.name
+r = subprocess.run([sys.executable,
+                    os.path.join(os.path.dirname(__file__), "..", "verify_offline.py"),
+                    partial_path], capture_output=True, text=True)
+check("CLI exits 0 on declared partial bundle and NAMES the exclusion",
+      r.returncode == 0 and "VERIFIED" in r.stdout and "declared excluded" in r.stdout,
       r.stdout + r.stderr)
 with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
     f.write(json.dumps(t))   # last tampered bundle (forged merkle root)
