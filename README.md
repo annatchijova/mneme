@@ -143,6 +143,49 @@ caught, in both verifiers:
 | Dodge a sweep's seal check by declaring it excluded | B5 — a fully-evidenced sweep may not be excluded |
 | Forge the cross-memory commitment | B6 — Merkle root over heads |
 
+## MCP Server (Model Context Protocol)
+
+MNEME exposes its custody-gated memory operations as an MCP server:
+
+```bash
+python3 mcp_server.py    # stdio transport
+```
+
+**Tools available:**
+
+| Tool | Description |
+|------|-------------|
+| `mneme_store` | Store a memory with custody chain from genesis |
+| `mneme_recall` | Custody-gated recall with exact Fraction ranking |
+| `mneme_reinforce` | Increase confidence (exact closed-form arithmetic) |
+| `mneme_quarantine_actor` | Taint-flag every memory an actor touched |
+| `mneme_rehabilitate` | Restore TAINT_FLAGGED memory to CLEAN |
+| `mneme_export_bundle` | Export sealed evidence bundle (self-contained) |
+| `mneme_verify_bundle` | Verify B1-B6 checks on any bundle |
+| `mneme_custody_chain` | View full per-memory custody history |
+| `mneme_info` | Architecture, invariants, and stats |
+
+**Claude Code config** (`~/.claude/settings.json`):
+
+```json
+{
+  "mcpServers": {
+    "mneme": {
+      "command": "python3",
+      "args": ["/path/to/mneme/mcp_server.py"],
+      "env": {
+        "MNEME_DB_PATH": "/path/to/mneme.db"
+      }
+    }
+  }
+}
+```
+
+The MCP server uses deterministic SHA-256-seeded embeddings (non-semantic,
+`is_semantic=False`). Rankings are reproducible but distances are not
+meaningful — the same honesty discipline as STIGMERGY's deterministic
+provider.
+
 ## Status
 
 Phase 1: core complete, 165/165 pure checks passing, demo harness and
