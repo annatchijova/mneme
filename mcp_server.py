@@ -359,7 +359,7 @@ def mneme_reinforce(
 @mcp.tool()
 def mneme_quarantine_actor(
     actor_id: str,
-    initiated_by: str = "mcp_agent",
+    initiated_by: str,
     reason: str = "",
 ) -> dict:
     """
@@ -374,9 +374,17 @@ def mneme_quarantine_actor(
     influence, not enmity, so quarantining an attacker never silences the
     memories it attacked.
 
+    Security audit Round 2: `initiated_by` MUST already be a registered,
+    non-QUARANTINED actor — this tool does NOT auto-register it. Initiating
+    a quarantine is authority-bearing; minting that identity on the same
+    call that spends it is the confused-deputy pattern H3/H4 named. Trusted
+    reviewer identities are provisioned out-of-band (e.g. inserted directly
+    into `actors` by an operator), never through this tool's own call path.
+
     Args:
         actor_id: The actor to quarantine.
-        initiated_by: Who initiated the quarantine (must be a registered actor).
+        initiated_by: Who initiated the quarantine — must already be a
+            registered, non-QUARANTINED actor. Unknown values are refused.
         reason: Why (mandatory — unreasoned quarantine cannot exist).
 
     Returns:
@@ -390,7 +398,6 @@ def mneme_quarantine_actor(
         return {"error": "reason must be non-empty."}
 
     conn = _get_conn()
-    _ensure_actor(conn, initiated_by)
     cur = conn.cursor()
     try:
         sweep = trust.quarantine_actor(
@@ -419,7 +426,7 @@ def mneme_quarantine_actor(
 @mcp.tool()
 def mneme_rehabilitate(
     memory_id: str,
-    actor_id: str = "mcp_agent",
+    actor_id: str,
     reason: str = "",
 ) -> dict:
     """
@@ -429,9 +436,17 @@ def mneme_rehabilitate(
     QUARANTINED ones). Rehabilitation is an audited event — the reason
     explains why the taint was a false positive.
 
+    Security audit Round 2, H3: `actor_id` MUST already be a registered,
+    non-QUARANTINED actor — this tool does NOT auto-register it. Reversing
+    a taint flag is exactly as authority-bearing as raising one; minting a
+    trusted-sounding identity on the same call that spends it is the
+    confused-deputy pattern this fix closes (it previously let the very
+    actor a sweep quarantined rehabilitate its own flagged memories).
+
     Args:
         memory_id: The memory to rehabilitate.
-        actor_id: Who is rehabilitating.
+        actor_id: Who is rehabilitating — must already be a registered,
+            non-QUARANTINED actor. Unknown values are refused.
         reason: Why (mandatory).
 
     Returns:
@@ -444,7 +459,6 @@ def mneme_rehabilitate(
         return {"error": "reason must be non-empty."}
 
     conn = _get_conn()
-    _ensure_actor(conn, actor_id)
     cur = conn.cursor()
     try:
         trust.rehabilitate_memory(

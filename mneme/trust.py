@@ -253,7 +253,27 @@ def rehabilitate_memory(
     direct quarantine is a stronger claim requiring its own review path;
     conflating the two reversals would let a bulk false-positive cleanup
     silently un-quarantine directly-incriminated memories.
+
+    Security audit Round 2, H3: reversing a taint flag is exactly as
+    authority-bearing as raising one, so it is held to the same bar as
+    quarantine_actor()'s "unknown initiator" check — actor_id must name a
+    registered, non-QUARANTINED actor. Without this, the actor a sweep
+    just quarantined could rehabilitate the very memories that sweep
+    flagged, reversing its own containment.
     """
+    cur.execute("SELECT status FROM actors WHERE actor_id = ?", (actor_id,))
+    actor_row = cur.fetchone()
+    if actor_row is None:
+        raise ValueError(
+            f"Unknown actor {actor_id!r} — rehabilitation requires a "
+            "registered identity, same as quarantine."
+        )
+    if actor_row[0] == "QUARANTINED":
+        raise ValueError(
+            f"Actor {actor_id!r} is QUARANTINED and cannot rehabilitate "
+            "memories — an actor under investigation is not its own reviewer."
+        )
+
     cur.execute(
         "SELECT custody_status FROM memories WHERE memory_id = ?", (memory_id,)
     )

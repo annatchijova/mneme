@@ -22,6 +22,8 @@ from __future__ import annotations
 import os
 import sqlite3
 import sys
+import tempfile
+import threading
 from decimal import Decimal
 from fractions import Fraction
 
@@ -267,6 +269,96 @@ try:
     check("reinforcing a superseded memory refused", False)
 except ValueError:
     check("reinforcing a superseded memory refused", True)
+
+# ------------------------------------------------------- supersede TOCTOU (Round 2, H4)
+print("[supersede concurrency — lineage must not fork under a race]")
+# supersede() reads old_memory_id's custody_status once, then writes
+# later (field.py). Two concurrent callers can both observe CLEAN before
+# either has written, both pass the guard, and both append a
+# SUPERSEDED_BY event -- forking the lineage the docstring says cannot
+# fork. A barrier forces the exact interleaving instead of hoping for it.
+
+
+class _BarrierCursor:
+    """Proxies a real cursor; releases both racer threads together right
+    after supersede()'s predecessor CLEAN-status read returns, so the
+    TOCTOU window opens deterministically instead of by luck."""
+
+    def __init__(self, real_cursor, barrier):
+        self._cur = real_cursor
+        self._barrier = barrier
+        self._armed = False
+
+    def execute(self, sql, params=()):
+        self._armed = "SELECT custody_status FROM memories WHERE memory_id = ?" in sql
+        return self._cur.execute(sql, params)
+
+    def fetchone(self):
+        row = self._cur.fetchone()
+        if self._armed:
+            self._armed = False
+            self._barrier.wait()
+        return row
+
+    def __getattr__(self, name):
+        return getattr(self._cur, name)
+
+
+def _race_supersede():
+    tmpdir = tempfile.mkdtemp()
+    db_path = os.path.join(tmpdir, "race.db")
+    seed_conn = sqlite3.connect(db_path)
+    with open(os.path.join(os.path.dirname(__file__), "..", "mneme", "schema.sql")) as f:
+        seed_conn.executescript(f.read())
+    seed_cur = seed_conn.cursor()
+    ts = custody.now_ts()
+    for aid in ("racer-a", "racer-b"):
+        seed_cur.execute("INSERT INTO actors (actor_id, display_name, kind, created_at) "
+                         "VALUES (?, ?, 'AGENT', ?)", (aid, aid, ts))
+    field.store(seed_cur, memory_id="mem-race", content="v1", embedding=emb(1.0, 0.0),
+                embedding_model="dev", actor_id="racer-a", reason="seed")
+    seed_conn.commit()
+    seed_conn.close()
+
+    barrier = threading.Barrier(2)
+    outcomes: dict[str, str] = {}
+
+    def racer(name: str, successor_id: str):
+        conn = sqlite3.connect(db_path, timeout=30)
+        proxied = _BarrierCursor(conn.cursor(), barrier)
+        try:
+            field.supersede(proxied, old_memory_id="mem-race", memory_id=successor_id,
+                            content=f"v-by-{name}", embedding=emb(0.9, 0.1),
+                            embedding_model="dev", actor_id=name, reason="race")
+            conn.commit()
+            outcomes[name] = "committed"
+        except Exception as e:
+            conn.rollback()
+            outcomes[name] = f"refused: {e}"
+        finally:
+            conn.close()
+
+    t1 = threading.Thread(target=racer, args=("racer-a", "mem-race-y"))
+    t2 = threading.Thread(target=racer, args=("racer-b", "mem-race-z"))
+    t1.start(); t2.start()
+    t1.join(); t2.join()
+
+    check_conn = sqlite3.connect(db_path)
+    check_cur = check_conn.cursor()
+    check_cur.execute("SELECT event_type FROM custody_chain WHERE memory_id='mem-race' "
+                      "AND event_type='SUPERSEDED_BY'")
+    superseded_events = check_cur.fetchall()
+    ok, errs = custody.verify_custody_chain(check_cur, "mem-race")
+    check_conn.close()
+    return outcomes, superseded_events, ok, errs
+
+
+outcomes, superseded_events, chain_ok, chain_errs = _race_supersede()
+check("exactly one racer commits, the other is refused",
+      sorted(outcomes.values()).count("committed") == 1, str(outcomes))
+check("mem-race carries exactly one SUPERSEDED_BY event — lineage did not fork",
+      len(superseded_events) == 1, f"{len(superseded_events)} events: {outcomes}")
+check("mem-race's chain still verifies", chain_ok, str(chain_errs))
 
 # ---------------------------------------------------------------- receipts
 print("[receipt persistence]")
