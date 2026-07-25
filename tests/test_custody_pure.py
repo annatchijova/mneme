@@ -294,6 +294,26 @@ raises("rehabilitating a CLEAN memory refused",
                                          actor_id="analyst-anna", reason="r"),
        ValueError, "TAINT_FLAGGED only")
 
+# Round 2, H3: rehabilitate_memory() performs zero validation on actor_id
+# — not even that the actor exists, let alone that it is in good standing.
+# "pipeline-x" is the actor THIS SAME sweep quarantined (see above); it is
+# still sitting in `actors` with status='QUARANTINED'. Nothing stops it
+# from rehabilitating its own poisoned memory back to CLEAN — the exact
+# self-rehabilitation the rescue rule elsewhere in this project exists to
+# prevent by a different mechanism. "mem-poison-1" is still TAINT_FLAGGED
+# (only "mem-touched" was rehabilitated above, by the legitimate analyst).
+check("pipeline-x is QUARANTINED, not merely unregistered",
+      cur.execute("SELECT status FROM actors WHERE actor_id='pipeline-x'")
+      .fetchone()[0] == "QUARANTINED")
+raises("a QUARANTINED actor cannot rehabilitate its own tainted memory",
+       lambda: trust.rehabilitate_memory(cur, memory_id="mem-poison-1",
+                                         actor_id="pipeline-x",
+                                         reason="self-review: false positive"),
+       ValueError, "quarantined")
+check("mem-poison-1 was NOT self-rehabilitated",
+      cur.execute("SELECT custody_status FROM memories WHERE memory_id='mem-poison-1'")
+      .fetchone()[0] == "TAINT_FLAGGED")
+
 # direct quarantine of ONE memory: evidence against the memory itself
 trust.quarantine_memory(cur, memory_id="mem-clean", actor_id="analyst-anna",
                         reason="directly incriminated in incident review")

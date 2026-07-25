@@ -290,11 +290,27 @@ def supersede(
         actor_id=actor_id, reason=reason,
         payload={"successor_memory_id": memory_id}, created_at=ts,
     )
+    # Security audit Round 2, H4: the CLEAN check above is a single read;
+    # a concurrent supersede() on the same old_memory_id can pass that
+    # same read before either writer commits, and both would otherwise
+    # append their own SUPERSEDED_BY event — forking the lineage this
+    # function's docstring claims cannot fork. The guard here re-asserts
+    # CLEAN at the moment of the write, atomically with the write itself;
+    # a rowcount of 0 means a concurrent writer got there first, and the
+    # whole transaction (including the successor's STORED and this
+    # SUPERSEDED_BY event, still uncommitted) rolls back with the caller's
+    # rollback — nothing is left half-applied.
     cur.execute(
         "UPDATE memories SET custody_status = 'SUPERSEDED', superseded_by = ? "
-        "WHERE memory_id = ?",
+        "WHERE memory_id = ? AND custody_status = 'CLEAN'",
         (memory_id, old_memory_id),
     )
+    if cur.rowcount != 1:
+        raise ValueError(
+            f"{old_memory_id} custody_status changed after the initial CLEAN "
+            "check — a concurrent writer raced this supersession. Refusing "
+            "to fork the lineage."
+        )
     return stored
 
 

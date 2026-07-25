@@ -183,6 +183,11 @@ What neither had, and MNEME adds:
                           instead of read (single file, zero deps)
     SECURITY_AUDIT.md     Round-1 adversarial audit (A–D–I): findings
                           confirmed by induction, and discarded vectors
+    SECURITY_AUDIT_ROUND_2.md
+                          Round-2 authority-after-quarantine audit:
+                          confirmed containment and recovery-boundary gaps,
+                          a falsified rollback vector, and the guarantees
+                          that must transfer to distributed memory systems
     tests/                pure suites: no pip installs, no infrastructure,
                           SQLite :memory: only
 
@@ -232,7 +237,8 @@ provider.
 ## Status
 
 Phase 1: core complete, 165/165 pure checks passing, demo harness, the
-Field Viewer, and a Round-1 security audit (`SECURITY_AUDIT.md`)
+Field Viewer, and two adversarial security-audit rounds
+(`SECURITY_AUDIT.md`, `SECURITY_AUDIT_ROUND_2.md`)
 included. Not yet built: HTTP API, k-NN graph for large corpora, STDP
 synaptic dynamics, stylometric authorship checks (see
 `KNOWN_LIMITATIONS.md` — every absence there is a decision with a
