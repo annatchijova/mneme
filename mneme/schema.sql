@@ -99,6 +99,45 @@ CREATE TABLE IF NOT EXISTS custody_chain (
 CREATE INDEX IF NOT EXISTS idx_custody_actor ON custody_chain (actor_id);
 
 -- -----------------------------------------------------------------------------
+-- authority_chain — THE OTHER table. Per-ACTOR tamper-evident hash chain
+-- recording who was allowed to cause what (mneme/authority.py).
+--
+-- custody_chain answers "what happened to this memory". This answers "who
+-- was authorized to cause it". The two are separable proofs over different
+-- evidence, and bundle check B7 demands both: a perfect chain of an
+-- unauthorized act is exactly the hole Round 2 confirmed.
+--
+-- subject_id is WHOSE authority the row describes; issuer_id is WHO wrote
+-- it. They coincide only in the root bootstrap, which is refused once any
+-- chain exists — so the ledger is a tree rooted at one auditable act.
+--
+-- Same structural disciplines as custody_chain: genesis bound to the
+-- subject id (a grant history cannot be grafted between actors), seq dense
+-- from 0, UNIQUE (subject_id, prev_hash) so a fork is a constraint
+-- violation rather than a race outcome, reason NOT NULL so an unreasoned
+-- grant cannot exist, and no ON DELETE anywhere (A4: revocation is an
+-- event, never a row removal).
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS authority_chain (
+    subject_id    TEXT NOT NULL REFERENCES actors(actor_id),
+    seq           INTEGER NOT NULL CHECK (seq >= 0),
+    event_type    TEXT NOT NULL CHECK (event_type IN (
+                      'ACTOR_REGISTERED','GRANTED','REVOKED',
+                      'ACTOR_QUARANTINED','ACTOR_REINSTATED')),
+    issuer_id     TEXT NOT NULL REFERENCES actors(actor_id),
+    reason        TEXT NOT NULL CHECK (length(trim(reason)) > 0),
+    created_at    TEXT NOT NULL,
+    payload_json  TEXT NOT NULL,            -- canonical bytes, exactly what was hashed
+    prev_hash     TEXT NOT NULL CHECK (length(prev_hash) = 64),
+    entry_hash    TEXT NOT NULL CHECK (length(entry_hash) = 64),
+    PRIMARY KEY (subject_id, seq),
+    UNIQUE (subject_id, prev_hash),
+    UNIQUE (entry_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_authority_issuer ON authority_chain (issuer_id);
+
+-- -----------------------------------------------------------------------------
 -- cell_links — raven-memory's ternary links between memories.
 -- RESONANT amplifies neighbours; INHIBITORY silences contradictions.
 -- Link creation/removal is a state change => custody events on BOTH ends.

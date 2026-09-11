@@ -59,6 +59,36 @@ that makes disagreement loud):
       memory_id ASC; odd leaf promoted unpaired — duplicating the last
       leaf, Bitcoin-style, admits two leaf sets with one root, an
       ambiguity we refuse; same rule as STIGMERGY's ledger).
+  B7  AUTHORITY PROVENANCE: every custody event was not merely recorded
+      but AUTHORIZED. Integrity provenance (B2) and authority provenance
+      (B7) are separable proofs over different evidence, and a bundle
+      must carry both. In order:
+        1. every authority chain verifies structurally (genesis bound to
+           the actor id, dense seq, linkage, recomputation, canonical
+           payload bytes, canonical non-decreasing UTC) and replays
+           without contradiction;
+        2. the declared actor status reproduces from that replay — the
+           authority analogue of B4;
+        3. the ledger has exactly one root grant, self-issued, conferring
+           the whole capability vocabulary;
+        4. NO AMPLIFICATION, re-derived offline: every non-root authority
+           event names an issuer whose own chain travels in the bundle
+           and who held, at that event's instant, the capability the
+           event required — and, for a GRANT, every capability it
+           conferred. Authority is delegated, never invented;
+        5. every custody event at or after the declared authority genesis
+           names a grant_id that was active for its actor at that
+           event's instant, conferred the capability the event type
+           requires, and belonged to an actor not under quarantine then;
+        6. events BEFORE the declared genesis are UNAUTHORIZED BY
+           DECLARATION — counted, named on a successful verdict, never
+           silently passed as authorized. A field with no authority
+           ledger at all declares authority_genesis_at: null and every
+           one of its events is in this category. Absence stated, never
+           implied — the same contract B5 holds sweeps to.
+      The declared genesis must equal the earliest instant in the carried
+      authority evidence, so an exporter cannot raise it to excuse more
+      events than the ledger actually predates.
 
 Replay state machine (B4), the single normative statement — the
 standalone verifier transcribes it verbatim:
@@ -75,6 +105,21 @@ standalone verifier transcribes it verbatim:
       its payload["from"] must equal the current state.
   confidence: starts 0.5000000000; each REINFORCED must declare
       confidence_before equal to current, and sets confidence_after.
+
+Authority replay (B7) has its own normative statement, in
+authority.replay_authority's docstring, for the same reason: one place
+where the rule is written down, transcribed verbatim by the standalone
+verifier.
+
+FORMAT V2 AND WHY THE VERSION MOVED. A V1 bundle sealed bytes without
+sealing the SEMANTICS those bytes were checked under, which left exactly
+one lie available: change a rule tomorrow, and every bundle sealed today
+silently acquires the new rule when a new verifier reads it. A V2 body
+carries a "protocols" block naming, by version, every semantics its
+checks depend on (see protocol.py), and a verifier that meets a version
+it does not implement refuses rather than assuming. V1 bundles are not
+readable by this verifier and that is the point — they were sealed under
+undeclared semantics, so verify them with a verifier of their era.
 """
 
 from __future__ import annotations
@@ -84,9 +129,9 @@ import json
 from typing import Any
 
 from .canonical import canonical_json
-from . import custody
+from . import authority, custody, protocol
 
-BUNDLE_FORMAT = "MNEME_BUNDLE_V1"
+BUNDLE_FORMAT = "MNEME_BUNDLE_V2"
 INITIAL_CONFIDENCE = "0.5000000000"
 
 
@@ -118,6 +163,36 @@ def heads_merkle_root(heads: dict[str, str]) -> str:
 
 _CHAIN_COLS = ["memory_id", "seq", "event_type", "actor_id", "reason",
                "created_at", "payload_json", "prev_hash", "entry_hash"]
+
+
+def _authority_closure(cur, seed_actors: set[str]) -> list[str]:
+    """
+    Every authority chain the bundle must carry to make B7 checkable, as a
+    sorted list.
+
+    Seeded with the actors that wrote the exported custody events, then
+    closed under ISSUANCE: an actor's chain is worthless to an auditor
+    without the chain of whoever empowered it, and that one without ITS
+    issuer, up to the root. No-amplification (A3) is only re-derivable
+    offline if the whole delegation path travels. The closure terminates
+    because issuance is acyclic by construction — the root is self-issued
+    on an empty ledger and every other issuer predates its subject's
+    grant.
+    """
+    seen: set[str] = set()
+    frontier = set(seed_actors)
+    while frontier:
+        sid = min(frontier)
+        frontier.discard(sid)
+        if sid in seen:
+            continue
+        seen.add(sid)
+        cur.execute(
+            "SELECT issuer_id FROM authority_chain WHERE subject_id = ?", (sid,))
+        for (issuer,) in cur.fetchall():
+            if issuer not in seen:
+                frontier.add(issuer)
+    return sorted(seen)
 
 
 def export_bundle(cur, *, memory_ids: list[str] | None = None) -> str:
@@ -185,12 +260,45 @@ def export_bundle(cur, *, memory_ids: list[str] | None = None) -> str:
               if flagged_by_sweep.get(s["sweep_id"], set()) <= exported]
     excluded_sweeps = [s for s in all_sweeps if s not in sweeps]
 
+    # Authority evidence (B7). Always exported — an authority chain is a
+    # few rows and an unauthorized-looking bundle that merely omitted the
+    # proof is the worst of both outcomes.
+    actors_in_evidence: set[str] = set()
+    for mem in memories:
+        for r in mem["custody"]:
+            actors_in_evidence.add(r["actor_id"])
+    # The root always travels, even when no exported memory's actor leads
+    # to it. Without it a bundle could declare an authority genesis whose
+    # evidence it does not carry — a claim about a ledger nobody can see —
+    # and the earliest-instant check (B7) would have nothing to compare.
+    root = authority.root_subject(cur)
+    if root is not None:
+        actors_in_evidence.add(root)
+    authority_rows: list[dict[str, Any]] = []
+    auth_heads: dict[str, str] = {}
+    for sid in _authority_closure(cur, actors_in_evidence):
+        chain = authority.load_authority_rows(cur, sid)
+        if not chain:
+            continue   # a legacy actor with no ledger presence; B7 names it
+        cur.execute("SELECT status FROM actors WHERE actor_id = ?", (sid,))
+        row = cur.fetchone()
+        auth_heads[sid] = chain[-1]["entry_hash"]
+        authority_rows.append({
+            "subject_id": sid,
+            "status": row[0] if row else "ACTIVE",
+            "chain": chain,
+        })
+
     body = {
         "format": BUNDLE_FORMAT,
+        "protocols": dict(protocol.CURRENT_PROTOCOLS),
         "created_at": custody.now_ts(),
         "memories": memories,
         "sweeps": sweeps,
         "excluded_sweeps": excluded_sweeps,
+        "authority": authority_rows,
+        "authority_genesis_at": authority.genesis_at(cur),
+        "authority_merkle_root": heads_merkle_root(auth_heads),
         "heads_merkle_root": heads_merkle_root(heads),
     }
     body_canonical = canonical_json(body)
@@ -248,25 +356,233 @@ def replay_state(chain: list[dict[str, Any]]) -> tuple[str, str, str, list[str]]
     return status, fstate, conf, errors
 
 
-def verify_bundle(bundle_json: str) -> tuple[bool, list[str]]:
-    """Full B1–B6 verification of an exported bundle string."""
+def verify_authority(
+    body: dict[str, Any],
+    memory_chains: list[tuple[str, list[dict[str, Any]]]],
+) -> tuple[list[str], list[str]]:
+    """
+    B7 — authority provenance. Returns (errors, notes); notes are claims an
+    auditor must SEE on a PASSING verdict, not things buried by one.
+
+    Pure over the bundle body and the memory chains that already passed
+    B2 (an event whose integrity is unproven is not worth authorizing).
+    The standalone verifier transcribes this function.
+    """
     errors: list[str] = []
+    notes: list[str] = []
+
+    entries = body.get("authority", [])
+    declared_genesis = body.get("authority_genesis_at")
+    if not isinstance(entries, list):
+        return ["B7: 'authority' is not a list."], notes
+
+    all_events = [(mid, r) for mid, chain in memory_chains for r in chain]
+    with_grant = [(mid, r) for mid, r in all_events
+                  if isinstance(json.loads(r["payload_json"]).get("grant_id"), str)]
+
+    # --- The no-ledger regime: stated, never assumed.
+    if not entries:
+        if declared_genesis is not None:
+            errors.append(
+                "B7: the bundle declares an authority genesis but carries no "
+                "authority evidence — a claim about a ledger nobody can see.")
+        for mid, r in with_grant:
+            errors.append(
+                f"B7: {mid} seq {r['seq']}: names a grant_id, but the bundle "
+                "carries no authority chain that could have issued it.")
+        if heads_merkle_root({}) != body.get("authority_merkle_root"):
+            errors.append("B7: authority_merkle_root does not recompute.")
+        if not errors:
+            notes.append(
+                f"this field has NO authority ledger: all {len(all_events)} "
+                "custody event(s) are UNAUTHORIZED BY DECLARATION. Their "
+                "integrity is proven; nobody's permission to cause them is.")
+        return errors, notes
+
+    if not isinstance(declared_genesis, str):
+        return (["B7: the bundle carries authority evidence but declares no "
+                 "authority_genesis_at — without it, 'this event predates the "
+                 "ledger' is indistinguishable from 'this event dodged it'."],
+                notes)
+
+    # --- 1/2. Structure, then meaning, then the declared status column.
+    states: dict[str, authority.AuthorityState] = {}
+    auth_heads: dict[str, str] = {}
+    earliest: str | None = None
+    for entry in sorted(entries, key=lambda e: str(e.get("subject_id"))):
+        sid = entry.get("subject_id")
+        chain = entry.get("chain")
+        if not isinstance(sid, str) or not isinstance(chain, list) or not chain:
+            errors.append(f"B7: malformed authority entry for {sid!r}.")
+            continue
+        try:
+            ok, errs = authority.verify_authority_rows(sid, chain)
+        except (ValueError, TypeError, KeyError) as exc:
+            errors.append(f"B7: {sid}: authority chain is unreadable ({exc}).")
+            continue
+        if not ok:
+            errors.extend(f"B7: {e}" for e in errs)
+            continue
+        state, rerrs = authority.replay_authority(sid, chain)
+        if rerrs:
+            errors.extend(f"B7: {e}" for e in rerrs)
+            continue
+        states[sid] = state
+        auth_heads[sid] = chain[-1]["entry_hash"]
+        first_ts = chain[0]["created_at"]
+        if earliest is None or first_ts < earliest:
+            earliest = first_ts
+        if entry.get("status") != state.status:
+            errors.append(
+                f"B7: {sid}: declared actor status {entry.get('status')!r}, "
+                f"authority replay says {state.status!r}.")
+
+    if heads_merkle_root(auth_heads) != body.get("authority_merkle_root"):
+        errors.append("B7: authority_merkle_root does not recompute.")
+    if earliest is not None and declared_genesis != earliest:
+        errors.append(
+            f"B7: declared authority_genesis_at {declared_genesis} is not the "
+            f"earliest instant in the carried ledger ({earliest}) — raising it "
+            "would excuse events the ledger did not actually predate.")
+    if errors:
+        return errors, notes
+
+    # --- 3. Exactly one root, self-issued, conferring everything.
+    roots = sorted(sid for sid, st in states.items() if st.is_root)
+    if len(roots) != 1:
+        errors.append(
+            f"B7: the ledger declares {len(roots)} root grants ({roots}); "
+            "authority hangs from exactly one auditable act or it hangs from "
+            "nothing checkable.")
+
+    # --- 4. No amplification (A3), re-derived offline.
+    for sid in sorted(states):
+        state = states[sid]
+        for r in next(e["chain"] for e in entries if e.get("subject_id") == sid):
+            payload = json.loads(r["payload_json"])
+            issuer = r["issuer_id"]
+            at = r["created_at"]
+            where = f"B7: {sid} authority seq {r['seq']}"
+            if issuer == sid and payload.get("root") is True:
+                continue                      # the bootstrap, exempt by design
+            if issuer not in states:
+                errors.append(
+                    f"{where}: issued by {issuer!r}, whose authority chain is "
+                    "not in this bundle — the delegation path is unprovable.")
+                continue
+            needed = authority.AUTHORITY_EVENT_CAPABILITY[r["event_type"]]
+            issuer_caps = authority.capabilities_at(states[issuer], at)
+            if needed not in issuer_caps:
+                errors.append(
+                    f"{where}: issuer {issuer!r} did not hold {needed} at {at} "
+                    "(never granted, revoked by then, or quarantined).")
+                continue
+            if r["event_type"] == "GRANTED":
+                conferred = set(payload.get("capabilities", []))
+                missing = sorted(conferred - issuer_caps)
+                if missing:
+                    errors.append(
+                        f"{where}: issuer {issuer!r} conferred {missing} it did "
+                        "not hold — authority invented, not delegated (A3).")
+
+    # --- 5/6. Every custody event: authorized, or declared pre-authority.
+    pre_authority = 0
+    for mid, r in all_events:
+        payload = json.loads(r["payload_json"])
+        gid = payload.get("grant_id")
+        at = r["created_at"]
+        where = f"B7: {mid} seq {r['seq']} ({r['event_type']})"
+        if at < declared_genesis:
+            pre_authority += 1
+            if isinstance(gid, str):
+                errors.append(
+                    f"{where}: names grant {gid!r} but is timestamped before "
+                    "the ledger existed.")
+            continue
+        if not isinstance(gid, str):
+            errors.append(
+                f"{where}: no grant_id, and it postdates the authority genesis "
+                f"{declared_genesis}. Recorded is not authorized.")
+            continue
+        actor = r["actor_id"]
+        if actor not in states:
+            errors.append(f"{where}: actor {actor!r} has no authority chain in "
+                          "this bundle.")
+            continue
+        if authority.quarantined_at(states[actor], at):
+            errors.append(f"{where}: actor {actor!r} was QUARANTINED at {at} "
+                          "and held no capability (A5).")
+            continue
+        caps = authority.grant_capabilities_at(states[actor], gid, at)
+        if caps is None:
+            errors.append(f"{where}: grant {gid!r} was not active for {actor!r} "
+                          f"at {at}.")
+            continue
+        try:
+            needed = authority.required_capability(r["event_type"], payload)
+        except ValueError as exc:
+            errors.append(f"{where}: {exc}")
+            continue
+        if needed not in caps:
+            errors.append(f"{where}: grant {gid!r} confers {sorted(caps)}, "
+                          f"which does not include {needed}.")
+
+    if pre_authority and not errors:
+        notes.append(
+            f"{pre_authority} custody event(s) predate this field's authority "
+            f"genesis ({declared_genesis}) and are UNAUTHORIZED BY "
+            "DECLARATION — their integrity is proven, their authorization is "
+            "not claimed.")
+    return errors, notes
+
+
+def verify_bundle(bundle_json: str) -> tuple[bool, list[str]]:
+    """
+    Full B1–B7 verification of an exported bundle string.
+
+    Returns (ok, errors). For the notes an auditor must see on a PASSING
+    verdict — declared sweep exclusions, unauthorized-by-declaration
+    counts — use verify_bundle_verbose().
+    """
+    ok, errors, _ = verify_bundle_verbose(bundle_json)
+    return ok, errors
+
+
+def verify_bundle_verbose(bundle_json: str) -> tuple[bool, list[str], list[str]]:
+    """B1–B7, plus the notes a passing verdict must not bury."""
+    errors: list[str] = []
+    notes: list[str] = []
     try:
         outer = json.loads(bundle_json)
         body, seal = outer["body"], outer["bundle_sha256"]
     except Exception:
-        return False, ["Bundle is not valid JSON with body/bundle_sha256."]
+        return False, ["Bundle is not valid JSON with body/bundle_sha256."], notes
 
     # B1 — seal
     if hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest() != seal:
-        return False, ["B1: bundle_sha256 does not recompute — bundle tampered as a whole."]
+        return (False,
+                ["B1: bundle_sha256 does not recompute — bundle tampered as a whole."],
+                notes)
     if body.get("format") != BUNDLE_FORMAT:
-        return False, [f"Unknown bundle format {body.get('format')!r}."]
+        return (False,
+                [f"Unknown bundle format {body.get('format')!r} (this verifier "
+                 f"implements {BUNDLE_FORMAT}). A bundle sealed under an older "
+                 "format was checked under semantics it never declared; verify "
+                 "it with a verifier of its era."],
+                notes)
+
+    # Protocol declaration — before any check that depends on a semantics.
+    perrors = protocol.check_protocols(body.get("protocols"))
+    if perrors:
+        return False, [f"B0: {e}" for e in perrors], notes
+    notes.append("semantics: " + ", ".join(
+        f"{k} {body['protocols'][k]}" for k in protocol.PROTOCOL_NAMES))
 
     heads: dict[str, str] = {}
     tf_by_sweep: dict[str, list[str]] = {}
     stored_supersedes: dict[str, str] = {}   # successor -> claimed predecessor
     successors: dict[str, set[str]] = {}     # predecessor -> SUPERSEDED_BY names
+    verified_chains: list[tuple[str, list[dict[str, Any]]]] = []
 
     for mem in body.get("memories", []):
         mid = mem["memory_id"]
@@ -278,6 +594,7 @@ def verify_bundle(bundle_json: str) -> tuple[bool, list[str]]:
             errors.extend(f"B2: {e}" for e in errs)
             continue
         heads[mid] = chain[-1]["entry_hash"]
+        verified_chains.append((mid, chain))
 
         # B3 — content integrity against the birth seal
         birth = json.loads(chain[0]["payload_json"])
@@ -353,8 +670,17 @@ def verify_bundle(bundle_json: str) -> tuple[bool, list[str]]:
         errors.append(f"B5: sweep {sid}: TAINT_FLAGGED events reference it but "
                       "the bundle neither carries it nor declares it excluded.")
 
+    for sw in excluded:
+        notes.append(f"sweep {sw['sweep_id']} declared excluded — its seal was "
+                     "NOT checked against evidence in this bundle.")
+
     # B6 — heads Merkle root
     if heads_merkle_root(heads) != body.get("heads_merkle_root"):
         errors.append("B6: heads_merkle_root does not recompute.")
 
-    return (not errors), errors
+    # B7 — authority provenance
+    aerrors, anotes = verify_authority(body, verified_chains)
+    errors.extend(aerrors)
+    notes.extend(anotes)
+
+    return (not errors), errors, notes

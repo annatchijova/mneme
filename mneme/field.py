@@ -54,7 +54,7 @@ from fractions import Fraction
 from typing import Any, Iterable
 
 from .canonical import CANONICAL_SCALE, canonical_json, quantize
-from . import custody
+from . import authority, custody
 
 # ---------------------------------------------------------------------------
 # Exact constants (raven's, made rational)
@@ -157,10 +157,20 @@ def store(
     claim: str | None = None,
     supersedes: str | None = None,
     created_at: str | None = None,
+    grant_id: str | None = None,
 ) -> StoredMemory:
     """
     Insert a memory + its STORED custody event + auto-detected
     contradiction links, all in the caller's transaction.
+
+    AUTHORITY (Invariant A1): the actor must hold STORE at this instant —
+    or SUPERSEDE, when `supersedes` names a predecessor, because retiring
+    an existing memory is a strictly stronger act than adding one. The
+    grant that authorized it is sealed into the STORED payload, so the
+    event carries its own authority proof and B7 can re-check it offline
+    against the actor's authority chain. In a field with no authority
+    ledger the write proceeds and seals no grant_id — unauthorized by
+    declaration, never by omission (see authority.gate).
 
     Contradiction rule (raven's, verbatim in spirit): same topic,
     different claim ⇒ bidirectional INHIBITORY links, PLUS — the MNEME
@@ -176,6 +186,11 @@ def store(
     lineage is a bilateral fact, like contradiction.
     """
     ts = created_at if created_at is not None else custody.now_ts()
+    birth_capability = "SUPERSEDE" if supersedes is not None else "STORE"
+    birth_grant = authority.gate(
+        cur, actor_id=actor_id, capability=birth_capability, at_ts=ts,
+        grant_id=grant_id,
+    )
     csha = custody.content_sha256(content)
     emb_json = embedding_to_json(embedding)
 
@@ -192,6 +207,8 @@ def store(
         payload["claim"] = claim
     if supersedes is not None:
         payload["supersedes"] = supersedes
+    if birth_grant is not None:
+        payload["grant_id"] = birth_grant
     custody.append_event(
         cur, memory_id=memory_id, event_type="STORED", actor_id=actor_id,
         reason=reason, payload=payload, created_at=ts,
@@ -213,6 +230,19 @@ def store(
             if other_claim and other_claim != claim:
                 contradicted.append(other_id)
 
+    # A contradiction event lands on a THIRD PARTY's chain, so it is
+    # authorized separately and always against STORE — superseding a claim
+    # is disagreeing with it, and disagreeing on someone else's chain is
+    # the act of a writer, not of a retirer. An actor that may supersede
+    # but may not store therefore cannot supersede INTO a contradiction;
+    # the refusal is loud and its reason is this sentence.
+    contradiction_grant = None
+    if contradicted:
+        contradiction_grant = authority.gate(
+            cur, actor_id=actor_id, capability="STORE", at_ts=ts,
+            grant_id=grant_id if birth_capability == "STORE" else None,
+        )
+
     for other_id in contradicted:
         for a, b in ((memory_id, other_id), (other_id, memory_id)):
             cur.execute(
@@ -221,10 +251,13 @@ def store(
                 "VALUES (?, ?, 'INHIBITORY', 1, ?)",
                 (a, b, ts),
             )
+            cpayload: dict[str, Any] = {"other_memory_id": b, "topic": topic}
+            if contradiction_grant is not None:
+                cpayload["grant_id"] = contradiction_grant
             custody.append_event(
                 cur, memory_id=a, event_type="CONTRADICTED_BY", actor_id=actor_id,
                 reason=f"auto contradiction on topic {topic!r}",
-                payload={"other_memory_id": b, "topic": topic},
+                payload=cpayload,
                 created_at=ts,
             )
 
@@ -245,6 +278,7 @@ def supersede(
     topic: str | None = None,
     claim: str | None = None,
     created_at: str | None = None,
+    grant_id: str | None = None,
 ) -> StoredMemory:
     """
     The M1 path for new content: content is immutable, so an "update"
@@ -266,6 +300,11 @@ def supersede(
     claim, the automatic contradiction rule fires as usual and both
     chains also record CONTRADICTED_BY — truthful, kept: superseding a
     claim IS disagreeing with it.
+
+    AUTHORITY: SUPERSEDE, resolved once and sealed into both halves of
+    the lineage, so an auditor reading either chain finds the same grant
+    behind the same act. A contradiction fired by the successor is
+    authorized separately against STORE (see store()).
     """
     cur.execute("SELECT custody_status FROM memories WHERE memory_id = ?",
                 (old_memory_id,))
@@ -279,16 +318,28 @@ def supersede(
             "lineage; tainted memories are incident evidence)."
         )
     ts = created_at if created_at is not None else custody.now_ts()
+    # Both halves of the lineage are one act, so both are authorized by one
+    # grant, resolved once here and sealed into both events. Resolving it
+    # before store() also means an unauthorized supersession never creates
+    # the successor at all.
+    lineage_grant = authority.gate(
+        cur, actor_id=actor_id, capability="SUPERSEDE", at_ts=ts,
+        grant_id=grant_id,
+    )
 
     stored = store(
         cur, memory_id=memory_id, content=content, embedding=embedding,
         embedding_model=embedding_model, actor_id=actor_id, reason=reason,
         topic=topic, claim=claim, supersedes=old_memory_id, created_at=ts,
+        grant_id=lineage_grant,
     )
+    retire_payload: dict[str, Any] = {"successor_memory_id": memory_id}
+    if lineage_grant is not None:
+        retire_payload["grant_id"] = lineage_grant
     custody.append_event(
         cur, memory_id=old_memory_id, event_type="SUPERSEDED_BY",
         actor_id=actor_id, reason=reason,
-        payload={"successor_memory_id": memory_id}, created_at=ts,
+        payload=retire_payload, created_at=ts,
     )
     # Security audit Round 2, H4: the CLEAN check above is a single read;
     # a concurrent supersede() on the same old_memory_id can pass that
@@ -315,12 +366,19 @@ def supersede(
 
 
 def reinforce(cur, *, memory_id: str, actor_id: str, reason: str,
-              created_at: str | None = None) -> tuple[Decimal, str]:
+              created_at: str | None = None,
+              grant_id: str | None = None) -> tuple[Decimal, str]:
     """
     STIGMERGY's closed form c' = c + α(1−c), exact, plus custody event.
     Returns (new_confidence, field_state). Promotion to REINFORCED at
     the exact threshold writes its own STATE_CHANGED event — one state
     transition, one event, always.
+
+    AUTHORITY: REINFORCE, and the promotion event it may trigger is
+    sealed under the same grant — one act, one authorization. Round 2's
+    R2-01 lived exactly here: a quarantined actor could keep inflating a
+    clean memory's confidence. It no longer can, and the refusal happens
+    in this transaction rather than in a later sweep.
     """
     cur.execute(
         "SELECT confidence, field_state, custody_status FROM memories "
@@ -336,16 +394,22 @@ def reinforce(cur, *, memory_id: str, actor_id: str, reason: str,
             "non-CLEAN memory would launder taint into confidence."
         )
     ts = created_at if created_at is not None else custody.now_ts()
+    reinforce_grant = authority.gate(
+        cur, actor_id=actor_id, capability="REINFORCE", at_ts=ts,
+        grant_id=grant_id,
+    )
 
     c = Fraction(Decimal(conf_txt))
     c_new = c + REINFORCEMENT_ALPHA * (1 - c)
     conf_q = quantize(c_new, field="confidence")
 
+    rpayload: dict[str, Any] = {"confidence_before": quantize(c),
+                                "confidence_after": conf_q}
+    if reinforce_grant is not None:
+        rpayload["grant_id"] = reinforce_grant
     custody.append_event(
         cur, memory_id=memory_id, event_type="REINFORCED", actor_id=actor_id,
-        reason=reason,
-        payload={"confidence_before": quantize(c), "confidence_after": conf_q},
-        created_at=ts,
+        reason=reason, payload=rpayload, created_at=ts,
     )
     cur.execute("UPDATE memories SET confidence = ? WHERE memory_id = ?",
                 (format(conf_q, "f"), memory_id))
@@ -353,11 +417,14 @@ def reinforce(cur, *, memory_id: str, actor_id: str, reason: str,
     new_state = state
     if state == "NEUTRAL" and c_new >= PROMOTION_THRESHOLD:
         new_state = "REINFORCED"
+        spayload: dict[str, Any] = {"from": "NEUTRAL", "to": "REINFORCED"}
+        if reinforce_grant is not None:
+            spayload["grant_id"] = reinforce_grant
         custody.append_event(
             cur, memory_id=memory_id, event_type="STATE_CHANGED", actor_id=actor_id,
             reason=f"confidence crossed promotion threshold "
                    f"{PROMOTION_THRESHOLD.numerator}/{PROMOTION_THRESHOLD.denominator}",
-            payload={"from": "NEUTRAL", "to": "REINFORCED"},
+            payload=spayload,
             created_at=ts,
         )
         cur.execute("UPDATE memories SET field_state = 'REINFORCED' "

@@ -40,6 +40,23 @@ Checks (normative statement in mneme/bundle.py's header):
       verified one.
   B6  Merkle root over chain heads recomputes (leaves sorted by
       memory_id ASC, odd leaf promoted unpaired)
+  B7  authority provenance: every authority chain verifies and replays;
+      declared actor status reproduces from it; exactly one self-issued
+      root grant conferring the whole vocabulary; NO AMPLIFICATION —
+      every authority event's issuer held, at that instant, the
+      capability the event required and (for a grant) every capability
+      it conferred; and every custody event at or after the declared
+      authority genesis names a grant that was active for its actor at
+      that instant, conferred the capability its event type requires,
+      and belonged to an actor not then quarantined. Events before the
+      genesis — and every event in a field with no ledger at all — are
+      UNAUTHORIZED BY DECLARATION: named on success, never passed as
+      authorized.
+
+  B0 comes last in this list and first in the code: a V2 bundle declares
+      the VERSION of every semantics its checks depend on, and a
+      verifier that meets a version it does not implement refuses rather
+      than applying today's rules to yesterday's evidence.
 """
 
 from __future__ import annotations
@@ -49,12 +66,52 @@ import json
 import re
 import sys
 
-FORMAT = "MNEME_BUNDLE_V1"
+FORMAT = "MNEME_BUNDLE_V2"
 GENESIS_PREFIX = b"MNEME_CUSTODY_GENESIS:"
+AUTHORITY_GENESIS_PREFIX = b"MNEME_AUTHORITY_GENESIS:"
 EVENT_TYPES = frozenset({
     "STORED", "REINFORCED", "CONTRADICTED_BY", "SUPERSEDED_BY",
     "QUARANTINED", "TAINT_FLAGGED", "REHABILITATED", "STATE_CHANGED",
 })
+AUTHORITY_EVENT_TYPES = frozenset({
+    "ACTOR_REGISTERED", "GRANTED", "REVOKED",
+    "ACTOR_QUARANTINED", "ACTOR_REINSTATED",
+})
+CAPABILITIES = frozenset({
+    "STORE", "REINFORCE", "SUPERSEDE", "QUARANTINE_ACTOR",
+    "QUARANTINE_MEMORY", "REHABILITATE", "GRANT", "REVOKE", "DECIDE",
+})
+# Custody event type -> capability its actor had to hold (authority.py).
+REQUIRED_CAPABILITY = {
+    "STORED": "STORE",
+    "REINFORCED": "REINFORCE",
+    "CONTRADICTED_BY": "STORE",
+    "SUPERSEDED_BY": "SUPERSEDE",
+    "QUARANTINED": "QUARANTINE_MEMORY",
+    "TAINT_FLAGGED": "QUARANTINE_ACTOR",
+    "REHABILITATED": "REHABILITATE",
+    "STATE_CHANGED": "REINFORCE",
+}
+# Authority event type -> capability its ISSUER had to hold.
+AUTHORITY_EVENT_CAPABILITY = {
+    "ACTOR_REGISTERED": "GRANT",
+    "GRANTED": "GRANT",
+    "REVOKED": "REVOKE",
+    "ACTOR_QUARANTINED": "QUARANTINE_ACTOR",
+    "ACTOR_REINSTATED": "QUARANTINE_ACTOR",
+}
+PROTOCOL_NAMES = ("custody_protocol", "replay_protocol", "ranking_protocol",
+                  "taint_protocol", "authority_protocol", "receipt_protocol")
+# Every version this verifier actually implements (mneme/protocol.py).
+SUPPORTED_PROTOCOLS = {
+    "custody_protocol": frozenset({"1.0.0"}),
+    "replay_protocol": frozenset({"1.0.0"}),
+    "ranking_protocol": frozenset({"1.0.0"}),
+    "taint_protocol": frozenset({"1.0.0", "1.1.0"}),
+    "authority_protocol": frozenset({"1.0.0"}),
+    "receipt_protocol": frozenset({"1.0.0", "1.1.0"}),
+}
+GRANT_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_\-.:]{1,64}$")
 INITIAL_CONFIDENCE = "0.5000000000"
 # Canonical timestamp shape (UTC, microseconds, +00:00). Verification
 # re-asserts it so lexicographic order equals chronological order.
@@ -84,6 +141,33 @@ def canonical_json(payload: dict) -> str:
 
 def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+# --- B0: declared semantics (transcribed from mneme/protocol.py) ------------
+
+def check_protocols(declared) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(declared, dict):
+        return ["protocols: block absent or not an object — a bundle that "
+                "declares no semantics commits to none."]
+    for name in PROTOCOL_NAMES:
+        if name not in declared:
+            errors.append(f"protocols: {name} is not declared — this verifier "
+                          "will not apply today's rules to evidence that never "
+                          "named them.")
+            continue
+        version = declared[name]
+        if not isinstance(version, str):
+            errors.append(f"protocols: {name} version is not a string.")
+        elif version not in SUPPORTED_PROTOCOLS[name]:
+            errors.append(
+                f"protocols: {name} {version} is not implemented by this "
+                f"verifier (supported: "
+                f"{', '.join(sorted(SUPPORTED_PROTOCOLS[name]))}).")
+    for name in sorted(set(declared) - set(PROTOCOL_NAMES)):
+        errors.append(f"protocols: {name!r} is unknown to this verifier — the "
+                      "bundle was sealed by a newer MNEME.")
+    return errors
 
 
 # --- B2: custody chain ------------------------------------------------------
@@ -182,6 +266,300 @@ def replay_state(chain: list[dict], errors: list[str]) -> tuple[str, str, str]:
     return status, fstate, conf
 
 
+# --- B7: authority chains (transcribed from mneme/authority.py) -------------
+
+def verify_authority_chain(subject_id: str, chain: list, errors: list) -> bool:
+    if not chain:
+        errors.append(f"B7: {subject_id}: empty authority chain.")
+        return False
+    expected_prev = sha256_hex(AUTHORITY_GENESIS_PREFIX + subject_id.encode("utf-8"))
+    prev_ts = None
+    for i, r in enumerate(chain):
+        where = f"B7: {subject_id} authority seq {r.get('seq')}"
+        if r.get("seq") != i:
+            errors.append(f"{where}: seq not dense (expected {i})."); return False
+        et = r.get("event_type")
+        if et not in AUTHORITY_EVENT_TYPES:
+            errors.append(f"{where}: unknown event_type {et!r}."); return False
+        if i == 0 and et != "ACTOR_REGISTERED":
+            errors.append(f"{where}: chain does not begin with ACTOR_REGISTERED."); return False
+        if i > 0 and et == "ACTOR_REGISTERED":
+            errors.append(f"{where}: ACTOR_REGISTERED after birth."); return False
+        if r.get("prev_hash") != expected_prev:
+            errors.append(f"{where}: prev_hash does not link (broken or grafted)."); return False
+        try:
+            payload = json.loads(r["payload_json"])
+        except Exception:
+            errors.append(f"{where}: payload_json is not valid JSON."); return False
+        try:
+            if canonical_json(payload) != r["payload_json"]:
+                errors.append(f"{where}: payload_json is not canonical bytes."); return False
+        except ValueError as e:
+            errors.append(f"{where}: {e}"); return False
+        envelope = {
+            "subject_id": subject_id, "seq": r["seq"], "event_type": et,
+            "issuer_id": r["issuer_id"], "reason": r["reason"],
+            "created_at": r["created_at"], "payload": payload,
+        }
+        recomputed = sha256_hex(r["prev_hash"].encode("ascii")
+                                + canonical_json(envelope).encode("utf-8"))
+        if recomputed != r["entry_hash"]:
+            errors.append(f"{where}: entry_hash does not recompute — grant tampered.")
+            return False
+        ts = r["created_at"]
+        if not isinstance(ts, str) or not TS_PATTERN.match(ts):
+            errors.append(f"{where}: created_at {ts!r} is not canonical UTC "
+                          "microsecond ISO 8601 (…+00:00)."); return False
+        if prev_ts is not None and ts < prev_ts:
+            errors.append(f"{where}: created_at {ts} precedes the previous "
+                          f"event's {prev_ts} — chain runs backwards in time."); return False
+        prev_ts = ts
+        expected_prev = r["entry_hash"]
+    return True
+
+
+def replay_authority(subject_id: str, chain: list, errors: list) -> dict:
+    """
+    The authority state machine (normative statement in
+    mneme/authority.py's replay_authority docstring), transcribed.
+    """
+    state = {"status": "ACTIVE", "grants": {}, "quarantine": [], "root": False}
+    for r in chain:
+        et, payload = r["event_type"], json.loads(r["payload_json"])
+        where = f"B7: {subject_id} authority seq {r['seq']}"
+        if et == "GRANTED":
+            gid, caps = payload.get("grant_id"), payload.get("capabilities")
+            is_root = payload.get("root", False)
+            if not (isinstance(gid, str) and GRANT_ID_PATTERN.match(gid)):
+                errors.append(f"{where}: GRANTED without a well-formed grant_id."); continue
+            if gid in state["grants"]:
+                errors.append(f"{where}: grant_id {gid!r} reused."); continue
+            if not (isinstance(caps, list) and caps and all(isinstance(c, str) for c in caps)):
+                errors.append(f"{where}: GRANTED without a capability list."); continue
+            unknown = [c for c in caps if c not in CAPABILITIES]
+            if unknown:
+                errors.append(f"{where}: unknown capabilities {sorted(unknown)}."); continue
+            if list(caps) != sorted(set(caps)):
+                errors.append(f"{where}: capability list is not sorted and "
+                              "duplicate-free."); continue
+            if not isinstance(is_root, bool):
+                errors.append(f"{where}: GRANTED 'root' is not a boolean."); continue
+            if is_root:
+                if r["issuer_id"] != subject_id:
+                    errors.append(f"{where}: a root grant must be self-issued."); continue
+                if set(caps) != set(CAPABILITIES):
+                    errors.append(f"{where}: a root grant must confer the whole "
+                                  "capability vocabulary."); continue
+                state["root"] = True
+            state["grants"][gid] = {"capabilities": tuple(caps),
+                                    "granted_at": r["created_at"],
+                                    "revoked_at": None, "root": is_root}
+        elif et == "REVOKED":
+            gid = payload.get("grant_id")
+            if not isinstance(gid, str) or gid not in state["grants"]:
+                errors.append(f"{where}: REVOKED names grant {gid!r}, which this "
+                              "chain never granted."); continue
+            if state["grants"][gid]["revoked_at"] is not None:
+                errors.append(f"{where}: grant {gid} revoked twice."); continue
+            state["grants"][gid]["revoked_at"] = r["created_at"]
+        elif et == "ACTOR_QUARANTINED":
+            if state["status"] != "ACTIVE":
+                errors.append(f"{where}: ACTOR_QUARANTINED from {state['status']}, "
+                              "valid only from ACTIVE.")
+            state["status"] = "QUARANTINED"
+            state["quarantine"].append([r["created_at"], None])
+        elif et == "ACTOR_REINSTATED":
+            if state["status"] != "QUARANTINED":
+                errors.append(f"{where}: ACTOR_REINSTATED from {state['status']}, "
+                              "valid only from QUARANTINED.")
+            elif state["quarantine"]:
+                state["quarantine"][-1][1] = r["created_at"]
+            state["status"] = "ACTIVE"
+    return state
+
+
+def quarantined_at(state: dict, at_ts: str) -> bool:
+    """Half-open [from, to): a write sharing a microsecond with its own
+    quarantine is refused, not admitted."""
+    return any(lo <= at_ts and (hi is None or at_ts < hi)
+               for lo, hi in state["quarantine"])
+
+
+def grant_capabilities_at(state: dict, grant_id: str, at_ts: str):
+    g = state["grants"].get(grant_id)
+    if g is None or g["granted_at"] > at_ts:
+        return None
+    if g["revoked_at"] is not None and g["revoked_at"] <= at_ts:
+        return None
+    return frozenset(g["capabilities"])
+
+
+def capabilities_at(state: dict, at_ts: str) -> frozenset:
+    if quarantined_at(state, at_ts):
+        return frozenset()
+    out = set()
+    for gid in state["grants"]:
+        caps = grant_capabilities_at(state, gid, at_ts)
+        if caps:
+            out |= caps
+    return frozenset(out)
+
+
+def required_capability(event_type: str, payload: dict):
+    if event_type == "STORED" and isinstance(payload.get("supersedes"), str):
+        return "SUPERSEDE"
+    return REQUIRED_CAPABILITY.get(event_type)
+
+
+def verify_authority(body: dict, memory_chains: list) -> tuple[list, list]:
+    """
+    Returns (errors, notes). Deliberately owns its OWN error list rather
+    than appending to the caller's: the package implementation does the
+    same, and "did B7 find anything" must not silently become "did any
+    check anywhere find anything" in one implementation and not the other.
+    The agreement test caught exactly that divergence.
+    """
+    errors: list = []
+    notes: list = []
+    entries = body.get("authority", [])
+    declared_genesis = body.get("authority_genesis_at")
+    if not isinstance(entries, list):
+        return ["B7: 'authority' is not a list."], notes
+
+    all_events = [(mid, r) for mid, chain in memory_chains for r in chain]
+
+    if not entries:
+        if declared_genesis is not None:
+            errors.append("B7: the bundle declares an authority genesis but "
+                          "carries no authority evidence.")
+        for mid, r in all_events:
+            if isinstance(json.loads(r["payload_json"]).get("grant_id"), str):
+                errors.append(f"B7: {mid} seq {r['seq']}: names a grant_id, but "
+                              "the bundle carries no authority chain that could "
+                              "have issued it.")
+        if heads_merkle_root({}) != body.get("authority_merkle_root"):
+            errors.append("B7: authority_merkle_root does not recompute.")
+        if not errors:
+            notes.append(f"this field has NO authority ledger: all "
+                         f"{len(all_events)} custody event(s) are UNAUTHORIZED "
+                         "BY DECLARATION. Their integrity is proven; nobody's "
+                         "permission to cause them is.")
+        return errors, notes
+
+    if not isinstance(declared_genesis, str):
+        return (errors + ["B7: the bundle carries authority evidence but declares no authority_genesis_at."]), notes
+
+    states, auth_heads, chains_by_id = {}, {}, {}
+    earliest = None
+    broken = False
+    for entry in sorted(entries, key=lambda e: str(e.get("subject_id"))):
+        sid, chain = entry.get("subject_id"), entry.get("chain")
+        if not isinstance(sid, str) or not isinstance(chain, list) or not chain:
+            errors.append(f"B7: malformed authority entry for {sid!r}.")
+            broken = True; continue
+        if not verify_authority_chain(sid, chain, errors):
+            broken = True; continue
+        before = len(errors)
+        state = replay_authority(sid, chain, errors)
+        if len(errors) != before:
+            broken = True; continue
+        states[sid], chains_by_id[sid] = state, chain
+        auth_heads[sid] = chain[-1]["entry_hash"]
+        if earliest is None or chain[0]["created_at"] < earliest:
+            earliest = chain[0]["created_at"]
+        if entry.get("status") != state["status"]:
+            errors.append(f"B7: {sid}: declared actor status "
+                          f"{entry.get('status')!r}, authority replay says "
+                          f"{state['status']!r}.")
+
+    if heads_merkle_root(auth_heads) != body.get("authority_merkle_root"):
+        errors.append("B7: authority_merkle_root does not recompute.")
+    if earliest is not None and declared_genesis != earliest:
+        errors.append(f"B7: declared authority_genesis_at {declared_genesis} is "
+                      f"not the earliest instant in the carried ledger "
+                      f"({earliest}).")
+    if broken or errors:
+        return errors, notes
+
+    roots = sorted(sid for sid, st in states.items() if st["root"])
+    if len(roots) != 1:
+        errors.append(f"B7: the ledger declares {len(roots)} root grants "
+                      f"({roots}); authority hangs from exactly one auditable "
+                      "act or from nothing checkable.")
+
+    # No amplification (A3), re-derived offline.
+    for sid in sorted(states):
+        for r in chains_by_id[sid]:
+            payload = json.loads(r["payload_json"])
+            issuer, at = r["issuer_id"], r["created_at"]
+            where = f"B7: {sid} authority seq {r['seq']}"
+            if issuer == sid and payload.get("root") is True:
+                continue
+            if issuer not in states:
+                errors.append(f"{where}: issued by {issuer!r}, whose authority "
+                              "chain is not in this bundle — the delegation "
+                              "path is unprovable.")
+                continue
+            needed = AUTHORITY_EVENT_CAPABILITY[r["event_type"]]
+            issuer_caps = capabilities_at(states[issuer], at)
+            if needed not in issuer_caps:
+                errors.append(f"{where}: issuer {issuer!r} did not hold {needed} "
+                              f"at {at} (never granted, revoked by then, or "
+                              "quarantined).")
+                continue
+            if r["event_type"] == "GRANTED":
+                missing = sorted(set(payload.get("capabilities", [])) - issuer_caps)
+                if missing:
+                    errors.append(f"{where}: issuer {issuer!r} conferred "
+                                  f"{missing} it did not hold — authority "
+                                  "invented, not delegated (A3).")
+
+    pre_authority = 0
+    for mid, r in all_events:
+        payload = json.loads(r["payload_json"])
+        gid, at = payload.get("grant_id"), r["created_at"]
+        where = f"B7: {mid} seq {r['seq']} ({r['event_type']})"
+        if at < declared_genesis:
+            pre_authority += 1
+            if isinstance(gid, str):
+                errors.append(f"{where}: names grant {gid!r} but is timestamped "
+                              "before the ledger existed.")
+            continue
+        if not isinstance(gid, str):
+            errors.append(f"{where}: no grant_id, and it postdates the authority "
+                          f"genesis {declared_genesis}. Recorded is not "
+                          "authorized.")
+            continue
+        actor = r["actor_id"]
+        if actor not in states:
+            errors.append(f"{where}: actor {actor!r} has no authority chain in "
+                          "this bundle.")
+            continue
+        if quarantined_at(states[actor], at):
+            errors.append(f"{where}: actor {actor!r} was QUARANTINED at {at} and "
+                          "held no capability (A5).")
+            continue
+        caps = grant_capabilities_at(states[actor], gid, at)
+        if caps is None:
+            errors.append(f"{where}: grant {gid!r} was not active for {actor!r} "
+                          f"at {at}.")
+            continue
+        needed = required_capability(r["event_type"], payload)
+        if needed is None:
+            errors.append(f"{where}: no capability is mapped for this event "
+                          "type — an authority hole.")
+        elif needed not in caps:
+            errors.append(f"{where}: grant {gid!r} confers {sorted(caps)}, which "
+                          f"does not include {needed}.")
+
+    if pre_authority and not errors:
+        notes.append(f"{pre_authority} custody event(s) predate this field's "
+                     f"authority genesis ({declared_genesis}) and are "
+                     "UNAUTHORIZED BY DECLARATION — their integrity is proven, "
+                     "their authorization is not claimed.")
+    return errors, notes
+
+
 # --- B6: Merkle over heads ---------------------------------------------------
 
 def heads_merkle_root(heads: dict[str, str]) -> str:
@@ -200,26 +578,40 @@ def heads_merkle_root(heads: dict[str, str]) -> str:
 
 # --- driver -------------------------------------------------------------------
 
-def verify(bundle_json: str) -> tuple[bool, list[str]]:
+def verify(bundle_json: str) -> tuple[bool, list[str], list[str]]:
+    """Returns (ok, errors, notes). Notes are claims a PASSING verdict must
+    show the auditor rather than bury: declared sweep exclusions, declared
+    protocol semantics, unauthorized-by-declaration counts."""
     errors: list[str] = []
+    notes: list[str] = []
     try:
         outer = json.loads(bundle_json)
         body, seal = outer["body"], outer["bundle_sha256"]
     except Exception:
-        return False, ["Bundle is not valid JSON with body/bundle_sha256."]
+        return False, ["Bundle is not valid JSON with body/bundle_sha256."], notes
 
     try:
         if sha256_hex(canonical_json(body).encode("utf-8")) != seal:
-            return False, ["B1: bundle_sha256 does not recompute — bundle tampered as a whole."]
+            return False, ["B1: bundle_sha256 does not recompute — bundle tampered as a whole."], notes
     except ValueError as e:
-        return False, [f"B1: body is not canonicalizable: {e}"]
+        return False, [f"B1: body is not canonicalizable: {e}"], notes
     if body.get("format") != FORMAT:
-        return False, [f"Unknown bundle format {body.get('format')!r}."]
+        return False, [f"Unknown bundle format {body.get('format')!r} (this "
+                       f"verifier implements {FORMAT}). A bundle sealed under "
+                       "an older format was checked under semantics it never "
+                       "declared; verify it with a verifier of its era."], notes
+
+    perrors = check_protocols(body.get("protocols"))
+    if perrors:
+        return False, [f"B0: {e}" for e in perrors], notes
+    notes.append("semantics: " + ", ".join(
+        f"{k} {body['protocols'][k]}" for k in PROTOCOL_NAMES))
 
     heads: dict[str, str] = {}
     tf_by_sweep: dict[str, list[str]] = {}
     stored_supersedes: dict[str, str] = {}   # successor -> claimed predecessor
     successors: dict[str, set[str]] = {}     # predecessor -> SUPERSEDED_BY names
+    verified_chains: list = []
 
     for mem in body.get("memories", []):
         mid = mem["memory_id"]
@@ -227,6 +619,7 @@ def verify(bundle_json: str) -> tuple[bool, list[str]]:
         if not verify_chain(mid, chain, errors):
             continue
         heads[mid] = chain[-1]["entry_hash"]
+        verified_chains.append((mid, chain))
 
         birth = json.loads(chain[0]["payload_json"])
         if isinstance(birth.get("supersedes"), str):
@@ -296,10 +689,18 @@ def verify(bundle_json: str) -> tuple[bool, list[str]]:
         errors.append(f"B5: sweep {sid}: TAINT_FLAGGED events reference it but "
                       "the bundle neither carries it nor declares it excluded.")
 
+    for sw in excluded:
+        notes.append(f"sweep {sw['sweep_id']} declared excluded — its seal was "
+                     "NOT checked against evidence in this bundle.")
+
     if heads_merkle_root(heads) != body.get("heads_merkle_root"):
         errors.append("B6: heads_merkle_root does not recompute.")
 
-    return (not errors), errors
+    aerrors, anotes = verify_authority(body, verified_chains)
+    errors.extend(aerrors)
+    notes.extend(anotes)
+
+    return (not errors), errors, notes
 
 
 def main() -> int:
@@ -308,18 +709,14 @@ def main() -> int:
         return 2
     with open(sys.argv[1], encoding="utf-8") as f:
         raw = f.read()
-    ok, errors = verify(raw)
+    ok, errors, notes = verify(raw)
     if ok:
-        print("VERIFIED: every check (B1-B6) passed.")
+        print("VERIFIED: every check (B0-B7) passed.")
         # A declared exclusion is a claim the auditor must SEE, not
-        # something a passing verdict may bury.
-        try:
-            excluded = json.loads(raw)["body"].get("excluded_sweeps", [])
-        except Exception:
-            excluded = []
-        for sw in excluded:
-            print(f"  NOTE: sweep {sw['sweep_id']} declared excluded — its seal "
-                  "was NOT checked against evidence in this bundle.")
+        # something a passing verdict may bury. So is a field whose events
+        # nobody was ever authorized to cause.
+        for n in notes:
+            print(f"  NOTE: {n}")
         return 0
     print(f"FAILED: {len(errors)} problem(s).")
     for e in errors:

@@ -50,8 +50,14 @@ def codes(errors: list[str]) -> set[str]:
 
 
 def both_verdicts(bundle_json: str):
-    ok_pkg, err_pkg = bundle.verify_bundle(bundle_json)
-    ok_off, err_off = offline.verify(bundle_json)
+    ok_pkg, err_pkg, notes_pkg = bundle.verify_bundle_verbose(bundle_json)
+    ok_off, err_off, notes_off = offline.verify(bundle_json)
+    # The notes a PASSING verdict shows an auditor are part of the verdict:
+    # a verifier that silently drops "this field has no authority ledger"
+    # has disagreed with its twin about what the bundle proves, even though
+    # both said VERIFIED.
+    check("verdict notes agree", notes_pkg == notes_off,
+          f"{notes_pkg} vs {notes_off}")
     return ok_pkg, err_pkg, ok_off, err_off
 
 

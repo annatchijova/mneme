@@ -167,6 +167,13 @@ def _require_id(value: str, field: str) -> None:
         )
 
 
+# The same rule, under a public name, because authority.py derives its own
+# genesis hashes from actor identifiers and must validate them identically.
+# One identifier rule for the whole protocol or two chains can disagree
+# about what an identifier even is.
+require_id = _require_id
+
+
 # ---------------------------------------------------------------------------
 # Hashing
 # ---------------------------------------------------------------------------

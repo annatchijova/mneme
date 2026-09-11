@@ -59,7 +59,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .canonical import canonical_json
-from . import custody
+from . import authority, custody
 
 
 @dataclass(frozen=True)
@@ -87,10 +87,30 @@ def quarantine_actor(
     initiated_by: str,
     reason: str,
     created_at: str | None = None,
+    grant_id: str | None = None,
 ) -> TaintSweep:
     """
     Quarantine an actor and taint-flag every memory whose custody chain
-    it appears in. One logical operation, one transaction (the caller's):
+    it appears in. One logical operation, one transaction (the caller's).
+
+    AUTHORITY (Round 2, R2-01 and R2-02 together): the initiator must
+    hold QUARANTINE_ACTOR, and the quarantine now has TWO halves that
+    land in the same transaction —
+
+      retrospective  every memory the actor touched is TAINT_FLAGGED
+                     (this was all quarantine ever meant);
+      prospective    an ACTOR_QUARANTINED event on the actor's authority
+                     chain, from which instant its effective capability
+                     set is empty (Invariant A5). The actor cannot store
+                     a fresh CLEAN memory, cannot reinforce a clean one,
+                     cannot rehabilitate its own evidence.
+
+    Before this, containment was retrospective only: the sweep flagged
+    history while the compromised actor kept writing, and a second sweep
+    was refused as a duplicate. Flagging the past while the present stays
+    open is not containment.
+
+    Step by step:
 
       1. actors.status -> QUARANTINED (idempotence: re-quarantining an
          already-quarantined actor is refused with our words — a second
@@ -118,14 +138,28 @@ def quarantine_actor(
     if row[0] == "QUARANTINED":
         raise ValueError(
             f"Actor {actor_id!r} is already QUARANTINED. A second sweep for "
-            "the same incident would split the evidence; rehabilitate first "
-            "if this is a new incident against a restored actor."
+            "the same incident would split the evidence; reinstate the actor "
+            "first (authority.reinstate_actor, an audited event) if this is a "
+            "new incident against a restored actor."
         )
     cur.execute("SELECT 1 FROM actors WHERE actor_id = ?", (initiated_by,))
     if cur.fetchone() is None:
         raise ValueError(f"Unknown initiator {initiated_by!r}.")
 
     ts = created_at if created_at is not None else custody.now_ts()
+    sweep_grant = authority.gate(
+        cur, actor_id=initiated_by, capability="QUARANTINE_ACTOR", at_ts=ts,
+        grant_id=grant_id,
+    )
+    if authority.ledger_exists(cur):
+        # The prospective half. Appended BEFORE the flagging loop so that a
+        # failure anywhere below takes the write barrier down with it —
+        # a field where the barrier committed but the sweep did not would
+        # claim a containment it never performed.
+        authority.quarantine_actor_authority(
+            cur, subject_id=actor_id, issuer_id=initiated_by, reason=reason,
+            created_at=ts,
+        )
 
     cur.execute(
         "UPDATE actors SET status = 'QUARANTINED' WHERE actor_id = ?", (actor_id,)
@@ -143,6 +177,8 @@ def quarantine_actor(
         "sweep_id": sweep_id,
         "quarantined_actor": actor_id,
     }
+    if sweep_grant is not None:
+        payload_common["grant_id"] = sweep_grant
 
     for mid in flagged:
         custody.append_event(
@@ -199,6 +235,7 @@ def quarantine_memory(
     actor_id: str,
     reason: str,
     created_at: str | None = None,
+    grant_id: str | None = None,
 ) -> None:
     """
     Direct quarantine of ONE memory: the analyst has evidence against
@@ -217,6 +254,12 @@ def quarantine_memory(
     reverses TAINT_FLAGGED only. Undoing a direct quarantine is a
     stronger claim with no designed review path yet — named in
     KNOWN_LIMITATIONS, arriving with its own invariant or not at all.
+
+    AUTHORITY: QUARANTINE_MEMORY, a capability distinct from
+    QUARANTINE_ACTOR on purpose. Incriminating one memory and sweeping an
+    entire data source are different-sized claims, and an authority model
+    that cannot tell them apart is a role system wearing capability
+    vocabulary.
     """
     cur.execute("SELECT custody_status FROM memories WHERE memory_id = ?",
                 (memory_id,))
@@ -229,9 +272,14 @@ def quarantine_memory(
             "would add a status write with no new evidence."
         )
     ts = created_at if created_at is not None else custody.now_ts()
+    qgrant = authority.gate(cur, actor_id=actor_id,
+                            capability="QUARANTINE_MEMORY", at_ts=ts,
+                            grant_id=grant_id)
     custody.append_event(
         cur, memory_id=memory_id, event_type="QUARANTINED",
-        actor_id=actor_id, reason=reason, payload={}, created_at=ts,
+        actor_id=actor_id, reason=reason,
+        payload={} if qgrant is None else {"grant_id": qgrant},
+        created_at=ts,
     )
     cur.execute(
         "UPDATE memories SET custody_status = 'QUARANTINED' WHERE memory_id = ?",
@@ -246,6 +294,7 @@ def rehabilitate_memory(
     actor_id: str,
     reason: str,
     created_at: str | None = None,
+    grant_id: str | None = None,
 ) -> None:
     """
     Audited reversal of TAINT_FLAGGED for one memory (analyst reviewed a
@@ -260,6 +309,14 @@ def rehabilitate_memory(
     registered, non-QUARANTINED actor. Without this, the actor a sweep
     just quarantined could rehabilitate the very memories that sweep
     flagged, reversing its own containment.
+
+    Round 2, R2-02, is the deeper half of the same finding and the reason
+    REHABILITATE is its own capability: the status check above stops the
+    actor a sweep JUST quarantined, and stops nobody else. Any registered
+    caller could still nominate itself the reviewer by choosing a string.
+    Now the reviewer must hold a grant that someone holding both GRANT
+    and REHABILITATE issued, on the record, before this instant — and the
+    grant travels in the evidence bundle, where B7 re-derives it.
     """
     cur.execute("SELECT status FROM actors WHERE actor_id = ?", (actor_id,))
     actor_row = cur.fetchone()
@@ -286,13 +343,18 @@ def rehabilitate_memory(
             "reverses TAINT_FLAGGED only."
         )
     ts = created_at if created_at is not None else custody.now_ts()
+    rgrant = authority.gate(cur, actor_id=actor_id, capability="REHABILITATE",
+                            at_ts=ts, grant_id=grant_id)
+    rpayload: dict[str, Any] = {"from_status": "TAINT_FLAGGED"}
+    if rgrant is not None:
+        rpayload["grant_id"] = rgrant
     custody.append_event(
         cur,
         memory_id=memory_id,
         event_type="REHABILITATED",
         actor_id=actor_id,
         reason=reason,
-        payload={"from_status": "TAINT_FLAGGED"},
+        payload=rpayload,
         created_at=ts,
     )
     cur.execute(

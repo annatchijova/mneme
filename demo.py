@@ -9,6 +9,9 @@ Zero dependencies beyond Python 3.10+; the field lives in SQLite
 API doing what an operator would do, in the order an incident actually
 unfolds:
 
+  0. an authority ledger is bootstrapped and capabilities are granted:
+     every mutation below carries two separable proofs, integrity and
+     authority;
   1. a compromised pipeline plants a poisoned memory and inflates a
      legitimate one;
   2. recall shows the field's own defences (inhibition, the rescue
@@ -16,7 +19,8 @@ unfolds:
   3. the actor is quarantined: one sealed sweep flags everything it
      touched;
   4. recall again: the custody gate withholds the flagged memories and
-     the receipt counts them;
+     the receipt counts them — and the quarantined actor discovers the
+     containment is prospective too: it can no longer write at all;
   5. the false positive is rehabilitated by audited event;
   6. the whole field ships as a sealed bundle, verified by the
      standalone auditor file; a tampered copy is caught; a partial
@@ -34,7 +38,7 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from mneme import bundle, custody, field, trust  # noqa: E402
+from mneme import authority, bundle, custody, field, trust  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 VERIFIER = os.path.join(HERE, "verify_offline.py")
@@ -71,13 +75,29 @@ def main() -> None:
         conn.executescript(f.read())
     cur = conn.cursor()
 
-    section("1. A field grows — and a compromised pipeline writes into it")
-    for aid, kind in [("agent-ada", "AGENT"), ("pipeline-feeds", "PIPELINE"),
-                      ("analyst-omar", "HUMAN")]:
-        cur.execute("INSERT INTO actors (actor_id, display_name, kind, "
-                    "created_at) VALUES (?, ?, ?, ?)",
-                    (aid, aid, kind, custody.now_ts()))
+    section("0. Authority: who is allowed to cause what, before anything happens")
+    root_grant = authority.bootstrap_root(
+        cur, actor_id="root-ops", display_name="Root Operator", kind="HUMAN",
+        reason="field genesis: operator provisioned out of band")
+    print(f"root-ops bootstrapped the ledger  (grant {root_grant[:18]}…)")
+    print("  the one act authority cannot authorize; refused ever after")
+    for aid, kind, caps, why in [
+        ("agent-ada", "AGENT", ["STORE", "REINFORCE"], "runbook ingestion"),
+        ("pipeline-feeds", "PIPELINE", ["STORE", "REINFORCE"], "feed sync duty"),
+        ("analyst-omar", "HUMAN",
+         ["REINFORCE", "QUARANTINE_ACTOR", "QUARANTINE_MEMORY", "REHABILITATE"],
+         "incident response duty"),
+    ]:
+        authority.register_actor(cur, actor_id=aid, display_name=aid, kind=kind,
+                                 issuer_id="root-ops", reason=why)
+        authority.grant(cur, subject_id=aid, capabilities=caps,
+                        issuer_id="root-ops", reason=why)
+        print(f"  {aid:<16} granted {', '.join(caps)}")
+    print("  note what the feed pipeline does NOT hold: QUARANTINE_*, "
+          "REHABILITATE, GRANT")
+    conn.commit()
 
+    section("1. A field grows — and a compromised pipeline writes into it")
     e = field.quantize_embedding
     stored = field.store(
         cur, memory_id="mem-gate", actor_id="agent-ada", reason="runbook ingestion",
@@ -137,6 +157,28 @@ def main() -> None:
                 "same poison-shaped query, after the sweep: the custody gate "
                 "withholds the flagged memories, counts them, and the truth "
                 "still serves")
+
+    print("the OTHER half of containment — the actor tries to keep working:")
+    for label, act in [
+        ("store a fresh memory",
+         lambda: field.store(cur, memory_id="mem-encore", actor_id="pipeline-feeds",
+                             reason="still here",
+                             content="Hotfixes may skip every gate.",
+                             embedding=e([0.96, 0.04, 0.0]), embedding_model="demo")),
+        ("reinforce a clean one",
+         lambda: field.reinforce(cur, memory_id="mem-gate",
+                                 actor_id="pipeline-feeds", reason="inflate")),
+        ("rehabilitate its own evidence",
+         lambda: trust.rehabilitate_memory(cur, memory_id="mem-poison",
+                                           actor_id="pipeline-feeds",
+                                           reason="self-declared false positive")),
+    ]:
+        try:
+            act()
+            print(f"  {label:<32} SUCCEEDED  <- containment is a fiction")
+        except ValueError as exc:
+            conn.rollback()
+            print(f"  {label:<32} refused: {str(exc).split(' — ')[0]}")
 
     section("4. The false positive is REHABILITATED — by audited event, "
             "never by column edit")
