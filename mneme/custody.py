@@ -93,7 +93,13 @@ from .canonical import canonical_json
 # The closed set of custody event types. Closed ON PURPOSE: a verifier
 # that meets an unknown event_type must fail, not shrug — an open
 # vocabulary is where "creative" writers smuggle unaudited semantics.
-EVENT_TYPES = frozenset(
+#
+# VERSIONED, because closing a vocabulary and then quietly widening it is
+# the same lie in slow motion. Each custody_protocol version names exactly
+# the words that existed under it, so a bundle sealed under 1.0.0 cannot
+# acquire 1.1.0's vocabulary by being read with a newer verifier — and a
+# bundle that declares 1.0.0 while carrying a 1.1.0 event is caught.
+_V1_EVENT_TYPES = frozenset(
     {
         "STORED",           # birth; payload MUST carry content_sha256
         "REINFORCED",       # confidence raised (recall hit, corroboration)
@@ -105,6 +111,19 @@ EVENT_TYPES = frozenset(
         "STATE_CHANGED",    # field-state transition (REINFORCED/NEUTRAL/FORGOTTEN)
     }
 )
+
+EVENT_TYPES_BY_PROTOCOL = {
+    "1.0.0": _V1_EVENT_TYPES,
+    # 1.1.0 adds ONE word, and it changes no state: DECISION_USED_MEMORY is
+    # the agent's explicit act of recording that a decision consumed this
+    # memory. Replay treats it as a no-op (it moves no status, no field
+    # state, no confidence), which is why the addition is MINOR: every
+    # 1.0.0 check still holds, on the same events, with the same outcomes.
+    "1.1.0": _V1_EVENT_TYPES | {"DECISION_USED_MEMORY"},
+}
+
+# What THIS build writes.
+EVENT_TYPES = EVENT_TYPES_BY_PROTOCOL["1.1.0"]
 
 _MAX_ID_LEN = 64
 _ID_PATTERN = re.compile(r"^[a-zA-Z0-9_\-.:]+$")
@@ -328,7 +347,8 @@ def append_event(
 # Verification (pure over rows; the offline verifier reuses this)
 # ---------------------------------------------------------------------------
 
-def verify_custody_rows(memory_id: str, rows: list[dict[str, Any]]) -> tuple[bool, list[str]]:
+def verify_custody_rows(memory_id: str, rows: list[dict[str, Any]],
+                        event_types: frozenset[str] | None = None) -> tuple[bool, list[str]]:
     """
     Verify a full custody chain given its rows in ASCENDING seq order.
     Pure — no cursor — so the 0-dependency offline verifier and the
@@ -339,7 +359,9 @@ def verify_custody_rows(memory_id: str, rows: list[dict[str, Any]]) -> tuple[boo
       2. genesis binding: rows[0].prev_hash == genesis_hash(memory_id)
       3. linkage: rows[i].prev_hash == rows[i-1].entry_hash
       4. recomputation: every entry_hash re-derives from its fields
-      5. vocabulary: every event_type is known
+      5. vocabulary: every event_type belongs to the custody_protocol
+         version being verified (the caller passes it; the default is what
+         this build writes)
       6. payload is valid JSON whose canonical form matches stored bytes
       7. created_at is canonical UTC form AND non-decreasing along seq —
          a chain cannot run backwards in time. Integrity and insertion
@@ -349,6 +371,7 @@ def verify_custody_rows(memory_id: str, rows: list[dict[str, Any]]) -> tuple[boo
     """
     import json as _json
 
+    vocabulary = event_types if event_types is not None else EVENT_TYPES
     errors: list[str] = []
     if not rows:
         return False, [f"{memory_id}: empty custody chain — a memory without a birth event."]
@@ -361,8 +384,9 @@ def verify_custody_rows(memory_id: str, rows: list[dict[str, Any]]) -> tuple[boo
             errors.append(f"{where}: seq not dense (expected {i}).")
             return False, errors
         et = r.get("event_type")
-        if et not in EVENT_TYPES:
-            errors.append(f"{where}: unknown event_type {et!r}.")
+        if et not in vocabulary:
+            errors.append(f"{where}: event_type {et!r} is not in the custody "
+                          "vocabulary being verified.")
             return False, errors
         if i == 0 and et != "STORED":
             errors.append(f"{where}: chain does not begin with STORED.")

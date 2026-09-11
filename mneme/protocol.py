@@ -72,9 +72,14 @@ from __future__ import annotations
 # The versions this build implements
 # ---------------------------------------------------------------------------
 
-# 1.0.0 — envelope, genesis binding, dense seq, closed 8-event vocabulary,
-#         canonical payload bytes, canonical-UTC non-decreasing timestamps.
-CUSTODY_PROTOCOL = "1.0.0"
+# 1.1.0 — 1.0.0's envelope, genesis binding, dense seq, canonical payload
+#         bytes and canonical-UTC non-decreasing timestamps, with ONE word
+#         added to the closed vocabulary: DECISION_USED_MEMORY, which
+#         replays to no state change. MINOR because every 1.0.0 check holds
+#         identically; a 1.0.0 bundle is verified against the 8-word
+#         vocabulary it was sealed under, and a bundle declaring 1.0.0 while
+#         carrying a 1.1.0 word is refused.
+CUSTODY_PROTOCOL = "1.1.0"
 
 # 1.0.0 — the B4 state machine exactly as stated in bundle.py's header.
 REPLAY_PROTOCOL = "1.0.0"
@@ -94,9 +99,15 @@ TAINT_PROTOCOL = "1.1.0"
 #         quarantine as a write barrier, the event_type -> capability map.
 AUTHORITY_PROTOCOL = "1.0.0"
 
-# 1.1.0 — 1.0.0's recall-receipt digest body PLUS the decision record that
-#         binds receipt_sha256 + decision_sha256 + policy_version.
-RECEIPT_PROTOCOL = "1.1.0"
+# 2.0.0 — MAJOR, and the honest label. 1.0.0's receipt body recorded what
+#         a recall RETURNED but never what it was ASKED (no top_k, no hops,
+#         no ranking semantics), so it could not be replayed and could not
+#         anchor a counterfactual. Adding those three fields changes the
+#         digest body, so a 1.0.0 receipt does not recompute under the new
+#         rules: a different protocol, not an extension of one. Also adds
+#         the decision record binding receipt + decision hash + policy
+#         version, and its bilateral DECISION_USED_MEMORY evidence.
+RECEIPT_PROTOCOL = "2.0.0"
 
 PROTOCOL_NAMES = (
     "custody_protocol",
@@ -120,18 +131,22 @@ CURRENT_PROTOCOLS: dict[str, str] = {
 # this table only if the code to check it is actually present — the table is
 # a claim about implemented behaviour, not a compatibility wish.
 #
-# taint 1.0.0 and receipt 1.0.0 remain supported because their MINOR
-# successors added rows without changing a single 1.0.0 check. When a MAJOR
+# taint 1.0.0 and custody 1.0.0 remain supported because their MINOR
+# successors added rows and one no-op word without changing a single
+# 1.0.0 check. When a MAJOR
 # bump happens, the old version leaves this table unless its rules are kept
 # alongside the new ones — and if they are kept, they are kept as code, in
 # both verifiers, with tests, or the entry is a lie.
 SUPPORTED_PROTOCOLS: dict[str, frozenset[str]] = {
-    "custody_protocol": frozenset({"1.0.0"}),
+    "custody_protocol": frozenset({"1.0.0", "1.1.0"}),
     "replay_protocol": frozenset({"1.0.0"}),
     "ranking_protocol": frozenset({"1.0.0"}),
     "taint_protocol": frozenset({"1.0.0", "1.1.0"}),
     "authority_protocol": frozenset({"1.0.0"}),
-    "receipt_protocol": frozenset({"1.0.0", "1.1.0"}),
+    # receipt 1.0.0 is NOT here. Its digest body differs, so this build
+    # genuinely cannot check a 1.0.0 receipt — and an entry claiming
+    # otherwise would be the one kind of lie this table exists to prevent.
+    "receipt_protocol": frozenset({"2.0.0"}),
 }
 
 

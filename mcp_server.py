@@ -60,7 +60,7 @@ from mcp.server.fastmcp import FastMCP
 # Ensure the package resolves regardless of the invoking CWD
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from mneme import authority, bundle, custody, field, protocol, trust
+from mneme import authority, bundle, causality, custody, field, protocol, trust
 from mneme.canonical import canonical_json, quantize, CANONICAL_SCALE
 
 log = logging.getLogger("mneme.mcp")
@@ -594,6 +594,7 @@ def mneme_recall(
     query: str,
     top_k: int = 5,
     hops: int = 2,
+    persist_receipt: bool = False,
 ) -> dict:
     """
     Custody-gated, exactly-ranked recall.
@@ -612,6 +613,11 @@ def mneme_recall(
         query: Text to search for (embedded deterministically).
         top_k: Maximum results (1-20).
         hops: BFS expansion depth (0=seed only, 2=default).
+        persist_receipt: Keep the receipt as evidence. Recall stays
+            read-only by default — serving is not a state transition, and
+            forcing a write into the hottest read path would invert that.
+            Set this when the recall is about to inform a decision:
+            mneme_record_decision can only cite a receipt the field kept.
 
     Returns:
         Ranked results with scores, receipt digest, and exclusion counts.
@@ -634,7 +640,11 @@ def mneme_recall(
             top_k=top_k,
             hops=hops,
         )
+        if persist_receipt:
+            field.persist_receipt(cur, receipt)
+            conn.commit()
     except Exception as exc:
+        conn.rollback()
         conn.close()
         return {"error": str(exc)}
     conn.close()
@@ -659,6 +669,10 @@ def mneme_recall(
             "excluded_custody": receipt.excluded_custody,
             "excluded_forgotten": receipt.excluded_forgotten,
             "excluded_inhibited": receipt.excluded_inhibited,
+            "top_k": receipt.top_k,
+            "hops": receipt.hops,
+            "ranking_protocol": receipt.ranking_protocol,
+            "persisted": bool(persist_receipt),
         },
         "embedding_model": "deterministic-sha256-v1",
         "is_semantic": False,
@@ -838,6 +852,130 @@ def mneme_rehabilitate(
 
 
 @mcp.tool()
+def mneme_record_decision(
+    receipt_sha256: str,
+    used_memory_ids: str,
+    decision_text: str,
+    policy_version: str,
+    actor_id: str,
+    reason: str = "decision recorded via MCP",
+) -> dict:
+    """
+    Close the loop from recall to action: commit that THIS decision used
+    THESE memories, from THAT recall, under THIS policy. Requires DECIDE.
+
+    Without this, MNEME can answer "why did the agent remember X" and
+    cannot answer the question an incident actually asks: "which
+    decisions were causally contaminated by X". A receipt is evidence
+    about a read; a decision record is evidence about an act.
+
+    The decision's TEXT never leaves your process in a form MNEME stores:
+    the field commits to sha256(decision_text) so the decision becomes a
+    fixed object that cannot be quietly rewritten later, while its
+    content stays yours.
+
+    The cited receipt must already be persisted (mneme_recall with
+    persist_receipt=true), and used_memory_ids must be a subset of what
+    that recall actually served — a decision cannot claim a memory the
+    recall never handed it.
+
+    Args:
+        receipt_sha256: The persisted recall receipt this decision consumed.
+        used_memory_ids: Comma-separated ids the decision actually used.
+        decision_text: The decision artifact. Hashed, never stored.
+        policy_version: Which rules produced it (e.g. "deploy-policy@3").
+        actor_id: Who decided — must hold DECIDE.
+        reason: Why (mandatory).
+
+    Returns:
+        The decision id and its sealed record digest.
+    """
+    actor_id = _sanitize_id(actor_id, "actor_id")
+    used = [_sanitize_id(m.strip(), "memory_id")
+            for m in used_memory_ids.split(",") if m.strip()]
+    if not used:
+        return {"error": "used_memory_ids must name at least one memory."}
+    if not decision_text.strip():
+        return {"error": "decision_text must be non-empty."}
+    if not reason.strip():
+        return {"error": "reason must be non-empty."}
+    conn = _get_conn()
+    cur = conn.cursor()
+    try:
+        rec = causality.record_decision(
+            cur, receipt=receipt_sha256.strip(), used_memory_ids=used,
+            decision_sha256=causality.decision_hash(_trunc(decision_text)),
+            policy_version=_trunc(policy_version, 128), actor_id=actor_id,
+            reason=_trunc(reason, 512))
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        conn.close()
+        return {"error": str(exc)}
+    conn.close()
+    return {
+        "decision_id": rec.decision_id,
+        "receipt_sha256": rec.receipt_sha256,
+        "decision_sha256": rec.decision_sha256,
+        "policy_version": rec.policy_version,
+        "used_memory_ids": list(rec.used_memory_ids),
+        "record_sha256": rec.record_sha256,
+    }
+
+
+@mcp.tool()
+def mneme_impact(memory_id: str) -> dict:
+    """
+    Blast radius: everything that depended on one memory, reconstructed
+    from evidence and GRADED — because equating contact with
+    contamination is how one quarantine becomes a denial of service on
+    your own field.
+
+    Three levels, and the distinction is the whole point:
+
+      DIRECT    rows, not inference: persisted recalls that served this
+                memory, and decisions that used it.
+      DERIVED   could not be what it is without it: supersession
+                successors, and memories the agent itself declared it
+                wrote because of a contaminated decision.
+      POSSIBLE  contact only: memories co-served in the same recall, and
+                RESONANT neighbours. Reported so an analyst sees the
+                perimeter; never acted on, never a custody status.
+
+    This measures and does not contain. Quarantining what it finds is a
+    separate, authorized, audited act — a function that both measured and
+    contained would make its own measurement impossible to trust.
+
+    Args:
+        memory_id: The memory to trace.
+
+    Returns:
+        The graded causal DAG and its reproducible seal.
+    """
+    memory_id = _sanitize_id(memory_id, "memory_id")
+    conn = _get_conn()
+    cur = conn.cursor()
+    try:
+        r = causality.impact(cur, memory_id)
+    except Exception as exc:
+        conn.close()
+        return {"error": str(exc)}
+    conn.close()
+    return {
+        "memory_id": r.memory_id,
+        "DIRECT": {"receipts": list(r.direct_receipts),
+                   "decisions": list(r.direct_decisions)},
+        "DERIVED": {"memories": list(r.derived_memories),
+                    "decisions": list(r.derived_decisions)},
+        "POSSIBLE": {"memories": list(r.possible_memories),
+                     "note": ("contact, not contamination — reported for "
+                              "analyst review, never auto-flagged")},
+        "edges": [list(e) for e in r.edges],
+        "impact_sha256": r.impact_sha256,
+    }
+
+
+@mcp.tool()
 def mneme_export_bundle(memory_ids: str = "") -> dict:
     """
     Export a sealed evidence bundle as JSON.
@@ -847,7 +985,7 @@ def mneme_export_bundle(memory_ids: str = "") -> dict:
     sweeps, and a Merkle root over all chain heads.
 
     Send the bundle + verify_offline.py to anyone who distrusts the
-    system. They can verify B1-B6 checks with nothing but stdlib Python.
+    system. They can verify B0-B8 checks with nothing but stdlib Python.
 
     Args:
         memory_ids: Comma-separated list of memory IDs to export.
@@ -881,7 +1019,7 @@ def mneme_export_bundle(memory_ids: str = "") -> dict:
 @mcp.tool()
 def mneme_verify_bundle(bundle_json: str) -> dict:
     """
-    Verify a MNEME evidence bundle (B1-B6 checks).
+    Verify a MNEME evidence bundle (B0-B8 checks).
 
     This is the forensic handoff tool: an auditor who distrusts the
     entire deployment can call this with a bundle received from any
@@ -918,7 +1056,7 @@ def mneme_verify_bundle(bundle_json: str) -> dict:
         # was ever authorized to cause.
         "notes": notes,
         "verdict": (
-            "VERIFIED: every check (B0-B7) passed."
+            "VERIFIED: every check (B0-B8) passed."
             if ok else
             f"FAILED: {len(errors)} problem(s) detected."
         ),

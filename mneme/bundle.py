@@ -89,6 +89,28 @@ that makes disagreement loud):
       The declared genesis must equal the earliest instant in the carried
       authority evidence, so an exporter cannot raise it to excuse more
       events than the ledger actually predates.
+  B8  CAUSAL PROVENANCE: recall -> decision, closed and bilateral. A
+      receipt proves what an agent was shown; a decision record proves
+      what it did with it. In order:
+        1. every carried receipt's digest recomputes from its own
+           columns, and its ranking_protocol matches the one the bundle
+           declares — a receipt produced under other ranking semantics is
+           not comparable evidence, it is a category error;
+        2. no decision_id appears in both "decisions" and
+           "excluded_decisions";
+        3. every decision (in either list) re-derives its record seal,
+           cites a receipt carried here, and claims only memories that
+           receipt actually SERVED — a decision naming a memory the
+           recall never handed it is refused;
+        4. an included decision's used memories all travel here, and each
+           one's custody chain carries a DECISION_USED_MEMORY event
+           naming that decision back. Bilateral, like contradiction and
+           lineage: neither side can hide the causal link alone;
+        5. an excluded decision must be genuinely partial — at least one
+           used memory absent — so exclusion cannot dodge check 4;
+        6. every decision_id referenced by a DECISION_USED_MEMORY event
+           appears in one of the two lists, and that event's memory
+           appears in that decision's used list.
 
 Replay state machine (B4), the single normative statement — the
 standalone verifier transcribes it verbatim:
@@ -129,7 +151,7 @@ import json
 from typing import Any
 
 from .canonical import canonical_json
-from . import authority, custody, protocol
+from . import authority, causality, custody, field as _field, protocol
 
 BUNDLE_FORMAT = "MNEME_BUNDLE_V2"
 INITIAL_CONFIDENCE = "0.5000000000"
@@ -289,6 +311,25 @@ def export_bundle(cur, *, memory_ids: list[str] | None = None) -> str:
             "chain": chain,
         })
 
+    # Causal evidence (B8). A decision travels in "decisions" only when the
+    # bundle carries EVERY memory it claims to have used, so its bilateral
+    # custody evidence is checkable; any other decision is DECLARED in
+    # "excluded_decisions" — absence stated, never implied, the same
+    # contract B5 holds sweeps to. Receipts cited by either list always
+    # travel: a decision citing a receipt nobody can read is a causal claim
+    # with no anchor.
+    all_decisions = causality.load_decision_rows(cur)
+    exported_ids = set(memory_ids)
+    decisions, excluded_decisions = [], []
+    for d in all_decisions:
+        used = set(json.loads(d["used_json"])["used"])
+        (decisions if used <= exported_ids else excluded_decisions).append(d)
+    cited = sorted({d["receipt_sha256"] for d in all_decisions})
+    receipts = {r["receipt_sha256"]: r for r in _field.load_receipt_rows(cur, cited)}
+    for r in _field.load_receipt_rows(cur):
+        if set(json.loads(r["served_json"])["served"]) <= exported_ids:
+            receipts[r["receipt_sha256"]] = r
+
     body = {
         "format": BUNDLE_FORMAT,
         "protocols": dict(protocol.CURRENT_PROTOCOLS),
@@ -296,6 +337,9 @@ def export_bundle(cur, *, memory_ids: list[str] | None = None) -> str:
         "memories": memories,
         "sweeps": sweeps,
         "excluded_sweeps": excluded_sweeps,
+        "receipts": [receipts[k] for k in sorted(receipts)],
+        "decisions": decisions,
+        "excluded_decisions": excluded_decisions,
         "authority": authority_rows,
         "authority_genesis_at": authority.genesis_at(cur),
         "authority_merkle_root": heads_merkle_root(auth_heads),
@@ -536,6 +580,130 @@ def verify_authority(
     return errors, notes
 
 
+def verify_causality(
+    body: dict[str, Any],
+    memory_chains: list[tuple[str, list[dict[str, Any]]]],
+) -> tuple[list[str], list[str]]:
+    """
+    B8 — causal provenance. Returns (errors, notes). Pure over the bundle
+    body and the chains that already passed B2. The standalone verifier
+    transcribes this function.
+    """
+    errors: list[str] = []
+    notes: list[str] = []
+
+    receipts_by_sha: dict[str, dict[str, Any]] = {}
+    declared_ranking = body.get("protocols", {}).get("ranking_protocol")
+    for row in body.get("receipts", []):
+        try:
+            sha = row["receipt_sha256"]
+            served = json.loads(row["served_json"])["served"]
+        except Exception:
+            errors.append("B8: a carried receipt is malformed.")
+            continue
+        if _field.receipt_digest_from_row(row, served) != sha:
+            errors.append(f"B8: receipt {sha[:16]}…: does not recompute from "
+                          "its own columns — receipt evidence edited.")
+            continue
+        if row.get("ranking_protocol") != declared_ranking:
+            errors.append(
+                f"B8: receipt {sha[:16]}…: was produced under ranking_protocol "
+                f"{row.get('ranking_protocol')!r} but this bundle declares "
+                f"{declared_ranking!r}. Two recalls are only comparable under "
+                "one ranking semantics.")
+            continue
+        receipts_by_sha[sha] = {"served": served}
+
+    carried_memories = {mid for mid, _ in memory_chains}
+    used_events: dict[str, set[str]] = {}     # decision_id -> memories claiming it
+    for mid, chain in memory_chains:
+        for r in chain:
+            if r["event_type"] != "DECISION_USED_MEMORY":
+                continue
+            did = json.loads(r["payload_json"]).get("decision_id")
+            if isinstance(did, str):
+                used_events.setdefault(did, set()).add(mid)
+
+    included = body.get("decisions", [])
+    excluded = body.get("excluded_decisions", [])   # absent key reads as none
+    included_ids = {d.get("decision_id") for d in included}
+    excluded_ids = {d.get("decision_id") for d in excluded}
+    for did in sorted(included_ids & excluded_ids):
+        errors.append(f"B8: decision {did}: declared both included and "
+                      "excluded — ambiguity refused.")
+
+    for d, is_included in [(d, True) for d in included] + [(d, False) for d in excluded]:
+        did = d.get("decision_id")
+        try:
+            used = json.loads(d["used_json"])["used"]
+        except Exception:
+            errors.append(f"B8: decision {did}: used_json is not valid JSON.")
+            continue
+        body_d = causality.decision_body(
+            decision_id=did, receipt_sha256=d["receipt_sha256"],
+            decision_sha256=d["decision_sha256"],
+            policy_version=d["policy_version"], actor_id=d["actor_id"],
+            reason=d["reason"], used_memory_ids=used,
+            created_at=d["created_at"])
+        if hashlib.sha256(
+                canonical_json(body_d).encode("utf-8")).hexdigest() != d.get("record_sha256"):
+            errors.append(f"B8: decision {did}: record seal does not recompute "
+                          "— decision evidence edited.")
+            continue
+        rec = receipts_by_sha.get(d["receipt_sha256"])
+        if rec is None:
+            errors.append(f"B8: decision {did}: cites receipt "
+                          f"{d['receipt_sha256'][:16]}…, which this bundle does "
+                          "not carry — a causal claim with no anchor.")
+            continue
+        not_served = sorted(set(used) - set(rec["served"]))
+        if not_served:
+            errors.append(f"B8: decision {did}: claims memories {not_served} "
+                          "its cited recall never served.")
+        if is_included:
+            absent = sorted(set(used) - carried_memories)
+            if absent:
+                errors.append(f"B8: decision {did}: declared fully evidenced "
+                              f"but {absent} do not travel in this bundle.")
+            for mid in sorted(set(used) & carried_memories):
+                if mid not in used_events.get(did, set()):
+                    errors.append(
+                        f"B8: decision {did}: names {mid}, but {mid}'s custody "
+                        "chain has no DECISION_USED_MEMORY naming it back — a "
+                        "causal claim only one side makes.")
+        else:
+            if set(used) <= carried_memories:
+                errors.append(f"B8: decision {did}: declared excluded but the "
+                              "bundle carries every memory it used — complete "
+                              "evidence must be included and checked, not "
+                              "excluded.")
+
+    by_id = {d.get("decision_id"): d for d in list(included) + list(excluded)}
+    for did in sorted(used_events):
+        if did not in included_ids and did not in excluded_ids:
+            errors.append(f"B8: decision {did}: DECISION_USED_MEMORY events "
+                          "reference it but the bundle neither carries it nor "
+                          "declares it excluded.")
+            continue
+        try:
+            claimed = set(json.loads(by_id[did]["used_json"])["used"])
+        except Exception:
+            continue
+        strays = sorted(used_events[did] - claimed)
+        if strays:
+            errors.append(f"B8: decision {did}: {strays} carry a "
+                          "DECISION_USED_MEMORY naming it, but the decision "
+                          "does not claim them — a causal link asserted from "
+                          "one side only.")
+
+    for d in excluded:
+        notes.append(f"decision {d.get('decision_id')} declared excluded — it "
+                     "used memories outside this bundle, so its causal "
+                     "evidence was NOT checked in full here.")
+    return errors, notes
+
+
+
 def verify_bundle(bundle_json: str) -> tuple[bool, list[str]]:
     """
     Full B1–B7 verification of an exported bundle string.
@@ -577,6 +745,7 @@ def verify_bundle_verbose(bundle_json: str) -> tuple[bool, list[str], list[str]]
         return False, [f"B0: {e}" for e in perrors], notes
     notes.append("semantics: " + ", ".join(
         f"{k} {body['protocols'][k]}" for k in protocol.PROTOCOL_NAMES))
+    vocabulary = custody.EVENT_TYPES_BY_PROTOCOL[body["protocols"]["custody_protocol"]]
 
     heads: dict[str, str] = {}
     tf_by_sweep: dict[str, list[str]] = {}
@@ -588,8 +757,12 @@ def verify_bundle_verbose(bundle_json: str) -> tuple[bool, list[str], list[str]]
         mid = mem["memory_id"]
         chain = mem["custody"]
 
-        # B2 — chain integrity (shared pure implementation)
-        ok, errs = custody.verify_custody_rows(mid, chain)
+        # B2 — chain integrity, against the vocabulary of the custody
+        # protocol THIS BUNDLE DECLARES. A bundle sealed under 1.0.0 is
+        # checked against 1.0.0's eight words, so a 1.1.0 event smuggled
+        # into it fails rather than being silently accepted by a newer
+        # verifier that happens to know the word.
+        ok, errs = custody.verify_custody_rows(mid, chain, vocabulary)
         if not ok:
             errors.extend(f"B2: {e}" for e in errs)
             continue
@@ -682,5 +855,10 @@ def verify_bundle_verbose(bundle_json: str) -> tuple[bool, list[str], list[str]]
     aerrors, anotes = verify_authority(body, verified_chains)
     errors.extend(aerrors)
     notes.extend(anotes)
+
+    # B8 — causal provenance
+    cerrors, cnotes = verify_causality(body, verified_chains)
+    errors.extend(cerrors)
+    notes.extend(cnotes)
 
     return (not errors), errors, notes

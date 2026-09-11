@@ -48,13 +48,13 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from fractions import Fraction
 from typing import Any, Iterable
 
 from .canonical import CANONICAL_SCALE, canonical_json, quantize
-from . import authority, custody
+from . import authority, custody, protocol
 
 # ---------------------------------------------------------------------------
 # Exact constants (raven's, made rational)
@@ -156,6 +156,7 @@ def store(
     topic: str | None = None,
     claim: str | None = None,
     supersedes: str | None = None,
+    derived_from_decision: str | None = None,
     created_at: str | None = None,
     grant_id: str | None = None,
 ) -> StoredMemory:
@@ -207,6 +208,12 @@ def store(
         payload["claim"] = claim
     if supersedes is not None:
         payload["supersedes"] = supersedes
+    if derived_from_decision is not None:
+        # The agent's declared causal parent: "I stored this BECAUSE of
+        # that decision". Blast-radius reconstruction follows this edge
+        # instead of guessing one, which is the difference between a
+        # DERIVED level that means something and a heuristic.
+        payload["derived_from_decision"] = derived_from_decision
     if birth_grant is not None:
         payload["grant_id"] = birth_grant
     custody.append_event(
@@ -453,6 +460,17 @@ class RecallReceipt:
     object a CRONOS-style tracer records: served ids in order, plus the
     counts of everything withheld and why. 'Why does the agent remember
     this' starts with 'here is the receipt of the recall that served it.'
+
+    receipt_protocol 2.0.0 — a MAJOR bump, and worth stating why, since
+    MINOR would have been the comfortable choice. The 1.0.0 body recorded
+    what a recall RETURNED but not what it was ASKED: no top_k, no hops,
+    no ranking semantics. A receipt that cannot say which question it
+    answered cannot be replayed, and a receipt that cannot be replayed
+    cannot anchor a counterfactual ("would this decision have differed
+    without the poisoned memory?"). Adding those three fields changes the
+    digest body, so a 1.0.0 receipt does not recompute under 1.0.0 rules
+    — that is a different protocol, not an extension of one, and calling
+    it MINOR would have been the first lie this file tells.
     """
     query_sha256: str
     seed_memory_id: str | None
@@ -460,25 +478,44 @@ class RecallReceipt:
     excluded_custody: int      # TAINT_FLAGGED / QUARANTINED / SUPERSEDED
     excluded_forgotten: int
     excluded_inhibited: int
+    top_k: int
+    hops: int
+    ranking_protocol: str
     receipt_sha256: str
 
 
-def _receipt(query_sha: str, seed: str | None, served: list[str],
-             exc_c: int, exc_f: int, exc_i: int) -> RecallReceipt:
-    body = {
-        "query_sha256": query_sha,
-        "seed_memory_id": seed,
-        "served": served,
-        "excluded_custody": exc_c,
-        "excluded_forgotten": exc_f,
-        "excluded_inhibited": exc_i,
+def receipt_body(r: RecallReceipt) -> dict[str, Any]:
+    """
+    The exact bytes a receipt's digest covers. One function, used when
+    sealing, when persisting, and when verifying, so the three cannot
+    drift — the same discipline compute_entry_hash holds custody to.
+    """
+    return {
+        "query_sha256": r.query_sha256,
+        "seed_memory_id": r.seed_memory_id,
+        "served": list(r.served),
+        "excluded_custody": r.excluded_custody,
+        "excluded_forgotten": r.excluded_forgotten,
+        "excluded_inhibited": r.excluded_inhibited,
+        "top_k": r.top_k,
+        "hops": r.hops,
+        "ranking_protocol": r.ranking_protocol,
     }
+
+
+def _receipt(query_sha: str, seed: str | None, served: list[str],
+             exc_c: int, exc_f: int, exc_i: int,
+             top_k: int, hops: int) -> RecallReceipt:
     import hashlib
-    digest = hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
-    return RecallReceipt(query_sha256=query_sha, seed_memory_id=seed,
-                         served=tuple(served), excluded_custody=exc_c,
-                         excluded_forgotten=exc_f, excluded_inhibited=exc_i,
-                         receipt_sha256=digest)
+    r = RecallReceipt(query_sha256=query_sha, seed_memory_id=seed,
+                      served=tuple(served), excluded_custody=exc_c,
+                      excluded_forgotten=exc_f, excluded_inhibited=exc_i,
+                      top_k=top_k, hops=hops,
+                      ranking_protocol=protocol.RANKING_PROTOCOL,
+                      receipt_sha256="")
+    digest = hashlib.sha256(
+        canonical_json(receipt_body(r)).encode("utf-8")).hexdigest()
+    return replace(r, receipt_sha256=digest)
 
 
 def persist_receipt(cur, receipt: RecallReceipt, *,
@@ -495,16 +532,9 @@ def persist_receipt(cur, receipt: RecallReceipt, *,
     Persisting the same receipt twice is a no-op (same evidence, same
     digest, one row).
     """
-    body = {
-        "query_sha256": receipt.query_sha256,
-        "seed_memory_id": receipt.seed_memory_id,
-        "served": list(receipt.served),
-        "excluded_custody": receipt.excluded_custody,
-        "excluded_forgotten": receipt.excluded_forgotten,
-        "excluded_inhibited": receipt.excluded_inhibited,
-    }
     import hashlib
-    digest = hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(
+        canonical_json(receipt_body(receipt)).encode("utf-8")).hexdigest()
     if digest != receipt.receipt_sha256:
         raise ValueError(
             "Receipt digest does not recompute from its fields — refusing "
@@ -518,11 +548,13 @@ def persist_receipt(cur, receipt: RecallReceipt, *,
     cur.execute(
         "INSERT INTO recall_receipts (receipt_sha256, query_sha256, "
         "seed_memory_id, served_json, excluded_custody, excluded_forgotten, "
-        "excluded_inhibited, persisted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "excluded_inhibited, top_k, hops, ranking_protocol, persisted_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (digest, receipt.query_sha256, receipt.seed_memory_id,
          canonical_json({"served": list(receipt.served)}),
          receipt.excluded_custody, receipt.excluded_forgotten,
-         receipt.excluded_inhibited, ts),
+         receipt.excluded_inhibited, receipt.top_k, receipt.hops,
+         receipt.ranking_protocol, ts),
     )
 
 
@@ -534,31 +566,58 @@ def verify_receipts(cur) -> tuple[bool, list[str]]:
     B4, applied to recall evidence.
     """
     errors: list[str] = []
-    cur.execute(
-        "SELECT receipt_sha256, query_sha256, seed_memory_id, served_json, "
-        "excluded_custody, excluded_forgotten, excluded_inhibited "
-        "FROM recall_receipts ORDER BY receipt_sha256 ASC")
-    for row in cur.fetchall():
-        digest, qsha, seed, served_json, exc_c, exc_f, exc_i = row
+    for row in load_receipt_rows(cur):
+        digest = row["receipt_sha256"]
         try:
-            served = json.loads(served_json)["served"]
+            served = json.loads(row["served_json"])["served"]
         except Exception:
             errors.append(f"receipt {digest}: served_json is not valid JSON.")
             continue
-        body = {
-            "query_sha256": qsha,
-            "seed_memory_id": seed,
-            "served": served,
-            "excluded_custody": int(exc_c),
-            "excluded_forgotten": int(exc_f),
-            "excluded_inhibited": int(exc_i),
-        }
-        import hashlib
-        if hashlib.sha256(
-                canonical_json(body).encode("utf-8")).hexdigest() != digest:
+        if receipt_digest_from_row(row, served) != digest:
             errors.append(f"receipt {digest}: does not recompute from its "
                           "columns — receipt evidence edited.")
     return (not errors), errors
+
+
+RECEIPT_COLS = ["receipt_sha256", "query_sha256", "seed_memory_id",
+                "served_json", "excluded_custody", "excluded_forgotten",
+                "excluded_inhibited", "top_k", "hops", "ranking_protocol",
+                "persisted_at"]
+
+
+def load_receipt_rows(cur, receipt_sha256s: list[str] | None = None) -> list[dict[str, Any]]:
+    sql = ("SELECT " + ", ".join(RECEIPT_COLS) + " FROM recall_receipts ")
+    params: tuple = ()
+    if receipt_sha256s is not None:
+        if not receipt_sha256s:
+            return []
+        sql += "WHERE receipt_sha256 IN (%s) " % ",".join(
+            "?" for _ in receipt_sha256s)
+        params = tuple(receipt_sha256s)
+    sql += "ORDER BY receipt_sha256 ASC"
+    cur.execute(sql, params)
+    return [dict(zip(RECEIPT_COLS, r)) for r in cur.fetchall()]
+
+
+def receipt_digest_from_row(row: dict[str, Any], served: list[str]) -> str:
+    """
+    Re-derive a persisted receipt's digest from its own columns. Shared by
+    verify_receipts() and by bundle check B8, and transcribed by the
+    offline verifier — one statement of what a receipt digest covers.
+    """
+    import hashlib
+    body = {
+        "query_sha256": row["query_sha256"],
+        "seed_memory_id": row["seed_memory_id"],
+        "served": served,
+        "excluded_custody": int(row["excluded_custody"]),
+        "excluded_forgotten": int(row["excluded_forgotten"]),
+        "excluded_inhibited": int(row["excluded_inhibited"]),
+        "top_k": int(row["top_k"]),
+        "hops": int(row["hops"]),
+        "ranking_protocol": row["ranking_protocol"],
+    }
+    return hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
 
 
 def recall(
@@ -626,7 +685,7 @@ def recall(
 
     if not candidates:
         return [], _receipt(query_sha, None, [], excluded_custody,
-                            excluded_forgotten, 0)
+                            excluded_forgotten, 0, top_k, hops)
 
     # --- Seed: exact argmax of dot/sqrt(nv) — sign-aware squared compare.
     def sim_key(c):
@@ -715,5 +774,6 @@ def recall(
                               inhibition_rescued=rescued))
 
     receipt = _receipt(query_sha, seed_id, [h.memory_id for h in hits],
-                       excluded_custody, excluded_forgotten, excluded_inhibited)
+                       excluded_custody, excluded_forgotten, excluded_inhibited,
+                       top_k, hops)
     return hits, receipt

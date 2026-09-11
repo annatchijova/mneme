@@ -52,6 +52,15 @@ Checks (normative statement in mneme/bundle.py's header):
       genesis — and every event in a field with no ledger at all — are
       UNAUTHORIZED BY DECLARATION: named on success, never passed as
       authorized.
+  B8  causal provenance: carried receipts recompute from their own
+      columns under the bundle's declared ranking semantics; every
+      decision re-derives its seal, cites a receipt carried here, and
+      claims only memories that receipt actually served; an included
+      decision's used memories all travel and each names the decision
+      back in a DECISION_USED_MEMORY event (bilateral, like lineage); an
+      excluded decision must be genuinely partial; and no
+      DECISION_USED_MEMORY event references a decision the bundle
+      neither carries nor declares excluded.
 
   B0 comes last in this list and first in the code: a V2 bundle declares
       the VERSION of every semantics its checks depend on, and a
@@ -69,10 +78,17 @@ import sys
 FORMAT = "MNEME_BUNDLE_V2"
 GENESIS_PREFIX = b"MNEME_CUSTODY_GENESIS:"
 AUTHORITY_GENESIS_PREFIX = b"MNEME_AUTHORITY_GENESIS:"
-EVENT_TYPES = frozenset({
+_V1_EVENT_TYPES = frozenset({
     "STORED", "REINFORCED", "CONTRADICTED_BY", "SUPERSEDED_BY",
     "QUARANTINED", "TAINT_FLAGGED", "REHABILITATED", "STATE_CHANGED",
 })
+# Versioned vocabulary: a bundle is checked against the words that existed
+# under the custody_protocol IT DECLARES, so a newer verifier cannot
+# silently accept a newer word inside an older bundle.
+EVENT_TYPES_BY_PROTOCOL = {
+    "1.0.0": _V1_EVENT_TYPES,
+    "1.1.0": _V1_EVENT_TYPES | {"DECISION_USED_MEMORY"},
+}
 AUTHORITY_EVENT_TYPES = frozenset({
     "ACTOR_REGISTERED", "GRANTED", "REVOKED",
     "ACTOR_QUARANTINED", "ACTOR_REINSTATED",
@@ -91,6 +107,7 @@ REQUIRED_CAPABILITY = {
     "TAINT_FLAGGED": "QUARANTINE_ACTOR",
     "REHABILITATED": "REHABILITATE",
     "STATE_CHANGED": "REINFORCE",
+    "DECISION_USED_MEMORY": "DECIDE",
 }
 # Authority event type -> capability its ISSUER had to hold.
 AUTHORITY_EVENT_CAPABILITY = {
@@ -104,12 +121,14 @@ PROTOCOL_NAMES = ("custody_protocol", "replay_protocol", "ranking_protocol",
                   "taint_protocol", "authority_protocol", "receipt_protocol")
 # Every version this verifier actually implements (mneme/protocol.py).
 SUPPORTED_PROTOCOLS = {
-    "custody_protocol": frozenset({"1.0.0"}),
+    "custody_protocol": frozenset({"1.0.0", "1.1.0"}),
     "replay_protocol": frozenset({"1.0.0"}),
     "ranking_protocol": frozenset({"1.0.0"}),
     "taint_protocol": frozenset({"1.0.0", "1.1.0"}),
     "authority_protocol": frozenset({"1.0.0"}),
-    "receipt_protocol": frozenset({"1.0.0", "1.1.0"}),
+    # receipt 1.0.0 is absent on purpose: its digest body differs, so this
+    # verifier genuinely cannot check one.
+    "receipt_protocol": frozenset({"2.0.0"}),
 }
 GRANT_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_\-.:]{1,64}$")
 INITIAL_CONFIDENCE = "0.5000000000"
@@ -172,7 +191,8 @@ def check_protocols(declared) -> list[str]:
 
 # --- B2: custody chain ------------------------------------------------------
 
-def verify_chain(memory_id: str, chain: list[dict], errors: list[str]) -> bool:
+def verify_chain(memory_id: str, chain: list[dict], errors: list[str],
+                 vocabulary: frozenset) -> bool:
     if not chain:
         errors.append(f"B2: {memory_id}: empty custody chain — a memory without a birth event.")
         return False
@@ -183,8 +203,9 @@ def verify_chain(memory_id: str, chain: list[dict], errors: list[str]) -> bool:
         if r.get("seq") != i:
             errors.append(f"{where}: seq not dense (expected {i})."); return False
         et = r.get("event_type")
-        if et not in EVENT_TYPES:
-            errors.append(f"{where}: unknown event_type {et!r}."); return False
+        if et not in vocabulary:
+            errors.append(f"{where}: event_type {et!r} is not in the custody "
+                          "vocabulary being verified."); return False
         if i == 0 and et != "STORED":
             errors.append(f"{where}: chain does not begin with STORED."); return False
         if i > 0 and et == "STORED":
@@ -560,6 +581,146 @@ def verify_authority(body: dict, memory_chains: list) -> tuple[list, list]:
     return errors, notes
 
 
+# --- B8: causal provenance (transcribed from mneme/bundle.py) --------------
+
+def receipt_digest_from_row(row: dict, served: list) -> str:
+    """The exact body a persisted receipt's digest covers (field.py)."""
+    body = {
+        "query_sha256": row["query_sha256"],
+        "seed_memory_id": row["seed_memory_id"],
+        "served": served,
+        "excluded_custody": int(row["excluded_custody"]),
+        "excluded_forgotten": int(row["excluded_forgotten"]),
+        "excluded_inhibited": int(row["excluded_inhibited"]),
+        "top_k": int(row["top_k"]),
+        "hops": int(row["hops"]),
+        "ranking_protocol": row["ranking_protocol"],
+    }
+    return sha256_hex(canonical_json(body).encode("utf-8"))
+
+
+def decision_body(d: dict, used: list) -> dict:
+    """The exact body a decision record's seal covers (causality.py).
+    used_memory_ids is sorted: citation order carries no fact the receipt
+    does not already hold, so leaving it free would admit two
+    representations of one claim."""
+    return {
+        "decision_id": d["decision_id"],
+        "receipt_sha256": d["receipt_sha256"],
+        "decision_sha256": d["decision_sha256"],
+        "policy_version": d["policy_version"],
+        "actor_id": d["actor_id"],
+        "reason": d["reason"],
+        "used_memory_ids": sorted(used),
+        "created_at": d["created_at"],
+    }
+
+
+def verify_causality(body: dict, memory_chains: list) -> tuple[list, list]:
+    errors: list = []
+    notes: list = []
+
+    receipts_by_sha: dict = {}
+    declared_ranking = body.get("protocols", {}).get("ranking_protocol")
+    for row in body.get("receipts", []):
+        try:
+            sha = row["receipt_sha256"]
+            served = json.loads(row["served_json"])["served"]
+        except Exception:
+            errors.append("B8: a carried receipt is malformed.")
+            continue
+        if receipt_digest_from_row(row, served) != sha:
+            errors.append(f"B8: receipt {sha[:16]}…: does not recompute from "
+                          "its own columns — receipt evidence edited.")
+            continue
+        if row.get("ranking_protocol") != declared_ranking:
+            errors.append(f"B8: receipt {sha[:16]}…: was produced under "
+                          f"ranking_protocol {row.get('ranking_protocol')!r} but "
+                          f"this bundle declares {declared_ranking!r}.")
+            continue
+        receipts_by_sha[sha] = served
+
+    carried_memories = {mid for mid, _ in memory_chains}
+    used_events: dict = {}
+    for mid, chain in memory_chains:
+        for r in chain:
+            if r["event_type"] != "DECISION_USED_MEMORY":
+                continue
+            did = json.loads(r["payload_json"]).get("decision_id")
+            if isinstance(did, str):
+                used_events.setdefault(did, set()).add(mid)
+
+    included = body.get("decisions", [])
+    excluded = body.get("excluded_decisions", [])
+    included_ids = {d.get("decision_id") for d in included}
+    excluded_ids = {d.get("decision_id") for d in excluded}
+    for did in sorted(included_ids & excluded_ids):
+        errors.append(f"B8: decision {did}: declared both included and "
+                      "excluded — ambiguity refused.")
+
+    for d, is_included in ([(d, True) for d in included]
+                           + [(d, False) for d in excluded]):
+        did = d.get("decision_id")
+        try:
+            used = json.loads(d["used_json"])["used"]
+        except Exception:
+            errors.append(f"B8: decision {did}: used_json is not valid JSON.")
+            continue
+        if sha256_hex(canonical_json(decision_body(d, used)).encode("utf-8")) \
+                != d.get("record_sha256"):
+            errors.append(f"B8: decision {did}: record seal does not recompute "
+                          "— decision evidence edited.")
+            continue
+        served = receipts_by_sha.get(d["receipt_sha256"])
+        if served is None:
+            errors.append(f"B8: decision {did}: cites receipt "
+                          f"{d['receipt_sha256'][:16]}…, which this bundle does "
+                          "not carry — a causal claim with no anchor.")
+            continue
+        not_served = sorted(set(used) - set(served))
+        if not_served:
+            errors.append(f"B8: decision {did}: claims memories {not_served} "
+                          "its cited recall never served.")
+        if is_included:
+            absent = sorted(set(used) - carried_memories)
+            if absent:
+                errors.append(f"B8: decision {did}: declared fully evidenced "
+                              f"but {absent} do not travel in this bundle.")
+            for mid in sorted(set(used) & carried_memories):
+                if mid not in used_events.get(did, set()):
+                    errors.append(f"B8: decision {did}: names {mid}, but {mid}'s "
+                                  "custody chain has no DECISION_USED_MEMORY "
+                                  "naming it back.")
+        elif set(used) <= carried_memories:
+            errors.append(f"B8: decision {did}: declared excluded but the bundle "
+                          "carries every memory it used — complete evidence must "
+                          "be included and checked, not excluded.")
+
+    by_id = {d.get("decision_id"): d for d in list(included) + list(excluded)}
+    for did in sorted(used_events):
+        if did not in included_ids and did not in excluded_ids:
+            errors.append(f"B8: decision {did}: DECISION_USED_MEMORY events "
+                          "reference it but the bundle neither carries it nor "
+                          "declares it excluded.")
+            continue
+        try:
+            claimed = set(json.loads(by_id[did]["used_json"])["used"])
+        except Exception:
+            continue
+        strays = sorted(used_events[did] - claimed)
+        if strays:
+            errors.append(f"B8: decision {did}: {strays} carry a "
+                          "DECISION_USED_MEMORY naming it, but the decision does "
+                          "not claim them — a causal link asserted from one side "
+                          "only.")
+
+    for d in excluded:
+        notes.append(f"decision {d.get('decision_id')} declared excluded — it "
+                     "used memories outside this bundle, so its causal evidence "
+                     "was NOT checked in full here.")
+    return errors, notes
+
+
 # --- B6: Merkle over heads ---------------------------------------------------
 
 def heads_merkle_root(heads: dict[str, str]) -> str:
@@ -606,6 +767,7 @@ def verify(bundle_json: str) -> tuple[bool, list[str], list[str]]:
         return False, [f"B0: {e}" for e in perrors], notes
     notes.append("semantics: " + ", ".join(
         f"{k} {body['protocols'][k]}" for k in PROTOCOL_NAMES))
+    vocabulary = EVENT_TYPES_BY_PROTOCOL[body["protocols"]["custody_protocol"]]
 
     heads: dict[str, str] = {}
     tf_by_sweep: dict[str, list[str]] = {}
@@ -616,7 +778,7 @@ def verify(bundle_json: str) -> tuple[bool, list[str], list[str]]:
     for mem in body.get("memories", []):
         mid = mem["memory_id"]
         chain = mem["custody"]
-        if not verify_chain(mid, chain, errors):
+        if not verify_chain(mid, chain, errors, vocabulary):
             continue
         heads[mid] = chain[-1]["entry_hash"]
         verified_chains.append((mid, chain))
@@ -700,6 +862,10 @@ def verify(bundle_json: str) -> tuple[bool, list[str], list[str]]:
     errors.extend(aerrors)
     notes.extend(anotes)
 
+    cerrors, cnotes = verify_causality(body, verified_chains)
+    errors.extend(cerrors)
+    notes.extend(cnotes)
+
     return (not errors), errors, notes
 
 
@@ -711,7 +877,7 @@ def main() -> int:
         raw = f.read()
     ok, errors, notes = verify(raw)
     if ok:
-        print("VERIFIED: every check (B0-B7) passed.")
+        print("VERIFIED: every check (B0-B8) passed.")
         # A declared exclusion is a claim the auditor must SEE, not
         # something a passing verdict may bury. So is a field whose events
         # nobody was ever authorized to cause.

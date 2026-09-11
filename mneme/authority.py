@@ -154,6 +154,11 @@ AUTHORITY_EVENT_TYPES = frozenset(
 # the stylometry pipeline named in KNOWN_LIMITATIONS is the obvious
 # candidate — arrives with its own capability and its own version bump, not
 # by widening this row.
+#
+# DECISION_USED_MEMORY maps to DECIDE and to nothing else. Recording that a
+# decision consumed a memory changes no memory state, but it is a claim
+# about causation that an incident will later be reconstructed from, so an
+# actor that may merely read must not be able to write one.
 REQUIRED_CAPABILITY: dict[str, str] = {
     "STORED": "STORE",
     "REINFORCED": "REINFORCE",
@@ -163,6 +168,7 @@ REQUIRED_CAPABILITY: dict[str, str] = {
     "TAINT_FLAGGED": "QUARANTINE_ACTOR",
     "REHABILITATED": "REHABILITATE",
     "STATE_CHANGED": "REINFORCE",
+    "DECISION_USED_MEMORY": "DECIDE",
 }
 
 # Which capability each AUTHORITY event type requires of its ISSUER. The

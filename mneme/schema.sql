@@ -84,7 +84,13 @@ CREATE TABLE IF NOT EXISTS custody_chain (
     seq           INTEGER NOT NULL CHECK (seq >= 0),
     event_type    TEXT NOT NULL CHECK (event_type IN (
                       'STORED','REINFORCED','CONTRADICTED_BY','SUPERSEDED_BY',
-                      'QUARANTINED','TAINT_FLAGGED','REHABILITATED','STATE_CHANGED')),
+                      'QUARANTINED','TAINT_FLAGGED','REHABILITATED','STATE_CHANGED',
+                      -- custody_protocol 1.1.0: the agent's explicit act of
+                      -- recording that a decision consumed this memory. It
+                      -- changes no state (replay treats it as a no-op); it
+                      -- closes recall -> action so blast radius is evidence,
+                      -- not inference.
+                      'DECISION_USED_MEMORY')),
     actor_id      TEXT NOT NULL REFERENCES actors(actor_id),
     reason        TEXT NOT NULL CHECK (length(trim(reason)) > 0),
     created_at    TEXT NOT NULL,
@@ -185,5 +191,43 @@ CREATE TABLE IF NOT EXISTS recall_receipts (
     excluded_custody   INTEGER NOT NULL CHECK (excluded_custody >= 0),
     excluded_forgotten INTEGER NOT NULL CHECK (excluded_forgotten >= 0),
     excluded_inhibited INTEGER NOT NULL CHECK (excluded_inhibited >= 0),
+    -- receipt_protocol 2.0.0: the question, not only the answer. Without
+    -- top_k / hops / ranking_protocol a receipt cannot be replayed, and a
+    -- receipt that cannot be replayed cannot anchor a counterfactual.
+    top_k              INTEGER NOT NULL CHECK (top_k > 0),
+    hops               INTEGER NOT NULL CHECK (hops >= 0),
+    ranking_protocol   TEXT NOT NULL,
     persisted_at       TEXT NOT NULL
 );
+
+-- -----------------------------------------------------------------------------
+-- decisions — the causal closure: recall -> action (mneme/causality.py).
+--
+-- A recall receipt proves what the agent was SHOWN. It does not prove what
+-- the agent DID with it, so "why did it remember X" was answerable while
+-- "which decisions were contaminated by X" was not. A decision record is
+-- the agent's own explicit, authorized act of committing that link:
+-- receipt_sha256 (what it was shown) + decision_sha256 (what it produced,
+-- by hash — MNEME never sees the artifact and does not pretend to) +
+-- policy_version (under which rules) + the subset of the served set it
+-- actually used.
+--
+-- used_json is a canonical, sorted claim that must be a SUBSET of the
+-- cited receipt's served list: a decision cannot claim to have used a
+-- memory the recall never served it. Bilateral, like contradiction and
+-- lineage: each used memory's custody chain carries a matching
+-- DECISION_USED_MEMORY event, so neither side can hide the link alone.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS decisions (
+    decision_id     TEXT PRIMARY KEY,
+    receipt_sha256  TEXT NOT NULL REFERENCES recall_receipts(receipt_sha256),
+    decision_sha256 TEXT NOT NULL CHECK (length(decision_sha256) = 64),
+    policy_version  TEXT NOT NULL CHECK (length(trim(policy_version)) > 0),
+    actor_id        TEXT NOT NULL REFERENCES actors(actor_id),
+    reason          TEXT NOT NULL CHECK (length(trim(reason)) > 0),
+    used_json       TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    record_sha256   TEXT NOT NULL UNIQUE CHECK (length(record_sha256) = 64)
+);
+
+CREATE INDEX IF NOT EXISTS idx_decisions_receipt ON decisions (receipt_sha256);
