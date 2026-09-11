@@ -64,6 +64,19 @@ service. Three levels, and the distinction between them is the point:
              agent declares that link when it stores; MNEME does not
              guess it.
 
+             AND THE DECLARATION IS GRADED, because it is SELF-ASSERTED.
+             Descent is the one relation MNEME does not make bilateral —
+             the decision it descends from was written before the memory
+             existed and cannot name it back — so an audit found that a
+             `DECIDE` holder can make its own memory look like a victim
+             of an honest one. The report therefore splits the level:
+             `derived_memories` are those whose declaring actor IS the
+             cited decision's actor (one actor's coherent account of its
+             own work), and `derived_unattested` are those where a third
+             party claims descent from someone ELSE's decision. The
+             second is strictly weaker and says so rather than sitting
+             silently in the strong bucket.
+
   POSSIBLE   Contact, not contamination. Memories co-served in the same
              recall as this one, and its RESONANT neighbours. These
              ranked alongside it or could have been amplified by it. The
@@ -338,6 +351,7 @@ class ImpactReport:
     direct_receipts: tuple[str, ...]
     direct_decisions: tuple[str, ...]
     derived_memories: tuple[str, ...]
+    derived_unattested: tuple[str, ...]
     derived_decisions: tuple[str, ...]
     possible_memories: tuple[str, ...]
     edges: tuple[tuple[str, str, str, str], ...]
@@ -395,36 +409,39 @@ def impact(cur, memory_id: str) -> ImpactReport:
     # exist, and each pass either adds at least one element to a set
     # bounded by the field or stops.
     derived_memories: set[str] = set()
+    derived_unattested: set[str] = set()
     derived_decisions: set[str] = set(direct_decisions)
 
     all_decisions = load_decision_rows(cur)
+    decision_actor = {d["decision_id"]: d["actor_id"] for d in all_decisions}
     cur.execute("SELECT memory_id, superseded_by FROM memories "
                 "WHERE superseded_by IS NOT NULL ORDER BY memory_id ASC")
     successor_of = dict(cur.fetchall())
-    cur.execute("SELECT memory_id, payload_json FROM custody_chain "
+    cur.execute("SELECT memory_id, actor_id, payload_json FROM custody_chain "
                 "WHERE seq = 0 ORDER BY memory_id ASC")
-    declared_descent: list[tuple[str, str]] = []
-    for mid, pj in cur.fetchall():
+    declared_descent: list[tuple[str, str, str]] = []
+    for mid, declarant, pj in cur.fetchall():
         dfd = json.loads(pj).get("derived_from_decision")
         if isinstance(dfd, str):
-            declared_descent.append((mid, dfd))
+            declared_descent.append((mid, dfd, declarant))
 
     changed = True
     while changed:
         changed = False
-        reached = derived_memories | {memory_id}
+        reached = derived_memories | derived_unattested | {memory_id}
 
         for src in sorted(reached):
             succ = successor_of.get(src)
             if succ is not None:
                 edges.add(("DERIVED", "SUPERSEDED_BY", src, succ))
-                if succ != memory_id and succ not in derived_memories:
+                if succ != memory_id and succ not in derived_memories \
+                        and succ not in derived_unattested:
                     derived_memories.add(succ)
                     changed = True
 
         for row in all_decisions:
             used = set(json.loads(row["used_json"])["used"])
-            hit = sorted(used & derived_memories)
+            hit = sorted(used & (derived_memories | derived_unattested))
             if hit:
                 for u in hit:
                     edges.add(("DERIVED", "USED_BY", u, row["decision_id"]))
@@ -432,11 +449,14 @@ def impact(cur, memory_id: str) -> ImpactReport:
                     derived_decisions.add(row["decision_id"])
                     changed = True
 
-        for mid, dfd in declared_descent:
+        for mid, dfd, declarant in declared_descent:
             if dfd in derived_decisions:
-                edges.add(("DERIVED", "DERIVED_FROM_DECISION", dfd, mid))
-                if mid != memory_id and mid not in derived_memories:
-                    derived_memories.add(mid)
+                attested = declarant == decision_actor.get(dfd)
+                edges.add(("DERIVED" if attested else "DERIVED_UNATTESTED",
+                           "DERIVED_FROM_DECISION", dfd, mid))
+                bucket = derived_memories if attested else derived_unattested
+                if mid != memory_id and mid not in bucket:
+                    bucket.add(mid)
                     changed = True
 
     # --- POSSIBLE: contact, not contamination. Reported, never acted on.
@@ -453,7 +473,7 @@ def impact(cur, memory_id: str) -> ImpactReport:
         if other != memory_id:
             possible.add(other)
             edges.add(("POSSIBLE", "RESONANT_NEIGHBOUR", memory_id, other))
-    possible -= derived_memories
+    possible -= derived_memories | derived_unattested
     possible.discard(memory_id)
 
     body = {
@@ -462,6 +482,7 @@ def impact(cur, memory_id: str) -> ImpactReport:
         "direct_receipts": sorted(direct_receipts),
         "direct_decisions": sorted(direct_decisions),
         "derived_memories": sorted(derived_memories),
+        "derived_unattested": sorted(derived_unattested),
         "derived_decisions": sorted(derived_decisions),
         "possible_memories": sorted(possible),
         "edges": sorted([list(e) for e in edges]),
@@ -471,6 +492,7 @@ def impact(cur, memory_id: str) -> ImpactReport:
         direct_receipts=tuple(sorted(direct_receipts)),
         direct_decisions=tuple(sorted(direct_decisions)),
         derived_memories=tuple(sorted(derived_memories)),
+        derived_unattested=tuple(sorted(derived_unattested)),
         derived_decisions=tuple(sorted(derived_decisions)),
         possible_memories=tuple(sorted(possible)),
         edges=tuple(sorted(edges)),

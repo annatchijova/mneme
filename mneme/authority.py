@@ -58,9 +58,15 @@ Design decisions, each load-bearing:
       at verification time against the event's own timestamp.
 
   THE FIELD IS NEVER LEFT UNGOVERNABLE (A6).
-      The last active grant conferring GRANT cannot be revoked. Without
-      this, an actor holding REVOKE could strand a field in a state where
-      no further grant can ever be issued — containment by bricking.
+      The field always retains at least one ACTIVE actor holding GRANT,
+      and EVERY path that could reduce that set is guarded: revoking the
+      last GRANT-conferring grant, and QUARANTINING its last holder.
+      Enforced by a counter under a CHECK with the guard inside the
+      UPDATE, so it is a constraint rather than a promise and two
+      concurrent losses serialise on one row rather than on an isolation
+      level. Without it, two individually legitimate acts — quarantine the
+      only GRANT holder, then let the responder rotate itself off — leave
+      a field that can never grant, register or reinstate again.
 
 Invariants (A for Authority):
   A1  Every custody event sealed under authority_protocol names the grant
@@ -72,7 +78,9 @@ Invariants (A for Authority):
       the chain with the instant it died.
   A5  A QUARANTINED actor's effective capability set is empty, at every
       instant inside the quarantine interval.
-  A6  The field always retains at least one actor holding GRANT.
+  A6  The field always retains at least one ACTIVE actor holding GRANT.
+      Guarded on every path that could reduce the set — revocation AND
+      quarantine — by a constraint, not by a read.
 
 THE BOOTSTRAP, stated plainly because hiding it would be the one
 dishonest thing this module could do: authority has to start somewhere,
@@ -584,6 +592,34 @@ def quarantined_at(state: AuthorityState, at_ts: str) -> bool:
     return False
 
 
+def capabilities_before(rows: list[dict[str, Any]], subject_id: str,
+                        seq: int, at_ts: str) -> frozenset[str]:
+    """
+    What the issuer held IMMEDIATELY BEFORE its own event at `seq`.
+
+    THE RULE, and it took an audit to find that it was missing: an
+    authority event is authorized by the state BEFORE it, never by the
+    state it creates. Evaluating the full replay at the event's timestamp
+    reads the event's own effect back into its own authorization, and for
+    exactly one act that is fatal — SELF-REVOCATION. An actor rotating
+    itself off revokes its own grant; the grant dies at that instant; and
+    B7, replaying everything, then finds the issuer did not hold REVOKE
+    when it revoked. An ordinary, honest operation produced an
+    unverifiable bundle, while the write path — which checks before
+    appending — allowed it. The two halves of the same rule disagreed.
+
+    Only the issuer's OWN chain can contain the event under evaluation,
+    so the prefix is taken only when issuer and subject coincide.
+    """
+    prefix = [r for r in rows if r["seq"] < seq]
+    if not prefix:
+        return frozenset()
+    state, errors = replay_authority(subject_id, prefix)
+    if errors:
+        return frozenset()
+    return capabilities_at(state, at_ts)
+
+
 def grant_capabilities_at(state: AuthorityState, grant_id: str,
                           at_ts: str) -> frozenset[str] | None:
     """
@@ -808,27 +844,68 @@ def effective_capabilities(cur, actor_id: str, at_ts: str | None = None) -> froz
                            at_ts if at_ts is not None else custody.now_ts())
 
 
-def _actors_holding_grant(cur, at_ts: str, *, skip: tuple[str, str] | None = None) -> list[str]:
+def actors_holding_grant(cur, at_ts: str) -> list[str]:
     """
-    Every actor with an effective GRANT at at_ts. `skip` optionally removes
-    one (subject_id, grant_id) pair from consideration — used to answer
-    'would revoking this grant leave the field ungovernable?' without
-    writing anything first.
+    Every actor with an effective GRANT at at_ts, derived from the chains.
+    This is the TRUTH; `governance.grant_holders` is a cache of its size,
+    and B7 re-derives it the same way.
     """
     cur.execute("SELECT DISTINCT subject_id FROM authority_chain ORDER BY subject_id ASC")
     holders: list[str] = []
     for (sid,) in cur.fetchall():
         state = load_state(cur, sid)
-        if quarantined_at(state, at_ts):
-            continue
-        for gid in sorted(state.grants):
-            if skip is not None and (sid, gid) == skip:
-                continue
-            caps = grant_capabilities_at(state, gid, at_ts)
-            if caps and "GRANT" in caps:
-                holders.append(sid)
-                break
+        if "GRANT" in capabilities_at(state, at_ts):
+            holders.append(sid)
     return holders
+
+
+def _holds_grant(cur, subject_id: str, at_ts: str) -> bool:
+    cur.execute("SELECT 1 FROM authority_chain WHERE subject_id = ? LIMIT 1",
+                (subject_id,))
+    if cur.fetchone() is None:
+        return False
+    return "GRANT" in capabilities_at(load_state(cur, subject_id), at_ts)
+
+
+def _governance_row(cur, at_ts: str) -> None:
+    """
+    Materialise the A6 counter for a field bootstrapped before it existed.
+    The count is derived from the chains, so a lazy migration is a cache
+    fill and not a new claim.
+    """
+    cur.execute("SELECT grant_holders FROM governance WHERE singleton = 1")
+    if cur.fetchone() is None:
+        cur.execute("INSERT INTO governance (singleton, grant_holders) "
+                    "VALUES (1, ?)", (max(1, len(actors_holding_grant(cur, at_ts))),))
+
+
+def _governance_gain(cur, at_ts: str) -> None:
+    """One more actor holds GRANT. Unconditional: A6 only ever refuses a loss."""
+    _governance_row(cur, at_ts)
+    cur.execute("UPDATE governance SET grant_holders = grant_holders + 1 "
+                "WHERE singleton = 1")
+
+
+def _governance_lose(cur, at_ts: str, what: str) -> None:
+    """
+    One fewer actor holds GRANT — refused if it would be the last.
+
+    A6 as a CONSTRAINT rather than a promise. The guard lives inside the
+    UPDATE, so two concurrent losses serialise on the governance row's lock
+    under every engine rather than on an isolation level a config flip can
+    change; and the column's CHECK (grant_holders >= 1) makes zero a
+    constraint violation even if some future caller forgets this function.
+    """
+    _governance_row(cur, at_ts)
+    cur.execute("UPDATE governance SET grant_holders = grant_holders - 1 "
+                "WHERE singleton = 1 AND grant_holders > 1")
+    if cur.rowcount != 1:
+        raise ValueError(
+            f"Refusing to {what}: it would leave the field with no actor "
+            "holding GRANT — unable to authorize any future act, including "
+            "its own repair (Invariant A6). A field nobody can govern is "
+            "indistinguishable from a successful attack."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -885,6 +962,7 @@ def bootstrap_root(
     cur.execute(
         "INSERT INTO ledger_root (singleton, actor_id, created_at) "
         "VALUES (1, ?, ?)", (actor_id, ts))
+    cur.execute("INSERT INTO governance (singleton, grant_holders) VALUES (1, 1)")
     append_authority_event(
         cur, subject_id=actor_id, event_type="ACTOR_REGISTERED",
         issuer_id=actor_id, reason=reason,
@@ -1008,12 +1086,15 @@ def grant(
             f"grant_id {gid!r} already exists on {subject_id}'s chain — "
             "'which grant authorized this' must have one answer."
         )
+    held_before = _holds_grant(cur, subject_id, ts)
     append_authority_event(
         cur, subject_id=subject_id, event_type="GRANTED", issuer_id=issuer_id,
         reason=reason, payload={"grant_id": gid, "capabilities": caps,
                                 "root": False},
         created_at=ts,
     )
+    if "GRANT" in caps and not held_before:
+        _governance_gain(cur, ts)
     return gid
 
 
@@ -1049,17 +1130,13 @@ def revoke(
             f"{state.grants[grant_id]['revoked_at']} — a second revocation "
             "records nothing the first did not."
         )
-    if "GRANT" in state.grants[grant_id]["capabilities"]:
-        if not _actors_holding_grant(cur, ts, skip=(subject_id, grant_id)):
-            raise ValueError(
-                "Refusing to revoke the last grant conferring GRANT — the "
-                "field would become ungovernable, unable to authorize any "
-                "future act including its own repair (Invariant A6)."
-            )
+    held_before = _holds_grant(cur, subject_id, ts)
     append_authority_event(
         cur, subject_id=subject_id, event_type="REVOKED", issuer_id=issuer_id,
         reason=reason, payload={"grant_id": grant_id}, created_at=ts,
     )
+    if held_before and not _holds_grant(cur, subject_id, ts):
+        _governance_lose(cur, ts, f"revoke {grant_id!r}")
 
 
 def quarantine_actor_authority(
@@ -1083,10 +1160,19 @@ def quarantine_actor_authority(
     state = load_state(cur, subject_id)
     if quarantined_at(state, ts):
         raise ValueError(f"Actor {subject_id!r} is already QUARANTINED.")
+    held_before = _holds_grant(cur, subject_id, ts)
     append_authority_event(
         cur, subject_id=subject_id, event_type="ACTOR_QUARANTINED",
         issuer_id=issuer_id, reason=reason, payload={}, created_at=ts,
     )
+    # A5 empties a quarantined actor's capabilities, so quarantining the
+    # last GRANT holder bricks the field exactly as revoking its grant
+    # would. A6 guarded the revoke and not this, which an audit found by
+    # walking the path: quarantine the only GRANT holder, then have the
+    # responder revoke its own grant, and nothing can ever be authorized
+    # again. Containment must never be a way to destroy governance.
+    if held_before:
+        _governance_lose(cur, ts, f"quarantine {subject_id!r}")
 
 
 def reinstate_actor(
@@ -1122,5 +1208,7 @@ def reinstate_actor(
         cur, subject_id=subject_id, event_type="ACTOR_REINSTATED",
         issuer_id=issuer_id, reason=reason, payload={}, created_at=ts,
     )
+    if _holds_grant(cur, subject_id, ts):
+        _governance_gain(cur, ts)
     cur.execute("UPDATE actors SET status = 'ACTIVE' WHERE actor_id = ?",
                 (subject_id,))

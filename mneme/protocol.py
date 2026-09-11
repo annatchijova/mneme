@@ -124,7 +124,24 @@ TAINT_PROTOCOL = "2.0.0"
 #         let any caller widen the custody gate and read what it withheld.
 #         MINOR — every 1.0.0/1.1.0 check is unchanged, and the capability
 #         gates a path that writes nothing and appears in no bundle.
-AUTHORITY_PROTOCOL = "1.2.0"
+# 1.3.0 — one rule CORRECTED and one invariant widened, both found by
+#         auditing this branch's own code.
+#         (a) An authority event is authorized by the ledger state
+#             IMMEDIATELY BEFORE it, never by the state it creates. Under
+#             1.2.0, B7 replayed the whole chain and then asked whether the
+#             issuer held the capability AT the event's instant — so an
+#             actor revoking its own grant was judged by a ledger in which
+#             that grant was already dead, and an ordinary rotation
+#             produced an UNVERIFIABLE bundle while the write path allowed
+#             it. The two halves of one rule disagreed.
+#         (b) A6 now covers quarantine as well as revocation, and is a
+#             constraint rather than a read.
+#         MINOR under this module's own discipline: a bundle declaring
+#         1.2.0 is still checked under 1.2.0, defect included, because
+#         evidence is checked under the rules it was sealed with. 1.2.0
+#         stays in the supported table for exactly that reason — a known
+#         defect is not a reason to retroactively re-judge old evidence.
+AUTHORITY_PROTOCOL = "1.3.0"
 
 # 2.0.0 — MAJOR, and the honest label. 1.0.0's receipt body recorded what
 #         a recall RETURNED but never what it was ASKED (no top_k, no hops,
@@ -141,7 +158,13 @@ RECEIPT_PROTOCOL = "2.0.0"
 #         bilaterality of claim-to-claim relations, the three set
 #         constraints and how a violation is evaluated, and the rule that
 #         a claim's standing is DERIVED and never stored.
-CLAIM_PROTOCOL = "1.0.0"
+# 1.1.0 — C6: declaring a constraint that binds an already-VALIDATED claim
+#         requires ADJUDICATE rather than ASSERT, because re-opening a
+#         settled question is an adjudication. Closes the asymmetric DoS
+#         Round 3 confirmed (R3-03). MINOR: every 1.0.0 check is unchanged
+#         and the conservative UNDETERMINED default is untouched — the fix
+#         prices the act rather than softening the semantics.
+CLAIM_PROTOCOL = "1.1.0"
 
 PROTOCOL_NAMES = (
     "custody_protocol",
@@ -178,12 +201,12 @@ SUPPORTED_PROTOCOLS: dict[str, frozenset[str]] = {
     "replay_protocol": frozenset({"1.0.0", "1.1.0"}),
     "ranking_protocol": frozenset({"1.0.0"}),
     "taint_protocol": frozenset({"1.0.0", "1.1.0", "2.0.0"}),
-    "authority_protocol": frozenset({"1.0.0", "1.1.0", "1.2.0"}),
+    "authority_protocol": frozenset({"1.0.0", "1.1.0", "1.2.0", "1.3.0"}),
     # receipt 1.0.0 is NOT here. Its digest body differs, so this build
     # genuinely cannot check a 1.0.0 receipt — and an entry claiming
     # otherwise would be the one kind of lie this table exists to prevent.
     "receipt_protocol": frozenset({"2.0.0"}),
-    "claim_protocol": frozenset({"1.0.0"}),
+    "claim_protocol": frozenset({"1.0.0", "1.1.0"}),
 }
 
 

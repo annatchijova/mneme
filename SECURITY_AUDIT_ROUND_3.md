@@ -58,7 +58,9 @@ not as evidence of coverage.
 | R3-03 | Medium | CONFIRMED BY INDUCTION | Asymmetric denial of service | Reported | An `ASSERT`-only actor can drag settled claims into unbounded new constraints, each of which only an `ADJUDICATE` holder can clear. |
 | R3-04 | Low–Medium | CONFIRMED BY INDUCTION | Evidence-quality limitation | Reported | Blast radius is inflatable by a `DECIDE` holder: `derived_from_decision` is self-asserted and the memory it descends from never corroborates it. |
 | R3-05 | Low | CONFIRMED BY INDUCTION | Information disclosure | Reported | Several un-gated paths confirm the EXISTENCE and STATUS of memories the custody gate withholds, without disclosing content. |
-| R3-06 | — | FALSIFIED (SQLite) / CONFIRMED (portability) | Concurrency defect | Reported | A6's "last GRANT" check is read-then-write. Both pre-checks pass concurrently; SQLite's write lock serializes them, and an MVCC engine would not. |
+| R3-06 | — | FALSIFIED (SQLite) / CONFIRMED (portability) | Concurrency defect | **Fixed in the follow-up** | A6's "last GRANT" check is read-then-write. Both pre-checks pass concurrently; SQLite's write lock serializes them, and an engine at READ COMMITTED would not. |
+| R3-07 | High | CONFIRMED BY INDUCTION | Software vulnerability | **Fixed in the follow-up** | A6 guarded revocation and not QUARANTINE. Two individually legitimate acts leave a field that can never grant, register or reinstate again — permanently ungovernable. |
+| R3-08 | Medium | CONFIRMED BY INDUCTION | Verification defect | **Fixed in the follow-up** | An authority event was judged by the state it CREATES, so an actor rotating itself off produced an unverifiable bundle while the write path allowed it. |
 
 ## R3-01 — The counterfactual is a disclosure oracle
 
@@ -394,6 +396,120 @@ codebase.
 | Two concurrent `bootstrap_root` calls | FALSIFIED after the R3-02 fix | The `ledger_root` singleton makes the second a constraint violation. Before the fix this was the route to the two-root state. |
 | Sequential double-revoke by one actor in one transaction | FALSIFIED | The second check sees the first write; A6 holds. Only concurrency defeats it (R3-06). |
 
+## R3-07 — A6 guarded one door and the field has two
+
+**Severity:** High · **Level:** CONFIRMED BY INDUCTION · **Status:** fixed in the follow-up
+
+### Surprise / expectation violated
+
+A6 exists so that a field can never be left unable to authorize anything,
+including its own repair. It was implemented as a check inside `revoke()`,
+and nowhere else — but A5 says a QUARANTINED actor holds NO capability, so
+quarantining the last GRANT holder empties governance exactly as revoking its
+grant would. Containment became a way to destroy governance.
+
+### Induction
+
+Two acts, each individually legitimate and each correctly authorized:
+
+```text
+holders of GRANT:                          ['root']
+step 1: ir quarantines root (holds QUARANTINE_ACTOR)   -> holders: []
+step 2: ir revokes its OWN grant (holds REVOKE)        -> SUCCEEDED
+        A6 looked only at GRANT-conferring grants, and ir's conferred
+        QUARANTINE_ACTOR + REVOKE, so it had nothing to say.
+
+bootstrap a new root       refused — the ledger already exists
+reinstate root             refused — ir holds nothing now
+grant anything to anyone   refused — nobody holds GRANT
+```
+
+The field is permanently ungovernable. Nothing is corrupt; every chain
+verifies; no act was unauthorized. The invariant simply was not enforced on
+the path that violated it.
+
+### Fix applied
+
+A6 is now a CONSTRAINT rather than a read: a `governance` singleton counting
+GRANT holders, under `CHECK (grant_holders >= 1)`, decremented by a
+conditional `UPDATE … WHERE grant_holders > 1` whose rowcount is the verdict.
+Every losing path goes through it — revocation AND quarantine — and two
+concurrent losses serialise on one row's lock under every engine rather than
+on an isolation level a config flip can change. That closes R3-06 in the same
+change, and it is the pattern `ledger_root` already established for the root
+act.
+
+A6 is restated to match what it now enforces: *the field always retains at
+least one ACTIVE actor holding GRANT.*
+
+### Boundary
+
+A6 is a WRITE-TIME invariant, not an evidence property. A bricked field still
+produces a bundle that verifies — correctly, because the chains are honest
+evidence of a bricked field. No bundle check was added and none should be;
+this is tested by refusal in `tests/test_authority_pure.py` rather than by the
+mutation suite, and that distinction is now written into the suite's own
+header.
+
+## R3-08 — An act judged by the state it creates
+
+**Severity:** Medium · **Level:** CONFIRMED BY INDUCTION · **Status:** fixed in the follow-up
+
+### Surprise / expectation violated
+
+`revoke()` checks the issuer's capability BEFORE appending, which is correct.
+B7 replayed the whole chain and then asked whether the issuer held the
+capability AT the event's instant — which, for a SELF-revocation, is an
+instant at which the grant is already dead.
+
+So the two halves of one rule disagreed: the write path allowed an ordinary
+rotation and the verifier called the resulting bundle forged.
+
+### Induction
+
+An actor holding QUARANTINE_ACTOR + REVOKE rotates itself off:
+
+```text
+B7: ir authority seq 2: issuer 'ir' did not hold REVOKE at
+    2026-09-11T07:07:27.738820+00:00 (never granted, revoked by then,
+    or quarantined).
+```
+
+Honest act. Unverifiable evidence.
+
+### Fix applied
+
+THE RULE, stated once and now implemented in both verifiers: **an authority
+event is authorized by the ledger state IMMEDIATELY BEFORE it, never by the
+state it creates.** `capabilities_before()` replays the issuer's own chain up
+to the event under evaluation. `authority_protocol` 1.3.0; 1.2.0 stays
+supported, defect included, because evidence is checked under the rules it was
+sealed with and a known defect is not a reason to retroactively re-judge old
+bundles.
+
+### The same defect, one layer up
+
+Implementing C6 (below) reproduced it immediately: the write path priced a
+SET_MEMBERSHIP by the epistemic state at the moment of the act, and B9 priced
+it by a fixed table. The honest field stopped verifying, the test caught it,
+and the fix was the same shape — `required_capability_for_set()`, shared by
+both implementations, evaluating the state strictly before the event.
+
+**The generalisation worth keeping: whenever a requirement depends on state,
+the writer and the verifier must derive it from the same function, and any
+requirement that depends on the state at the moment of an act must be
+evaluated BEFORE that act, not after it.**
+
+## What was applied from the reported findings
+
+| Finding | Applied |
+|---|---|
+| R3-03 denial of epistemics | C6: binding an already-VALIDATED claim into a NEW constraint requires ADJUDICATE, not ASSERT. `claim_protocol` 1.1.0. The conservative UNDETERMINED default is untouched — the fix prices the act rather than softening the semantics. |
+| R3-04 unilateral descent | The DERIVED level is now GRADED. `derived_memories` are those whose declaring actor IS the cited decision's actor; `derived_unattested` are third-party claims of descent from someone else's decision. Reported apart, so a shaped report cannot borrow the strong bucket's weight. |
+| R3-05 existence oracle | NOT applied, by the recommendation's own reasoning: two of the three paths are deliberate transparency, and making not-found indistinguishable from not-permitted costs diagnostic quality that a forensic tool needs. Documented in `KNOWN_LIMITATIONS.md`. |
+| R3-06 A6 read-then-write | Applied together with R3-07, as a constraint. |
+| Round 2 recommendation #4 | `excluded_lineage` now exists. A one-sided supersession export DECLARES its absent counterpart, a passing verdict names it, and declaring a counterpart the bundle actually carries is refused — the same contract B5, B8 and B9 hold. R2-04 is closed. |
+
 ## What this round says about the previous one
 
 Round 2 found that *audited* does not imply *authorized*, and the answer was an
@@ -422,4 +538,18 @@ read path gains a parameter, ask what it now reveals that it did not before.**
   answer generalises: grade the claim, bound the propagation, and make the
   expensive operation the one that requires authority.
 - Read-then-write preconditions that SQLite serialises for free become real
-  defects under MVCC. Port them as constraints before the port, not during it.
+  defects under weaker isolation. CockroachDB defaults to serializable, which
+  would abort one of the two transactions rather than admit both — so the
+  exposure is READ COMMITTED and any port that does not preserve the isolation
+  level. Relying on an isolation default is still an implicit dependency this
+  project would rather name than lean on, which is why A6 became a constraint
+  instead.
+- An invariant is only enforced on the paths someone enforced it on. A6
+  guarded revocation for two rounds while quarantine walked straight past it.
+  When an invariant is stated globally ("the field always retains…"),
+  enumerate every transition that can violate it and guard each one, or the
+  statement is a comment.
+- Whenever a requirement depends on state, the writer and the verifier must
+  derive it from ONE function; and a requirement about the state at the moment
+  of an act must be evaluated before the act, never after. Both halves of
+  R3-08 were that mistake, one layer apart.

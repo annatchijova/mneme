@@ -80,8 +80,9 @@ that makes disagreement loud):
            the whole capability vocabulary;
         4. NO AMPLIFICATION, re-derived offline: every non-root authority
            event names an issuer whose own chain travels in the bundle
-           and who held, at that event's instant, the capability the
-           event required — and, for a GRANT, every capability it
+           and who held, IMMEDIATELY BEFORE that event, the capability the
+           event required — before, never at, because an event judged by
+           the state it creates makes self-revocation unverifiable — and, for a GRANT, every capability it
            conferred. Authority is delegated, never invented;
         5. every custody event at or after the declared authority genesis
            names a grant_id that was active for its actor at that
@@ -377,6 +378,30 @@ def export_bundle(cur, *, memory_ids: list[str] | None = None) -> str:
             receipts[r["receipt_sha256"]] = r
 
 
+    # Lineage whose counterpart stays behind (B4). Round 2's R2-04 named
+    # this gap and its own recommendation #4 proposed the fix: a one-sided
+    # supersession export verifies while NAMING its absent counterpart, so
+    # the relation is not erased — but the verifier could not tell "the
+    # counterpart is not included" from "the lineage ended here". Declared
+    # now, the way sweeps, decisions and claim sets already are.
+    excluded_lineage = []
+    for mem in memories:
+        mid = mem["memory_id"]
+        birth = json.loads(mem["custody"][0]["payload_json"])
+        pred = birth.get("supersedes")
+        if isinstance(pred, str) and pred not in exported_ids:
+            excluded_lineage.append({"memory_id": mid, "role": "successor",
+                                     "counterpart": pred})
+        for r in mem["custody"]:
+            if r["event_type"] != "SUPERSEDED_BY":
+                continue
+            succ = json.loads(r["payload_json"]).get("successor_memory_id")
+            if isinstance(succ, str) and succ not in exported_ids:
+                excluded_lineage.append({"memory_id": mid,
+                                         "role": "predecessor",
+                                         "counterpart": succ})
+    excluded_lineage.sort(key=lambda d: (d["memory_id"], d["role"], d["counterpart"]))
+
     body = {
         "format": BUNDLE_FORMAT,
         "protocols": dict(protocol.CURRENT_PROTOCOLS),
@@ -387,6 +412,7 @@ def export_bundle(cur, *, memory_ids: list[str] | None = None) -> str:
         "receipts": [receipts[k] for k in sorted(receipts)],
         "decisions": decisions,
         "excluded_decisions": excluded_decisions,
+        "excluded_lineage": excluded_lineage,
         "claims": claim_rows,
         "claim_sets": claim_set_rows,
         "authority": authority_rows,
@@ -461,6 +487,7 @@ def verify_authority(
 
     # --- 1/2. Structure, then meaning, then the declared status column.
     states: dict[str, authority.AuthorityState] = {}
+    chains_by_sid: dict[str, list[dict[str, Any]]] = {}
     auth_heads: dict[str, str] = {}
     earliest: str | None = None
     for entry in sorted(entries, key=lambda e: str(e.get("subject_id"))):
@@ -482,6 +509,7 @@ def verify_authority(
             errors.extend(f"B7: {e}" for e in rerrs)
             continue
         states[sid] = state
+        chains_by_sid[sid] = chain
         auth_heads[sid] = chain[-1]["entry_hash"]
         first_ts = chain[0]["created_at"]
         if earliest is None or first_ts < earliest:
@@ -511,8 +539,7 @@ def verify_authority(
 
     # --- 4. No amplification (A3), re-derived offline.
     for sid in sorted(states):
-        state = states[sid]
-        for r in next(e["chain"] for e in entries if e.get("subject_id") == sid):
+        for r in chains_by_sid[sid]:
             payload = json.loads(r["payload_json"])
             issuer = r["issuer_id"]
             at = r["created_at"]
@@ -525,7 +552,14 @@ def verify_authority(
                     "not in this bundle — the delegation path is unprovable.")
                 continue
             needed = authority.AUTHORITY_EVENT_CAPABILITY[r["event_type"]]
-            issuer_caps = authority.capabilities_at(states[issuer], at)
+            # Authorized by the state BEFORE the event, never by the state
+            # it creates — otherwise an actor revoking its own grant is
+            # judged by a ledger in which that grant is already dead.
+            if issuer == sid:
+                issuer_caps = authority.capabilities_before(
+                    chains_by_sid[sid], sid, r["seq"], at)
+            else:
+                issuer_caps = authority.capabilities_at(states[issuer], at)
             if needed not in issuer_caps:
                 errors.append(
                     f"{where}: issuer {issuer!r} did not hold {needed} at {at} "
@@ -948,6 +982,14 @@ def verify_claims(
                     continue
                 caps = authority.grant_capabilities_at(auth[actor], gid, at)
                 needed = _claims.CLAIM_EVENT_CAPABILITY[r["event_type"]]
+                if r["event_type"] == "SET_MEMBERSHIP":
+                    # C6: which capability this act required depends on the
+                    # epistemic state at the moment of the act. Assuming
+                    # ASSERT would make the verifier disagree with the write
+                    # path about an honest re-opening.
+                    sid_ = payload.get("set_id")
+                    needed = _claims.required_capability_for_set(
+                        chains, sorted(declared_members.get(sid_, {cid})), at)
                 if caps is None:
                     errors.append(f"{where}: grant {gid!r} was not active for "
                                   f"{actor!r} at {at}.")
@@ -1065,16 +1107,40 @@ def verify_bundle_verbose(bundle_json: str) -> tuple[bool, list[str], list[str]]
                 if isinstance(succ, str):
                     successors.setdefault(mid, set()).add(succ)
 
-    # B4 — supersession lineage is bilateral when both parties are present
+    # B4 — supersession lineage is bilateral when both parties are present,
+    # and DECLARED absent when one is not (Round 2's R2-04 recommendation).
+    declared_lineage = body.get("excluded_lineage", [])
+    declared_pairs = {(d.get("memory_id"), d.get("role"), d.get("counterpart"))
+                      for d in declared_lineage}
     for s, x in sorted(stored_supersedes.items()):
-        if x in heads and s not in successors.get(x, set()):
-            errors.append(f"B4: {s}: STORED claims it supersedes {x}, but "
-                          f"{x}'s chain has no SUPERSEDED_BY naming {s}.")
+        if x in heads:
+            if s not in successors.get(x, set()):
+                errors.append(f"B4: {s}: STORED claims it supersedes {x}, but "
+                              f"{x}'s chain has no SUPERSEDED_BY naming {s}.")
+        elif (s, "successor", x) not in declared_pairs:
+            errors.append(f"B4: {s}: STORED claims it supersedes {x}, which "
+                          "this bundle neither carries nor declares excluded "
+                          "— absence stated, never implied.")
     for x in sorted(successors):
         for s in sorted(successors[x]):
-            if s in heads and stored_supersedes.get(s) != x:
-                errors.append(f"B4: {x}: SUPERSEDED_BY names {s}, but {s}'s "
-                              f"STORED does not claim to supersede {x}.")
+            if s in heads:
+                if stored_supersedes.get(s) != x:
+                    errors.append(f"B4: {x}: SUPERSEDED_BY names {s}, but {s}'s "
+                                  f"STORED does not claim to supersede {x}.")
+            elif (x, "predecessor", s) not in declared_pairs:
+                errors.append(f"B4: {x}: SUPERSEDED_BY names {s}, which this "
+                              "bundle neither carries nor declares excluded.")
+    for d in declared_lineage:
+        if d.get("counterpart") in heads:
+            errors.append(f"B4: {d.get('memory_id')}: declares its lineage "
+                          f"counterpart {d.get('counterpart')} excluded, but "
+                          "the bundle carries it — a present counterpart must "
+                          "be checked, not declared away.")
+    for d in declared_lineage:
+        other = "predecessor" if d["role"] == "successor" else "successor"
+        notes.append(f"{d['memory_id']} names {d['counterpart']} as its lineage "
+                     f"{other}, which does not travel here — the relation is "
+                     "declared, and the absent side's consent is NOT proven.")
 
     # B5 — sweep evidence (normative rules in the module header)
     included = body.get("sweeps", [])

@@ -34,7 +34,9 @@ Checks (normative statement in mneme/bundle.py's header):
       from replaying the chain's events; supersession lineage is
       bilateral when both parties travel in the bundle (a STORED
       "supersedes": X needs X's chain to name this memory back in a
-      SUPERSEDED_BY event, and vice versa)
+      SUPERSEDED_BY event, and vice versa), and DECLARED in
+      "excluded_lineage" when one party does not — absence stated, never
+      implied, with the absent counterpart named on a passing verdict
   B5  sweep evidence — absence stated, never implied: no sweep_id in
       both "sweeps" and "excluded_sweeps"; every included sweep's
       flagged set matches its count and seal; an excluded sweep must
@@ -49,8 +51,8 @@ Checks (normative statement in mneme/bundle.py's header):
   B7  authority provenance: every authority chain verifies and replays;
       declared actor status reproduces from it; exactly one self-issued
       root grant conferring the whole vocabulary; NO AMPLIFICATION —
-      every authority event's issuer held, at that instant, the
-      capability the event required and (for a grant) every capability
+      every authority event's issuer held, IMMEDIATELY BEFORE that
+      event, the capability the event required and (for a grant) every capability
       it conferred; and every custody event at or after the declared
       authority genesis names a grant that was active for its actor at
       that instant, conferred the capability its event type requires,
@@ -148,11 +150,11 @@ SUPPORTED_PROTOCOLS = {
     "replay_protocol": frozenset({"1.0.0", "1.1.0"}),
     "ranking_protocol": frozenset({"1.0.0"}),
     "taint_protocol": frozenset({"1.0.0", "1.1.0", "2.0.0"}),
-    "authority_protocol": frozenset({"1.0.0", "1.1.0", "1.2.0"}),
+    "authority_protocol": frozenset({"1.0.0", "1.1.0", "1.2.0", "1.3.0"}),
     # receipt 1.0.0 is absent on purpose: its digest body differs, so this
     # verifier genuinely cannot check one.
     "receipt_protocol": frozenset({"2.0.0"}),
-    "claim_protocol": frozenset({"1.0.0"}),
+    "claim_protocol": frozenset({"1.0.0", "1.1.0"}),
 }
 GRANT_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_\-.:]{1,64}$")
 SUPPORTED_QUANTIZATION = frozenset({
@@ -477,6 +479,25 @@ def grant_capabilities_at(state: dict, grant_id: str, at_ts: str):
     return frozenset(g["capabilities"])
 
 
+def capabilities_before(chain: list, subject_id: str, seq: int,
+                        at_ts: str) -> frozenset:
+    """
+    What the issuer held IMMEDIATELY BEFORE its own event at `seq`. An
+    authority event is authorized by the state BEFORE it, never by the
+    state it creates — otherwise an actor revoking its own grant is judged
+    by a ledger in which that grant is already dead, and an honest
+    rotation produces an unverifiable bundle.
+    """
+    prefix = [r for r in chain if r["seq"] < seq]
+    if not prefix:
+        return frozenset()
+    local: list = []
+    st = replay_authority(subject_id, prefix, local)
+    if local:
+        return frozenset()
+    return capabilities_at(st, at_ts)
+
+
 def capabilities_at(state: dict, at_ts: str) -> frozenset:
     if quarantined_at(state, at_ts):
         return frozenset()
@@ -584,7 +605,11 @@ def verify_authority(body: dict, memory_chains: list) -> tuple[list, list]:
                               "path is unprovable.")
                 continue
             needed = AUTHORITY_EVENT_CAPABILITY[r["event_type"]]
-            issuer_caps = capabilities_at(states[issuer], at)
+            if issuer == sid:
+                issuer_caps = capabilities_before(chains_by_id[sid], sid,
+                                                  r["seq"], at)
+            else:
+                issuer_caps = capabilities_at(states[issuer], at)
             if needed not in issuer_caps:
                 errors.append(f"{where}: issuer {issuer!r} did not hold {needed} "
                               f"at {at} (never granted, revoked by then, or "
@@ -969,6 +994,25 @@ def evaluate_constraint(constraint_type: str, states: dict) -> tuple:
             f"{len(held)} of {n} holding, {len(open_)} still open")
 
 
+def claim_state_before(claim_id: str, chain: list, at_ts: str) -> str:
+    """A claim's state strictly BEFORE an instant (claims.state_before)."""
+    prefix = [r for r in chain if r["created_at"] < at_ts]
+    if not prefix:
+        return "ASSERTED"
+    local: list = []
+    st = replay_claim(claim_id, prefix, local)
+    return "ASSERTED" if local else st["state"]
+
+
+def required_capability_for_set(chains: dict, members: list, at_ts: str) -> str:
+    """C6: binding an already-VALIDATED claim into a new constraint
+    re-opens a settled question and costs ADJUDICATE, not ASSERT."""
+    for cid in members:
+        if claim_state_before(cid, chains.get(cid, []), at_ts) == "VALIDATED":
+            return "ADJUDICATE"
+    return "ASSERT"
+
+
 def verify_claims(body: dict, memory_chains: list) -> tuple:
     errors: list = []
     notes: list = []
@@ -1092,6 +1136,10 @@ def verify_claims(body: dict, memory_chains: list) -> tuple:
                     continue
                 caps = grant_capabilities_at(auth[actor], gid, at)
                 needed = CLAIM_EVENT_CAPABILITY[r["event_type"]]
+                if r["event_type"] == "SET_MEMBERSHIP":
+                    sid_ = payload.get("set_id")
+                    needed = required_capability_for_set(
+                        chains, sorted(declared_members.get(sid_, {cid})), at)
                 if caps is None:
                     errors.append(f"{where}: grant {gid!r} was not active for "
                                   f"{actor!r} at {at}.")
@@ -1203,15 +1251,38 @@ def verify(bundle_json: str) -> tuple[bool, list[str], list[str]]:
                 if isinstance(succ, str):
                     successors.setdefault(mid, set()).add(succ)
 
+    declared_lineage = body.get("excluded_lineage", [])
+    declared_pairs = {(d.get("memory_id"), d.get("role"), d.get("counterpart"))
+                      for d in declared_lineage}
     for s, x in sorted(stored_supersedes.items()):
-        if x in heads and s not in successors.get(x, set()):
-            errors.append(f"B4: {s}: STORED claims it supersedes {x}, but "
-                          f"{x}'s chain has no SUPERSEDED_BY naming {s}.")
+        if x in heads:
+            if s not in successors.get(x, set()):
+                errors.append(f"B4: {s}: STORED claims it supersedes {x}, but "
+                              f"{x}'s chain has no SUPERSEDED_BY naming {s}.")
+        elif (s, "successor", x) not in declared_pairs:
+            errors.append(f"B4: {s}: STORED claims it supersedes {x}, which "
+                          "this bundle neither carries nor declares excluded "
+                          "— absence stated, never implied.")
     for x in sorted(successors):
         for s in sorted(successors[x]):
-            if s in heads and stored_supersedes.get(s) != x:
-                errors.append(f"B4: {x}: SUPERSEDED_BY names {s}, but {s}'s "
-                              f"STORED does not claim to supersede {x}.")
+            if s in heads:
+                if stored_supersedes.get(s) != x:
+                    errors.append(f"B4: {x}: SUPERSEDED_BY names {s}, but {s}'s "
+                                  f"STORED does not claim to supersede {x}.")
+            elif (x, "predecessor", s) not in declared_pairs:
+                errors.append(f"B4: {x}: SUPERSEDED_BY names {s}, which this "
+                              "bundle neither carries nor declares excluded.")
+    for d in declared_lineage:
+        if d.get("counterpart") in heads:
+            errors.append(f"B4: {d.get('memory_id')}: declares its lineage "
+                          f"counterpart {d.get('counterpart')} excluded, but "
+                          "the bundle carries it — a present counterpart must "
+                          "be checked, not declared away.")
+    for d in declared_lineage:
+        other = "predecessor" if d["role"] == "successor" else "successor"
+        notes.append(f"{d['memory_id']} names {d['counterpart']} as its lineage "
+                     f"{other}, which does not travel here — the relation is "
+                     "declared, and the absent side's consent is NOT proven.")
 
     included = body.get("sweeps", [])
     excluded = body.get("excluded_sweeps", [])  # absent key reads as empty

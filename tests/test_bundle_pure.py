@@ -178,6 +178,45 @@ conn3.commit()
 agree("SUPERSEDED_BY naming a non-consenting successor",
       bundle.export_bundle(cur3), False, {"B4"})
 
+# ------------------------------------------ declared lineage (Round 2, R2-04)
+# A one-sided export used to verify while merely NAMING its absent
+# counterpart: the relation was never erased, but the verifier could not
+# tell "not included" from "lineage ended here". Now it is declared, and
+# the declaration is checked both ways.
+print("\n[lineage whose counterpart stays behind]")
+only_successor = bundle.export_bundle(cur3, memory_ids=["m-b"])
+agree("a one-sided lineage export verifies", only_successor, True)
+_ok, _errs, _notes = bundle.verify_bundle_verbose(only_successor)
+check("...and declares the counterpart it cannot carry",
+      json.loads(only_successor)["body"]["excluded_lineage"]
+      == [{"memory_id": "m-b", "role": "successor", "counterpart": "m-a"}],
+      str(json.loads(only_successor)["body"]["excluded_lineage"]))
+check("...and a passing verdict names it out loud",
+      any("m-a" in n and "consent is NOT proven" in n for n in _notes),
+      str(_notes))
+
+only_predecessor = bundle.export_bundle(cur3, memory_ids=["m-a"])
+agree("the other side verifies too", only_predecessor, True)
+check("...declaring its absent successor",
+      {d["role"] for d in json.loads(only_predecessor)["body"]["excluded_lineage"]}
+      == {"predecessor"},
+      str(json.loads(only_predecessor)["body"]["excluded_lineage"]))
+
+t = json.loads(only_successor)
+t["body"]["excluded_lineage"] = []
+body_c = bundle.canonical_json(t["body"])
+t["bundle_sha256"] = hashlib.sha256(body_c.encode("utf-8")).hexdigest()
+agree("a lineage claim neither carried nor declared", json.dumps(t), False, {"B4"})
+
+full_pair = bundle.export_bundle(cur3, memory_ids=["m-a", "m-b"])
+t = json.loads(full_pair)
+t["body"]["excluded_lineage"] = [
+    {"memory_id": "m-b", "role": "successor", "counterpart": "m-a"}]
+body_c = bundle.canonical_json(t["body"])
+t["bundle_sha256"] = hashlib.sha256(body_c.encode("utf-8")).hexdigest()
+agree("a counterpart the bundle carries, declared away", json.dumps(t),
+      False, {"B4"})
+
 # ------------------------------------------------- backward-in-time chain (H1)
 # Both verifiers must reject a hash-valid chain that runs backwards in
 # time. Build a single-memory field, then rewrite its 2nd event to an

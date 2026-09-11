@@ -47,6 +47,12 @@ conflicts. A claim SET is a constraint over many hypotheses:
     INCOMPATIBLE  they cannot ALL hold together (weaker, and often the
                   only thing actually known)
 
+Binding OPEN hypotheses together costs `ASSERT`. Binding a SETTLED one
+back into dispute costs `ADJUDICATE`, because re-opening an adjudicated
+question is an adjudication (C6) — and without that price an ASSERT-only
+actor could fill a reviewer's queue for free, which Round 3 confirmed by
+induction.
+
 Resolution is then an operation on the SET rather than on an arbitrary
 pair: `resolve_set` validates and refutes members in one audited
 transaction, and REFUSES to commit a resolution that leaves the
@@ -64,6 +70,10 @@ Invariants (C for Claims):
       the relation does not exist.
   C5  A resolution must leave its set satisfied, checked in the same
       transaction that writes it.
+  C6  Re-opening a settled question is an adjudication-level act.
+      Declaring a constraint over open hypotheses needs ASSERT; declaring
+      one that drags an already-VALIDATED claim back into dispute needs
+      ADJUDICATE.
 
 As everywhere: every function takes a live cursor and NEVER commits.
 """
@@ -252,6 +262,35 @@ class ClaimState:
     contradicts: tuple = ()
     relations: tuple = ()
     sets: tuple = ()
+
+
+def state_before(claim_id: str, rows: list[dict[str, Any]],
+                 at_ts: str) -> str:
+    """
+    A claim's state strictly BEFORE an instant, from its own chain.
+
+    Needed because C6 makes one capability requirement depend on the
+    epistemic state at the moment of the act: binding an already-VALIDATED
+    claim into a new constraint costs ADJUDICATE, binding open ones costs
+    ASSERT. A verifier that assumed one or the other would disagree with
+    the write path about the same event — which is precisely the defect
+    R3-08 found on the authority side, and it showed up here the moment
+    the rule landed.
+    """
+    prefix = [r for r in rows if r["created_at"] < at_ts]
+    if not prefix:
+        return "ASSERTED"
+    st, errors = replay_claim(claim_id, prefix)
+    return "ASSERTED" if errors else st.state
+
+
+def required_capability_for_set(member_chains: dict[str, list[dict[str, Any]]],
+                                members: list[str], at_ts: str) -> str:
+    """C6, as one function both implementations share."""
+    for cid in members:
+        if state_before(cid, member_chains.get(cid, []), at_ts) == "VALIDATED":
+            return "ADJUDICATE"
+    return "ASSERT"
 
 
 def replay_claim(claim_id: str,
@@ -476,10 +515,34 @@ def declare_set(cur, *, members: list[str], constraint_type: str,
                 topic: str | None = None, created_at: str | None = None,
                 grant_id: str | None = None) -> str:
     """
-    Declare that a group of claims is mutually constrained. Requires
-    ASSERT, and writes a SET_MEMBERSHIP event on every member's chain so
-    the membership is re-derivable from evidence rather than trusted to
-    one row (the same lesson taint_protocol 2.0.0 learned about sweeps).
+    Declare that a group of claims is mutually constrained. Writes a
+    SET_MEMBERSHIP event on every member's chain so the membership is
+    re-derivable from evidence rather than trusted to one row (the same
+    lesson taint_protocol 2.0.0 learned about sweeps).
+
+    CAPABILITY DEPENDS ON WHAT IS BEING DISPUTED (claim_protocol 1.1.0,
+    Round 3 R3-03). Binding open hypotheses together requires `ASSERT` —
+    proposing that a question exists is proposing. Binding an ALREADY
+    VALIDATED claim into a new constraint is something else: it re-opens a
+    settled question, drags an adjudicated claim back into UNDETERMINED,
+    and can only be cleared by someone holding ADJUDICATE. So it requires
+    `ADJUDICATE`.
+
+    Without that split, the layer had an asymmetric denial of service
+    confirmed by induction: an ASSERT-only actor minted junk hypotheses,
+    bound settled claims into unbounded new EXACTLY_ONE sets, and left a
+    growing wall of UNDETERMINED constraints that only a privileged actor
+    could clear. Nothing was corrupted — the claim stayed VALIDATED and
+    the bundle verified — but `standing()` became unreadable and the
+    adjudicator's queue became the attacker's to fill. One cheap call
+    creating work only a privileged actor can do is the shape of every
+    authority DoS.
+
+    The conservative default that made it exploitable is KEPT: an open
+    hypothesis still reads UNDETERMINED, never "false by default", because
+    reading "nobody has objected yet" as "true" is how a memory system
+    manufactures agreement. The fix prices the act, it does not soften
+    the semantics.
     """
     if constraint_type not in CONSTRAINTS:
         raise ValueError(f"constraint_type must be one of {list(CONSTRAINTS)}.")
@@ -488,13 +551,23 @@ def declare_set(cur, *, members: list[str], constraint_type: str,
         raise ValueError(
             "A constraint over fewer than two claims constrains nothing. "
             "If the point is that one claim is false, refute it.")
-    for cid in ms:
-        load_claim_state(cur, cid)
+    settled = [cid for cid in ms if load_claim_state(cur, cid).state == "VALIDATED"]
     sid = set_id if set_id is not None else f"claimset-{uuid.uuid4().hex[:16]}"
     custody.require_id(sid, "set_id")
     ts = created_at if created_at is not None else custody.now_ts()
-    gid = authority.gate(cur, actor_id=actor_id, capability="ASSERT",
-                         at_ts=ts, grant_id=grant_id)
+    needed = "ADJUDICATE" if settled else "ASSERT"
+    try:
+        gid = authority.gate(cur, actor_id=actor_id, capability=needed,
+                             at_ts=ts, grant_id=grant_id)
+    except ValueError as exc:
+        if needed == "ADJUDICATE":
+            raise ValueError(
+                f"{sorted(settled)} are already VALIDATED. Binding a settled "
+                "claim into a new constraint re-opens an adjudicated "
+                "question, so it requires ADJUDICATE and not ASSERT — "
+                f"otherwise anyone could fill a reviewer's queue for free. "
+                f"({exc})") from None
+        raise
     cur.execute(
         "INSERT INTO claim_sets (set_id, constraint_type, topic, reason, "
         "created_by, created_at, members_json, members_sha256) "

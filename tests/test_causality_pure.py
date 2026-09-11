@@ -229,6 +229,29 @@ raises("impact does not invent a subject",
        ValueError, "does not invent a subject")
 
 clean_report = causality.impact(cur, "mem-side")
+# Descent is SELF-ASSERTED and cannot be bilateral — the decision was
+# written before the derived memory existed and cannot name it back. So a
+# third party claiming descent from someone else's decision is graded
+# weaker rather than sitting silently in the strong bucket.
+authority.register_actor(cur, actor_id="rider", display_name="rider",
+                         kind="AGENT", issuer_id="root", reason="staffing")
+authority.grant(cur, subject_id="rider", capabilities=["STORE"],
+                issuer_id="root", reason="duty")
+field.store(cur, memory_id="mem-ride", content="riding someone else's decision",
+            embedding=emb(0.7, 0.3), embedding_model="dev", actor_id="rider",
+            reason="claiming descent from a decision I did not make",
+            derived_from_decision=decision.decision_id)
+conn.commit()
+graded = causality.impact(cur, "mem-poison")
+check("descent declared by the decision's OWN actor stays DERIVED",
+      "mem-note" in graded.derived_memories, str(graded.derived_memories))
+check("descent declared by a third party is DERIVED_UNATTESTED",
+      graded.derived_unattested == ("mem-ride",), str(graded.derived_unattested))
+check("the two buckets are disjoint",
+      not (set(graded.derived_memories) & set(graded.derived_unattested)))
+check("and the seal covers the distinction",
+      graded.impact_sha256 != report.impact_sha256)
+
 check("an uninvolved memory has an empty blast radius",
       not clean_report.direct_decisions and not clean_report.derived_memories,
       str(clean_report))

@@ -264,54 +264,82 @@ forensic tool debuggable. Together they compose into id enumeration for
 an actor with a narrow grant, and that is the honest statement of the
 trade rather than a bug anyone should fix by reflex.
 
-## Denial of epistemics: ASSERT is cheap, ADJUDICATE is not
+## Denial of epistemics: priced, not eliminated
 
-(Round 3, R3-03, CONFIRMED and NOT FIXED.) An actor holding only
+(Round 3, R3-03 — CONFIRMED, and since CLOSED for the case that mattered.) An actor holding only
 `ASSERT` can mint junk hypotheses and bind an already-VALIDATED claim
 into new EXACTLY_ONE sets with them. Each set reads UNDETERMINED —
 correctly, because an open hypothesis must never be read as agreement —
 and only an `ADJUDICATE` holder can clear it. One cheap call creates work
 that only a privileged actor can do.
 
-Nothing is corrupted: the claim stays VALIDATED, the settled set stays
-SATISFIED, the bundle verifies. What degrades is the readability of
-`standing()` and the adjudicator's queue. It is the taint DoS one level
-up, and the influence budget's answer there suggests the shape of the
-answer here. The recommendation on the table — requiring `ADJUDICATE` to
-bind a VALIDATED claim into a NEW constraint, since re-opening a settled
-question is an adjudication-level act — is designed and not built.
+C6 now prices that act: binding an already-VALIDATED claim into a NEW
+constraint requires `ADJUDICATE`, because re-opening a settled question
+IS an adjudication. The conservative default that made it exploitable is
+kept exactly as it was — an open hypothesis still reads UNDETERMINED,
+never "false by default" — because reading "nobody has objected yet" as
+"true" is how a memory system manufactures agreement.
 
-## DERIVED is the one relation MNEME does not make bilateral
+WHAT REMAINS. Minting junk hypotheses against claims that are still OPEN
+is still cheap, and still creates work. C6 protects settled questions,
+not unsettled ones, and there is no principled way to protect the
+unsettled ones without making disagreement itself expensive — which
+would be a worse system. A per-actor rate discipline is the obvious next
+tool and is deliberately not in the protocol: rate limits are a
+deployment concern, and putting one in the evidence layer would make two
+honest fields produce different verdicts on the same acts.
 
-(Round 3, R3-04, CONFIRMED and NOT FIXED.) Contradiction, lineage and
+## DERIVED is the one relation MNEME cannot make bilateral
+
+(Round 3, R3-04 — CONFIRMED, and since GRADED rather than fixed.) Contradiction, lineage and
 decision-use are all bilateral: both sides record them or the relation
 does not exist. Descent is not. `derived_from_decision` is written by the
 storing actor into its own STORED payload, and neither the named decision
 nor the ancestor memory corroborates it.
 
-So an actor holding `STORE` and `DECIDE` can make its own memory appear
-DERIVED from an honest one, and co-serving inflates POSSIBLE for free.
-`impact()` never quarantines, so the damage is to an analyst's reading
-rather than to the field — but a report an attacker can shape is weaker
-evidence than its seal suggests, and that is worth knowing before anyone
-treats a blast radius as proof rather than as a lead.
+It CANNOT be made bilateral, and that is the honest statement rather than
+a deferral: the decision was written before the derived memory existed
+and cannot name back something that did not yet exist.
 
-## A6 is read-then-write, and SQLite hides it
+So the level is GRADED instead. `derived_memories` holds descent declared
+by the cited decision's OWN actor — one actor's coherent account of its
+own work. `derived_unattested` holds a third party's claim of descent
+from someone else's decision, which is strictly weaker and is reported
+apart so a shaped report cannot borrow the strong bucket's weight.
 
-(Round 3, R3-06, FALSIFIED on SQLite, CONFIRMED as a portability defect.)
-`revoke()` checks "would this leave the field without a GRANT holder?"
-and then appends. Two concurrent revokes each skipping a different holder
-both pass that check — confirmed by induction — and SQLite's
-single-writer lock refuses the second transaction, which is the only
-reason A6 holds today.
+WHAT REMAINS. Both buckets are still self-assertions; the grading says
+WHO asserted, not whether it is true. An actor can still inflate its own
+attested bucket about its own decisions, and co-serving still inflates
+POSSIBLE for free. `impact()` never quarantines, so the damage is to an
+analyst's reading rather than to the field — but a blast radius is a
+lead, never a proof, and the seal on it proves only that the report was
+computed from this state, not that the state was not shaped.
 
-Under snapshot isolation, both would commit and A6 would be an unenforced
-comment. The same shape as Round 2's H4 in code written after it, and the
-fix pattern is already in this codebase: re-assert the precondition inside
-the write and let `rowcount` be the verdict. `bootstrap_root`'s COUNT had
-the identical defect and is now closed structurally by the `ledger_root`
-singleton; A6 is not, and it should be ported before the CockroachDB
-port rather than during it.
+## A6 is a write-time invariant, and evidence cannot carry it
+
+(Round 3, R3-06 and R3-07 — both CLOSED.) A6 was a read inside
+`revoke()`: non-atomic, and guarding only one of the two paths that can
+lose a GRANT holder. QUARANTINE walked straight past it, and two
+individually legitimate acts — quarantine the only GRANT holder, then let
+the responder rotate itself off — left a field that could never grant,
+register or reinstate again. It is now a `governance` counter under a
+`CHECK`, decremented by a conditional `UPDATE` whose rowcount is the
+verdict, on every losing path.
+
+WHAT REMAINS, and it is a property of the idea rather than the
+implementation: **A6 is a write-time invariant and cannot be an evidence
+property.** A bricked field still exports a bundle that verifies —
+correctly, because the chains are honest evidence of a bricked field. No
+bundle check guards A6 and none should; it is tested by refusal in
+`tests/test_authority_pure.py`, and the mutation suite says so in its own
+header, because a mutation suite over evidence is the wrong instrument
+for a rule about what may be written.
+
+Second: the counter is a CACHE. It is derived from the chains, lazily
+materialised for fields bootstrapped before it existed, and B7 re-derives
+governance from evidence and never from it — the same contract
+`actors.status` has. A hand-edited counter cannot authorize anything; it
+can only refuse.
 
 ## Non-interference is proven per QUERY, and only over recall
 
@@ -411,7 +439,7 @@ export is the only one that proves a sweep flagged everything it should
 have — the same shape as the existing partial-export limitation below,
 for the same reason.
 
-## Semantic mutants: 14 killed, 3 declared survivors — and what they missed
+## Semantic mutants: 15 killed, 3 declared survivors — and what they missed
 
 `tests/test_semantic_mutants.py` patches MNEME's SEMANTICS, lets the
 patched code produce real evidence, and asks whether anything refuses
@@ -430,9 +458,11 @@ must be arithmetically DUE, not merely recorded — a writer that quietly
 narrowed the comparison satisfied every check MNEME had) and
 `taint_protocol` 2.0.0 (the sweep re-derivation above).
 
-AND IT MISSED THE TWO THAT MATTERED MOST. Round 3 found the
-counterfactual disclosure oracle and the unreachable root check, and 14/14
-had nothing to say about either. The reason is structural and worth
+AND IT MISSED THE ONES THAT MATTERED MOST. Round 3 found the
+counterfactual disclosure oracle, the unreachable root check, a
+permanently brickable field and a self-revocation that produced
+unverifiable evidence, and a perfect mutation score had nothing to say
+about any of them. The reason is structural and worth
 keeping in view: the same author wrote the mutants and the defenses, so
 the metric measured internal coherence rather than robustness. Both are
 mutants now — kept as markers of the blind spot, not as evidence of

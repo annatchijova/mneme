@@ -264,6 +264,42 @@ check("and EXACTLY_ONE refuses a set where nothing survives",
       claims.evaluate_constraint("EXACTLY_ONE",
                                  {a: "REFUTED", b: "REFUTED"})[0] == "VIOLATED")
 
+# ========================== re-opening a settled question is an adjudication
+print("\n[ASSERT is cheap; a reviewer's queue is not]")
+junk = claims.assert_claim(cur, statement="1.4.0 shipped on 2026-11-11.",
+                           actor_id="archivist", topic="release-date",
+                           reason="i read it somewhere")
+conn.commit()
+raises("an ASSERT-only actor cannot drag a VALIDATED claim back into dispute",
+       lambda: claims.declare_set(cur, members=[c_mar3, junk],
+                                  constraint_type="EXACTLY_ONE",
+                                  actor_id="archivist",
+                                  reason="surely one of these"),
+       ValueError, "requires ADJUDICATE and not ASSERT")
+conn.rollback()
+junk = claims.assert_claim(cur, statement="1.4.0 shipped on 2026-11-11.",
+                           actor_id="archivist", topic="release-date",
+                           reason="i read it somewhere")
+open_pair = claims.assert_claim(cur, statement="1.4.0 shipped on 2026-12-12.",
+                                actor_id="archivist", topic="release-date",
+                                reason="another open reading")
+conn.commit()
+check("binding two OPEN hypotheses still costs only ASSERT",
+      isinstance(claims.declare_set(cur, members=[junk, open_pair],
+                                    constraint_type="AT_MOST_ONE",
+                                    actor_id="archivist",
+                                    reason="two open readings"), str))
+conn.rollback()
+reopened = claims.declare_set(cur, members=[c_mar3, junk],
+                              constraint_type="EXACTLY_ONE",
+                              actor_id="adjudicator",
+                              reason="genuinely new evidence has appeared")
+conn.commit()
+check("an ADJUDICATE holder may re-open a settled question",
+      claims.evaluate_set(cur, reopened).status == "UNDETERMINED")
+check("...and the conservative default is untouched: open is not agreement",
+      "still open" in claims.evaluate_set(cur, reopened).explanation)
+
 # ======================================= the custody gate reaches the claims
 print("\n[a claim cannot stand on material the field refuses to serve]")
 trust.quarantine_memory(cur, memory_id="doc-changelog", actor_id="ir",

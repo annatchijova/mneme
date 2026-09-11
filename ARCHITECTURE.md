@@ -72,7 +72,7 @@ decision, not a quiet patch.
   audited event with a stated reason, never a row removal or column
   edit.
 
-- **A1–A7 — Authority is delegated, never invented.** Every mutation
+- **A1–A8 — Authority is delegated, never invented.** Every mutation
   names the grant it acted under (A1). Authority chains are per-actor,
   append-only, genesis bound to actor_id (A2). A grantor may only grant
   what it holds (A3), so every capability traces back by checkable
@@ -87,13 +87,15 @@ decision, not a quiet patch.
   documented bypass is a gate with a bypass (A7, found by Round 3 in
   this project's own new code).
 
-- **C1–C5 — A proposition is not a document.** A claim's statement is
+- **C1–C6 — A proposition is not a document.** A claim's statement is
   immutable; revision is supersession (C1). Claim chains are per-claim
   and genesis-bound (C2). A claim's STANDING is derived from evidence
   and never stored (C3) — a persisted confidence is a number whose
   derivation has been thrown away. Claim-to-claim relations are
-  bilateral (C4). And a resolution must leave its constraint satisfied,
-  checked in the same transaction that writes it (C5).
+  bilateral (C4). A resolution must leave its constraint satisfied,
+  checked in the same transaction that writes it (C5). And re-opening a
+  settled question is an adjudication: binding an already-VALIDATED claim
+  into a new constraint costs ADJUDICATE, not ASSERT (C6).
 
 - **M5 — Floats never decide.** Confidence arithmetic, promotion
   thresholds and recall ranking are exact `Fraction`; `Decimal` at

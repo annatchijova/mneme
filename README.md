@@ -111,6 +111,9 @@ caught, in both verifiers:
 | Change a rule and let old bundles acquire it | B0 — a bundle declares the semantics it was checked under |
 | Read a quarantined memory by pretending it is clean | Widening the custody gate needs COUNTERFACTUAL (Round 3, R3-01) |
 | Stand up a second root and ship one of them | B7 — every root chain travels, so the count is the real count (R3-02) |
+| Quarantine the last GRANT holder and brick the field | A6 is a constraint now, on every path that can lose one (R3-07) |
+| Ship a lineage claim whose counterpart stayed behind | B4 — declared in `excluded_lineage` or refused (Round 2, R2-04) |
+| Re-open a settled claim for the price of an ASSERT | C6 — re-opening an adjudicated question is an adjudication (R3-03) |
 
 ## The disciplines, in one paragraph
 
@@ -338,13 +341,15 @@ decision receipts, counterfactual contamination analysis, the influence
 budget, embedding provenance, temporal replay, the epistemic claims
 layer, and protocol versioning.
 
-Round 3 then audited that new surface and found two confirmed
+Round 3 then audited that new surface and found four confirmed
 vulnerabilities in it — a disclosure oracle in the counterfactual read
-path, and a global check the export made unreachable. Both are fixed
-here; three further findings are reported and named in
-`KNOWN_LIMITATIONS.md` rather than quietly closed.
+path, a global check the export made unreachable, a permanently brickable
+field, and a self-revocation that produced unverifiable evidence. All four
+are fixed, together with the last outstanding Round 2 recommendation
+(`excluded_lineage`, closing R2-04). What was not fixed is named in
+`KNOWN_LIMITATIONS.md` with the reasoning, rather than quietly closed.
 
-569/569 pure checks passing, plus 14/14 semantic mutants killed with
+615/615 pure checks passing, plus 15/15 semantic mutants killed with
 3 boundaries explicitly declared — and an audit that explains why that
 second number is a floor and not a ceiling.
 

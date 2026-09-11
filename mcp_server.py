@@ -950,7 +950,14 @@ def mneme_impact(memory_id: str) -> dict:
                 memory, and decisions that used it.
       DERIVED   could not be what it is without it: supersession
                 successors, and memories the agent itself declared it
-                wrote because of a contaminated decision.
+                wrote because of a contaminated decision. Descent is
+                SELF-ASSERTED and cannot be bilateral — the decision was
+                written before the derived memory existed and cannot name
+                it back — so the level is GRADED: DERIVED when the
+                declaring actor is the cited decision's own actor, and
+                DERIVED_UNATTESTED when a third party claims descent from
+                someone else's decision. The second is strictly weaker
+                and says so rather than sitting in the strong bucket.
       POSSIBLE  contact only: memories co-served in the same recall, and
                 RESONANT neighbours. Reported so an analyst sees the
                 perimeter; never acted on, never a custody status.
@@ -980,6 +987,12 @@ def mneme_impact(memory_id: str) -> dict:
                    "decisions": list(r.direct_decisions)},
         "DERIVED": {"memories": list(r.derived_memories),
                     "decisions": list(r.derived_decisions)},
+        "DERIVED_UNATTESTED": {
+            "memories": list(r.derived_unattested),
+            "note": ("a third party claimed descent from a decision it did "
+                     "not make — weaker than DERIVED, and reported apart "
+                     "from it so a shaped report cannot borrow its weight"),
+        },
         "POSSIBLE": {"memories": list(r.possible_memories),
                      "note": ("contact, not contamination — reported for "
                               "analyst review, never auto-flagged")},
@@ -1386,7 +1399,11 @@ def mneme_claim_set(
     Args:
         claim_ids: Comma-separated claim ids (at least two).
         constraint_type: AT_MOST_ONE, EXACTLY_ONE or INCOMPATIBLE.
-        actor_id: Who declares it — must hold ASSERT.
+        actor_id: Who declares it — must hold ASSERT for a set of OPEN
+            hypotheses, or ADJUDICATE if any member is already VALIDATED,
+            because binding a settled claim back into dispute re-opens an
+            adjudicated question. Without that price, anyone holding
+            ASSERT could fill a reviewer's queue for free.
         reason: Why these are mutually constrained (mandatory).
         topic: Optional grouping.
 

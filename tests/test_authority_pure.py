@@ -501,6 +501,77 @@ check("both implementations map events to the same capabilities",
       and authority.AUTHORITY_EVENT_CAPABILITY == offline.AUTHORITY_EVENT_CAPABILITY
       and set(authority.CAPABILITIES) == set(offline.CAPABILITIES))
 
+# ============================== A6 covers every path that can lose a holder
+print("\n[a field nobody can govern is indistinguishable from an attack]")
+conn9, cur9 = fresh_db()
+authority.bootstrap_root(cur9, actor_id="root", display_name="R",
+                         reason="genesis")
+for aid, caps in [("ir", ["QUARANTINE_ACTOR", "REVOKE"]), ("ops", ["GRANT"])]:
+    authority.register_actor(cur9, actor_id=aid, display_name=aid, kind="HUMAN",
+                             issuer_id="root", reason="staffing")
+    authority.grant(cur9, subject_id=aid, capabilities=caps, issuer_id="root",
+                    reason="duty")
+conn9.commit()
+check("governance is a counter, derived from the chains and cached",
+      cur9.execute("SELECT grant_holders FROM governance").fetchone()[0]
+      == len(authority.actors_holding_grant(cur9, custody.now_ts())) == 2)
+
+# The brick: quarantine the only GRANT holder, then let the responder rotate
+# itself off. Two individually legitimate acts; a field that can never grant,
+# register or reinstate again. A6 guarded the revoke and not the quarantine.
+authority.quarantine_actor_authority(cur9, subject_id="root", issuer_id="ir",
+                                     reason="root credentials compromised")
+cur9.execute("UPDATE actors SET status='QUARANTINED' WHERE actor_id='root'")
+conn9.commit()
+check("quarantining a non-last holder is still allowed",
+      authority.actors_holding_grant(cur9, custody.now_ts()) == ["ops"])
+raises("quarantining the LAST holder is refused",
+       lambda: authority.quarantine_actor_authority(
+           cur9, subject_id="ops", issuer_id="ir",
+           reason="and now the other one"),
+       ValueError, "Invariant A6")
+conn9.rollback()
+ops_grant = sorted(authority.load_state(cur9, "ops").grants)[0]
+raises("...and so is revoking it, by the same counter",
+       lambda: authority.revoke(cur9, subject_id="ops", grant_id=ops_grant,
+                                issuer_id="ir", reason="rotate"),
+       ValueError, "Invariant A6")
+conn9.rollback()
+check("reinstatement gives the holder back",
+      (authority.reinstate_actor(cur9, subject_id="root", issuer_id="ir",
+                                 reason="investigation cleared it") or True)
+      and authority.actors_holding_grant(cur9, custody.now_ts()) == ["ops", "root"])
+conn9.commit()
+check("the cached counter never drifts from the chains",
+      cur9.execute("SELECT grant_holders FROM governance").fetchone()[0]
+      == len(authority.actors_holding_grant(cur9, custody.now_ts())))
+raises("and the CHECK backs the guard even if a caller forgets it",
+       lambda: cur9.execute("UPDATE governance SET grant_holders = 0"),
+       Exception, "CHECK")
+conn9.rollback()
+agree("a governed field still verifies", bundle.export_bundle(cur9), True)
+
+# ============ an event is authorized by the state BEFORE it, never by its own
+print("\n[an act judged by the state it creates is judged by its own effect]")
+conn10, cur10 = fresh_db()
+authority.bootstrap_root(cur10, actor_id="root", display_name="R",
+                         reason="genesis")
+authority.register_actor(cur10, actor_id="ir", display_name="ir", kind="HUMAN",
+                         issuer_id="root", reason="staffing")
+ir_grant = authority.grant(cur10, subject_id="ir",
+                           capabilities=["QUARANTINE_ACTOR", "REVOKE"],
+                           issuer_id="root", reason="incident duty")
+conn10.commit()
+authority.revoke(cur10, subject_id="ir", grant_id=ir_grant, issuer_id="ir",
+                 reason="rotating myself off the incident")
+conn10.commit()
+check("an actor may rotate itself off",
+      authority.effective_capabilities(cur10, "ir") == frozenset())
+agree("...and the bundle of that ordinary act verifies",
+      bundle.export_bundle(cur10), True)
+check("the write path and B7 agree about the same act",
+      bundle.verify_bundle(bundle.export_bundle(cur10))[0])
+
 # ================================================== two roots, and the export
 print("\n[a check that cannot see what it checks is not a check]")
 raises("the root act is now refused by a CONSTRAINT, not only a read",

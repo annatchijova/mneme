@@ -32,6 +32,16 @@ closed, and both are in the protocol versions: replay_protocol 1.1.0
 taint_protocol 2.0.0 (an included sweep's flagged set is re-derived from
 custody evidence rather than trusted to agree with its own seal).
 
+NOT EVERY INVARIANT IS AN EVIDENCE PROPERTY, and this file can only ask
+about the ones that are. A6 — the field always retains an actor holding
+GRANT — is a WRITE-TIME invariant: a bricked field produces a bundle that
+verifies, correctly, because the chains are honest evidence of a bricked
+field. Removing the A6 guard would therefore "survive" here while being a
+serious defect, so A6 is tested by REFUSAL in tests/test_authority_pure.py
+instead. A mutation suite over evidence is the wrong instrument for a rule
+about what may be written, and pretending otherwise would be the second
+way this file could mislead.
+
 It did NOT find the two that Round 3 did — the counterfactual disclosure
 oracle and the unreachable root check — and that is the more useful fact
 about it. The author of a mutant who also wrote the defenses writes
@@ -53,8 +63,10 @@ from fractions import Fraction
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from mneme import (authority, bundle, causality, counterfactual,  # noqa: E402
+from mneme import (authority, bundle, causality, claims, counterfactual,  # noqa: E402
                    custody, field, trust)
+
+_real_load_claim_state = claims.load_claim_state
 from mneme.canonical import canonical_json  # noqa: E402
 
 _spec = importlib.util.spec_from_file_location(
@@ -509,6 +521,52 @@ def m_second_root():
     ok, errs = verdict(bundle.export_bundle(cur))
     conn.close()
     return (not ok), (errs[0] if errs else "")
+
+
+@mutant("a set re-opens a settled claim under ASSERT alone")
+def m_reopen_under_assert():
+    """
+    C6: binding an already-VALIDATED claim into a new constraint re-opens
+    an adjudicated question and costs ADJUDICATE. The mutation is a writer
+    that charges ASSERT for it — and B9 has to agree with the write path
+    about which capability an act required, or an honest re-opening looks
+    forged and a cheap one looks honest.
+    """
+    conn, cur = fresh()
+    authority.grant(cur, subject_id="agent", capabilities=["ASSERT"],
+                    issuer_id="root", reason="scribe duty")
+    a = claims.assert_claim(cur, statement="A", actor_id="agent", reason="r")
+    b = claims.assert_claim(cur, statement="B", actor_id="agent", reason="r")
+    sid = claims.declare_set(cur, members=[a, b], constraint_type="EXACTLY_ONE",
+                             actor_id="agent", reason="one of these")
+    authority.grant(cur, subject_id="ir", capabilities=["ADJUDICATE"],
+                    issuer_id="root", reason="reviewer duty")
+    claims.resolve_set(cur, set_id=sid, validate=[a], refute=[b],
+                       actor_id="ir", reason="ruled")
+    junk = claims.assert_claim(cur, statement="C", actor_id="agent", reason="r")
+    conn.commit()
+    # The mutation: price the act as ASSERT regardless of what it re-opens.
+    with patched(claims, "load_claim_state",
+                 lambda cur_, cid: _forced_open(claims, cur_, cid)):
+        try:
+            claims.declare_set(cur, members=[a, junk],
+                               constraint_type="EXACTLY_ONE", actor_id="agent",
+                               reason="surely one of these")
+        except Exception as exc:                              # noqa: BLE001
+            conn.close()
+            return True, f"refused at write: {exc}"
+    conn.commit()
+    ok, errs = verdict(bundle.export_bundle(cur))
+    conn.close()
+    return (not ok), (errs[0] if errs else "")
+
+
+def _forced_open(mod, cur, cid):
+    """A load_claim_state that never reports VALIDATED — the mutation."""
+    st = mod.load_claim_state.__wrapped__(cur, cid) if hasattr(
+        mod.load_claim_state, "__wrapped__") else _real_load_claim_state(cur, cid)
+    st.state = "ASSERTED"
+    return st
 
 
 @mutant("a hostile exporter omits an authority chain entirely",

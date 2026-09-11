@@ -166,6 +166,38 @@ CREATE TABLE IF NOT EXISTS ledger_root (
 );
 
 -- -----------------------------------------------------------------------------
+-- governance — Invariant A6, as a CONSTRAINT instead of a promise.
+--
+-- A6 says the field always retains at least one ACTIVE actor holding GRANT:
+-- a field nobody can ever authorize anything in, including its own repair,
+-- is indistinguishable from a successful attack. The first implementation
+-- checked it with a read inside revoke() and nowhere else, which left two
+-- holes an audit found:
+--
+--   * QUARANTINE was not guarded at all. Quarantining the last GRANT holder
+--     emptied governance silently, and a following self-revocation by the
+--     responder left a field that could never grant, register, or reinstate
+--     again — permanently bricked, by two individually legitimate acts.
+--   * The revoke check was read-then-write. Two concurrent revokes each
+--     skipping a different holder both pass; only SQLite's single-writer
+--     lock serialised them, and an engine at READ COMMITTED would not.
+--
+-- One counter on one row answers both. The CHECK makes zero a constraint
+-- violation; the conditional UPDATE (`WHERE holders > 1`) makes the
+-- decrement atomic, because two transactions touching the SAME ROW
+-- serialise on its lock under every engine worth porting to, rather than
+-- relying on an isolation level a config flip can change.
+--
+-- It holds no authority. It is a cache of a fact the chains already carry,
+-- like actors.status, and B7 re-derives governance from evidence — never
+-- from here.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS governance (
+    singleton     INTEGER PRIMARY KEY CHECK (singleton = 1),
+    grant_holders INTEGER NOT NULL CHECK (grant_holders >= 1)
+);
+
+-- -----------------------------------------------------------------------------
 -- cell_links — raven-memory's ternary links between memories.
 -- RESONANT amplifies neighbours; INHIBITORY silences contradictions.
 -- Link creation/removal is a state change => custody events on BOTH ends.
