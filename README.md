@@ -258,6 +258,10 @@ What neither had, and MNEME adds:
     mneme/bundle.py       evidence bundle export + verification (B0–B9)
     mneme/schema.sql      SQLite WAL, Phase 1; written to port to
                           CockroachDB mechanically
+    SPEC.md               the protocol as a normative document, written
+                          so a third party can implement a conforming
+                          verifier without reading the Python — and
+                          disagree, which is the point
     verify_offline.py     standalone stdlib-only verifier — send this
                           file plus a bundle to an auditor; they need
                           nothing else
@@ -357,7 +361,7 @@ are fixed, together with the last outstanding Round 2 recommendation
 (`excluded_lineage`, closing R2-04). What was not fixed is named in
 `KNOWN_LIMITATIONS.md` with the reasoning, rather than quietly closed.
 
-615/615 pure checks passing, plus 16/16 semantic mutants killed with
+695/695 pure checks passing, plus 16/16 semantic mutants killed with
 3 boundaries explicitly declared — and an audit that explains why that
 second number is a floor and not a ceiling.
 
