@@ -121,6 +121,7 @@ from dataclasses import dataclass, field as _dc_field
 from typing import Any
 
 from .canonical import canonical_json
+from . import chain as _chain
 from . import custody
 
 # ---------------------------------------------------------------------------
@@ -218,9 +219,51 @@ AUTHORITY_EVENT_CAPABILITY: dict[str, str] = {
     "ACTOR_REINSTATED": "QUARANTINE_ACTOR",
 }
 
-_AUTHORITY_GENESIS_PREFIX = b"MNEME_AUTHORITY_GENESIS:"
-
 _GRANT_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_\-.:]{1,64}$")
+
+# ---------------------------------------------------------------------------
+# The chain shape, declared
+# ---------------------------------------------------------------------------
+
+# Authority's instance of the shared chain core (mneme/chain.py). Same
+# shape as custody's — genesis bound to the subject, the same hashed
+# envelope, dense seq, one birth event — over a different table, a
+# different prefix, and different words. What is NOT here is what an
+# authority event means: that is replay_authority(), below, and it is the
+# part that has no custody analogue.
+#
+# birth_payload_check is absent on purpose: registering an identity seals
+# nothing. Custody's birth seals content, claims' birth seals a statement;
+# an actor is simply declared to exist, and what it may DO arrives later,
+# as GRANTED events an issuer had to be authorized to write.
+SPEC = _chain.ChainSpec(
+    kind="authority",
+    table="authority_chain",
+    genesis_prefix=b"MNEME_AUTHORITY_GENESIS:",
+    subject_key="subject_id",
+    actor_key="issuer_id",
+    birth_event="ACTOR_REGISTERED",
+    event_types=AUTHORITY_EVENT_TYPES,
+    where_fmt="{subject} authority seq {seq}",
+    empty_chain=("{subject}: empty authority chain — an actor with no "
+                 "registration event."),
+    birth_required=("First authority event for {subject} must be "
+                    "ACTOR_REGISTERED, got {event}. An identity is "
+                    "registered before it is empowered."),
+    birth_repeated=("{subject} already has an authority chain; registration "
+                    "is a birth event and an identity is born once."),
+    unknown_event=("Unknown authority event_type {event!r}. The vocabulary "
+                   "is closed; extending it is a protocol change, not a "
+                   "call-site choice."),
+    unreasoned=("reason must be a non-empty string — an unreasoned grant "
+                "is a grant nobody can review."),
+    tampered="grant tampered",
+    rogue_offset="grant lifetimes",
+)
+
+_AUTHORITY_GENESIS_PREFIX = SPEC.genesis_prefix
+
+AUTHORITY_COLS = SPEC.columns
 
 
 def required_capability(event_type: str, payload: dict[str, Any]) -> str:
@@ -245,10 +288,7 @@ def required_capability(event_type: str, payload: dict[str, Any]) -> str:
 
 
 def authority_genesis_hash(subject_id: str) -> str:
-    custody.require_id(subject_id, "subject_id")
-    return hashlib.sha256(
-        _AUTHORITY_GENESIS_PREFIX + subject_id.encode("utf-8")
-    ).hexdigest()
+    return _chain.genesis_hash(SPEC, subject_id)
 
 
 # ---------------------------------------------------------------------------
@@ -266,21 +306,12 @@ def compute_authority_hash(
     created_at: str,
     payload: dict[str, Any],
 ) -> tuple[str, str]:
-    """Returns (entry_hash, canonical_payload_json). Same contract as custody."""
-    envelope = {
-        "subject_id": subject_id,
-        "seq": seq,
-        "event_type": event_type,
-        "issuer_id": issuer_id,
-        "reason": reason,
-        "created_at": created_at,
-        "payload": payload,
-    }
-    canonical = canonical_json(envelope)
-    entry_hash = hashlib.sha256(
-        prev_hash.encode("ascii") + canonical.encode("utf-8")
-    ).hexdigest()
-    return entry_hash, canonical_json(payload)
+    """Returns (entry_hash, canonical_payload_json). Same contract as custody —
+    now literally the same code, in chain.compute_hash."""
+    return _chain.compute_hash(
+        SPEC, prev_hash=prev_hash, subject_id=subject_id, seq=seq,
+        event_type=event_type, actor_id=issuer_id, reason=reason,
+        created_at=created_at, payload=payload)
 
 
 @dataclass(frozen=True)
@@ -294,10 +325,6 @@ class AuthorityEntry:
     payload_json: str
     prev_hash: str
     entry_hash: str
-
-
-AUTHORITY_COLS = ["subject_id", "seq", "event_type", "issuer_id", "reason",
-                  "created_at", "payload_json", "prev_hash", "entry_hash"]
 
 
 def append_authority_event(
@@ -314,57 +341,10 @@ def append_authority_event(
     Append one authority event. NEVER commits — the caller's transaction
     also carries whatever this event authorizes or records.
     """
-    custody.require_id(subject_id, "subject_id")
-    custody.require_id(issuer_id, "issuer_id")
-    if event_type not in AUTHORITY_EVENT_TYPES:
-        raise ValueError(
-            f"Unknown authority event_type {event_type!r}. The vocabulary is "
-            "closed; extending it is a protocol change, not a call-site choice."
-        )
-    if not isinstance(reason, str) or not reason.strip():
-        raise ValueError(
-            "reason must be a non-empty string — an unreasoned grant is a "
-            "grant nobody can review."
-        )
-
-    cur.execute(
-        "SELECT seq, entry_hash FROM authority_chain WHERE subject_id = ? "
-        "ORDER BY seq DESC LIMIT 1",
-        (subject_id,),
-    )
-    row = cur.fetchone()
-    if row is None:
-        if event_type != "ACTOR_REGISTERED":
-            raise ValueError(
-                f"First authority event for {subject_id} must be "
-                f"ACTOR_REGISTERED, got {event_type}. An identity is "
-                "registered before it is empowered."
-            )
-        seq = 0
-        prev_hash = authority_genesis_hash(subject_id)
-    else:
-        if event_type == "ACTOR_REGISTERED":
-            raise ValueError(
-                f"{subject_id} already has an authority chain; registration "
-                "is a birth event and an identity is born once."
-            )
-        seq = int(row[0]) + 1
-        prev_hash = str(row[1])
-
-    ts = created_at if created_at is not None else custody.now_ts()
-    entry_hash, payload_canon = compute_authority_hash(
-        prev_hash=prev_hash, subject_id=subject_id, seq=seq,
-        event_type=event_type, issuer_id=issuer_id, reason=reason,
-        created_at=ts, payload=payload,
-    )
-    cur.execute(
-        "INSERT INTO authority_chain "
-        "(subject_id, seq, event_type, issuer_id, reason, created_at, "
-        " payload_json, prev_hash, entry_hash) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (subject_id, seq, event_type, issuer_id, reason, ts,
-         payload_canon, prev_hash, entry_hash),
-    )
+    seq, prev_hash, entry_hash, payload_canon, ts = _chain.append(
+        cur, SPEC, subject_id=subject_id, event_type=event_type,
+        actor_id=issuer_id, reason=reason, payload=payload,
+        created_at=created_at)
     return AuthorityEntry(
         subject_id=subject_id, seq=seq, event_type=event_type,
         issuer_id=issuer_id, reason=reason, created_at=ts,
@@ -380,70 +360,12 @@ def verify_authority_rows(subject_id: str,
                           rows: list[dict[str, Any]]) -> tuple[bool, list[str]]:
     """
     Verify one actor's full authority chain, given rows in ASCENDING seq.
-    Pure — the same checks as custody's chain verification, against the
-    authority envelope and genesis. Structure first; meaning comes after,
-    in replay_authority().
+    Pure — the same checks as custody's chain verification, because it is
+    the same implementation (chain.verify_rows) against the authority
+    envelope and genesis. Structure first; meaning comes after, in
+    replay_authority().
     """
-    errors: list[str] = []
-    if not rows:
-        return False, [f"{subject_id}: empty authority chain — an actor with "
-                       "no registration event."]
-
-    expected_prev = authority_genesis_hash(subject_id)
-    prev_ts: str | None = None
-    for i, r in enumerate(rows):
-        where = f"{subject_id} authority seq {r.get('seq')}"
-        if r.get("seq") != i:
-            errors.append(f"{where}: seq not dense (expected {i}).")
-            return False, errors
-        et = r.get("event_type")
-        if et not in AUTHORITY_EVENT_TYPES:
-            errors.append(f"{where}: unknown event_type {et!r}.")
-            return False, errors
-        if i == 0 and et != "ACTOR_REGISTERED":
-            errors.append(f"{where}: chain does not begin with ACTOR_REGISTERED.")
-            return False, errors
-        if i > 0 and et == "ACTOR_REGISTERED":
-            errors.append(f"{where}: ACTOR_REGISTERED after birth.")
-            return False, errors
-        if r.get("prev_hash") != expected_prev:
-            errors.append(f"{where}: prev_hash does not link (chain broken or grafted).")
-            return False, errors
-
-        try:
-            payload = json.loads(r["payload_json"])
-        except Exception:
-            errors.append(f"{where}: payload_json is not valid JSON.")
-            return False, errors
-        if canonical_json(payload) != r["payload_json"]:
-            errors.append(f"{where}: stored payload_json is not canonical — "
-                          "stored bytes and hashed bytes have drifted.")
-            return False, errors
-
-        recomputed, _ = compute_authority_hash(
-            prev_hash=r["prev_hash"], subject_id=subject_id, seq=r["seq"],
-            event_type=et, issuer_id=r["issuer_id"], reason=r["reason"],
-            created_at=r["created_at"], payload=payload,
-        )
-        if recomputed != r["entry_hash"]:
-            errors.append(f"{where}: entry_hash does not recompute — grant tampered.")
-            return False, errors
-
-        ts = r["created_at"]
-        if not isinstance(ts, str) or not custody._TS_PATTERN.match(ts):
-            errors.append(f"{where}: created_at {ts!r} is not canonical UTC "
-                          "microsecond ISO 8601 (…+00:00) — a rogue offset "
-                          "would make grant lifetimes a lie.")
-            return False, errors
-        if prev_ts is not None and ts < prev_ts:
-            errors.append(f"{where}: created_at {ts} precedes the previous "
-                          f"event's {prev_ts} — an authority chain cannot run "
-                          "backwards in time.")
-            return False, errors
-        prev_ts = ts
-        expected_prev = r["entry_hash"]
-
-    return True, []
+    return _chain.verify_rows(SPEC, subject_id, rows)
 
 
 @dataclass
@@ -662,13 +584,7 @@ def verify_authority_chain(cur, subject_id: str) -> tuple[bool, list[str]]:
 
 
 def load_authority_rows(cur, subject_id: str) -> list[dict[str, Any]]:
-    cur.execute(
-        "SELECT subject_id, seq, event_type, issuer_id, reason, created_at, "
-        "payload_json, prev_hash, entry_hash FROM authority_chain "
-        "WHERE subject_id = ? ORDER BY seq ASC",
-        (subject_id,),
-    )
-    return [dict(zip(AUTHORITY_COLS, r)) for r in cur.fetchall()]
+    return _chain.load_rows(cur, SPEC, subject_id)
 
 
 def load_state(cur, subject_id: str) -> AuthorityState:

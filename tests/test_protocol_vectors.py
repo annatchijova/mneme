@@ -41,10 +41,22 @@ before they were committed:
 The second number is the useful one: seventeen of twenty vectors depend
 on canonicalization, so the file has real reach into the protocol rather
 than sampling its edges.
+
+A LIMIT THIS FILE HIT IMMEDIATELY, recorded because it is the exact
+shape of what golden vectors cannot do. During the chain refactor these
+twenty vectors stayed green while mneme/authority.py carried TWO full
+implementations of its chain — the extracted one, and the original it
+was meant to replace, still in the file, shadowed by definition order.
+Byte-identical output, so nothing here could see it. Golden vectors
+prove the protocol did not move; they say nothing about whether the code
+that moved it is gone. The duplicate-definition scan at the end of this
+file is what covers that, and it is here because this file is where a
+refactor comes to be checked.
 """
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
@@ -228,6 +240,28 @@ print("\n[the protocol version table is itself part of the protocol]")
 vector("declared protocol versions",
        hashlib.sha256(bundle.canonical_json(
            dict(protocol.CURRENT_PROTOCOLS)).encode("utf-8")).hexdigest(), "7606951289558d3c9e6e0fa34293fe5d01fd51dfb4279084b5385e6048e0c5e9")
+
+print("\n[no module carries two implementations of the same thing]")
+# The check the vectors above cannot perform. A refactor that extracts
+# shared code and leaves the original behind produces IDENTICAL bytes —
+# Python simply uses whichever definition came last — so every digest
+# stays green while the duplication the refactor was meant to remove is
+# still sitting in the file. This actually happened, to authority.py,
+# during the extraction of mneme/chain.py.
+for _mod in ("chain", "custody", "authority", "claims", "trust", "field",
+             "bundle", "causality", "counterfactual", "protocol"):
+    _tree = ast.parse(open(os.path.join(
+        os.path.dirname(__file__), "..", "mneme", f"{_mod}.py")).read())
+    _names = [n.name for n in _tree.body
+              if isinstance(n, (ast.FunctionDef, ast.ClassDef))]
+    _dupes = sorted({n for n in _names if _names.count(n) > 1})
+    if _dupes:
+        print(f"  FAIL  mneme/{_mod}.py defines twice: {', '.join(_dupes)}")
+        print("        A shadowed duplicate is invisible to every byte-level "
+              "check in this file. Delete the dead one.")
+        FAIL += 1
+    else:
+        print(f"  ok  mneme/{_mod}.py")
 
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

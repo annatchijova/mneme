@@ -88,9 +88,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .canonical import canonical_json
-from . import authority, custody
-
-_CLAIM_GENESIS_PREFIX = b"MNEME_CLAIM_GENESIS:"
+from . import authority, chain as _chain, custody
 
 CLAIM_EVENT_TYPES = frozenset({
     "CLAIM_ASSERTED",    # seq 0; payload carries statement_sha256
@@ -123,14 +121,55 @@ CLAIM_EVENT_CAPABILITY: dict[str, str] = {
     "CLAIM_SUPERSEDED": "ASSERT",
 }
 
-CLAIM_COLS = ["claim_id", "seq", "event_type", "actor_id", "reason",
-              "created_at", "payload_json", "prev_hash", "entry_hash"]
+# ---------------------------------------------------------------------------
+# The chain shape, declared
+# ---------------------------------------------------------------------------
+
+# Claims' instance of the shared chain core (mneme/chain.py). Third and
+# last use of the same shape: genesis bound to the subject, one hashed
+# envelope, dense seq, one birth event. What a claim event MEANS is
+# replay_claim(), below — the state machine over ASSERTED / VALIDATED /
+# REFUTED / WITHDRAWN / SUPERSEDED that has no analogue in the other two.
+#
+# birth_payload_check is absent, and that is an ASYMMETRY worth naming
+# rather than quietly closing: custody refuses a STORED without
+# content_sha256 at WRITE, while claims catches a CLAIM_ASSERTED without
+# statement_sha256 only at REPLAY (see replay_claim). Both are caught, so
+# no unsealed assertion survives verification — but they are caught at
+# different moments, which means a claim chain can exist on disk in a
+# state a custody chain never can. Putting the three birth rules side by
+# side is what made that visible; closing it is a protocol change, not a
+# refactor, so it is recorded here and not done here.
+SPEC = _chain.ChainSpec(
+    kind="claim",
+    table="claim_chain",
+    genesis_prefix=b"MNEME_CLAIM_GENESIS:",
+    subject_key="claim_id",
+    actor_key="actor_id",
+    birth_event="CLAIM_ASSERTED",
+    event_types=CLAIM_EVENT_TYPES,
+    where_fmt="{subject} claim seq {seq}",
+    empty_chain="{subject}: empty claim chain — a proposition nobody asserted.",
+    birth_required=("First claim event for {subject} must be CLAIM_ASSERTED, "
+                    "got {event}. A proposition's history begins when "
+                    "someone asserts it."),
+    birth_repeated=("{subject} already has a chain; a claim is asserted "
+                    "once. Revision is supersession (Invariant C1)."),
+    unknown_event=("Unknown claim event_type {event!r}. The vocabulary is "
+                   "closed; extending it is a protocol change."),
+    unreasoned=("reason must be non-empty — an unreasoned epistemic act "
+                "cannot exist, same as an unreasoned custody event."),
+    tampered="claim evidence tampered",
+    rogue_offset="the order of epistemic acts",
+)
+
+_CLAIM_GENESIS_PREFIX = SPEC.genesis_prefix
+
+CLAIM_COLS = SPEC.columns
 
 
 def claim_genesis_hash(claim_id: str) -> str:
-    custody.require_id(claim_id, "claim_id")
-    return hashlib.sha256(
-        _CLAIM_GENESIS_PREFIX + claim_id.encode("utf-8")).hexdigest()
+    return _chain.genesis_hash(SPEC, claim_id)
 
 
 def statement_sha256(statement: str) -> str:
@@ -144,55 +183,18 @@ def compute_claim_hash(*, prev_hash: str, claim_id: str, seq: int,
                        event_type: str, actor_id: str, reason: str,
                        created_at: str,
                        payload: dict[str, Any]) -> tuple[str, str]:
-    envelope = {
-        "claim_id": claim_id, "seq": seq, "event_type": event_type,
-        "actor_id": actor_id, "reason": reason, "created_at": created_at,
-        "payload": payload,
-    }
-    canonical = canonical_json(envelope)
-    return (hashlib.sha256(prev_hash.encode("ascii")
-                           + canonical.encode("utf-8")).hexdigest(),
-            canonical_json(payload))
+    return _chain.compute_hash(
+        SPEC, prev_hash=prev_hash, subject_id=claim_id, seq=seq,
+        event_type=event_type, actor_id=actor_id, reason=reason,
+        created_at=created_at, payload=payload)
 
 
 def append_claim_event(cur, *, claim_id: str, event_type: str, actor_id: str,
                        reason: str, payload: dict[str, Any],
                        created_at: str | None = None) -> None:
-    custody.require_id(claim_id, "claim_id")
-    custody.require_id(actor_id, "actor_id")
-    if event_type not in CLAIM_EVENT_TYPES:
-        raise ValueError(
-            f"Unknown claim event_type {event_type!r}. The vocabulary is "
-            "closed; extending it is a protocol change.")
-    if not isinstance(reason, str) or not reason.strip():
-        raise ValueError("reason must be non-empty — an unreasoned epistemic "
-                         "act cannot exist, same as an unreasoned custody event.")
-    cur.execute("SELECT seq, entry_hash FROM claim_chain WHERE claim_id = ? "
-                "ORDER BY seq DESC LIMIT 1", (claim_id,))
-    row = cur.fetchone()
-    if row is None:
-        if event_type != "CLAIM_ASSERTED":
-            raise ValueError(
-                f"First claim event for {claim_id} must be CLAIM_ASSERTED, "
-                f"got {event_type}. A proposition's history begins when "
-                "someone asserts it.")
-        seq, prev_hash = 0, claim_genesis_hash(claim_id)
-    else:
-        if event_type == "CLAIM_ASSERTED":
-            raise ValueError(
-                f"{claim_id} already has a chain; a claim is asserted once. "
-                "Revision is supersession (Invariant C1).")
-        seq, prev_hash = int(row[0]) + 1, str(row[1])
-    ts = created_at if created_at is not None else custody.now_ts()
-    entry_hash, payload_canon = compute_claim_hash(
-        prev_hash=prev_hash, claim_id=claim_id, seq=seq, event_type=event_type,
-        actor_id=actor_id, reason=reason, created_at=ts, payload=payload)
-    cur.execute(
-        "INSERT INTO claim_chain (claim_id, seq, event_type, actor_id, reason, "
-        "created_at, payload_json, prev_hash, entry_hash) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (claim_id, seq, event_type, actor_id, reason, ts, payload_canon,
-         prev_hash, entry_hash))
+    _chain.append(cur, SPEC, subject_id=claim_id, event_type=event_type,
+                  actor_id=actor_id, reason=reason, payload=payload,
+                  created_at=created_at)
 
 
 # ---------------------------------------------------------------------------
@@ -202,52 +204,10 @@ def append_claim_event(cur, *, claim_id: str, event_type: str, actor_id: str,
 def verify_claim_rows(claim_id: str,
                       rows: list[dict[str, Any]]) -> tuple[bool, list[str]]:
     """Structure: genesis binding, dense seq, linkage, recomputation,
-    closed vocabulary, canonical payload bytes, canonical monotone UTC."""
-    errors: list[str] = []
-    if not rows:
-        return False, [f"{claim_id}: empty claim chain — a proposition nobody "
-                       "asserted."]
-    expected_prev = claim_genesis_hash(claim_id)
-    prev_ts: str | None = None
-    for i, r in enumerate(rows):
-        where = f"{claim_id} claim seq {r.get('seq')}"
-        if r.get("seq") != i:
-            return False, errors + [f"{where}: seq not dense (expected {i})."]
-        et = r.get("event_type")
-        if et not in CLAIM_EVENT_TYPES:
-            return False, errors + [f"{where}: unknown event_type {et!r}."]
-        if i == 0 and et != "CLAIM_ASSERTED":
-            return False, errors + [f"{where}: chain does not begin with "
-                                    "CLAIM_ASSERTED."]
-        if i > 0 and et == "CLAIM_ASSERTED":
-            return False, errors + [f"{where}: CLAIM_ASSERTED after birth."]
-        if r.get("prev_hash") != expected_prev:
-            return False, errors + [f"{where}: prev_hash does not link "
-                                    "(chain broken or grafted)."]
-        try:
-            payload = json.loads(r["payload_json"])
-        except Exception:
-            return False, errors + [f"{where}: payload_json is not valid JSON."]
-        if canonical_json(payload) != r["payload_json"]:
-            return False, errors + [f"{where}: payload_json is not canonical."]
-        recomputed, _ = compute_claim_hash(
-            prev_hash=r["prev_hash"], claim_id=claim_id, seq=r["seq"],
-            event_type=et, actor_id=r["actor_id"], reason=r["reason"],
-            created_at=r["created_at"], payload=payload)
-        if recomputed != r["entry_hash"]:
-            return False, errors + [f"{where}: entry_hash does not recompute "
-                                    "— claim evidence tampered."]
-        ts = r["created_at"]
-        if not isinstance(ts, str) or not custody._TS_PATTERN.match(ts):
-            return False, errors + [f"{where}: created_at {ts!r} is not "
-                                    "canonical UTC microsecond ISO 8601."]
-        if prev_ts is not None and ts < prev_ts:
-            return False, errors + [f"{where}: created_at {ts} precedes the "
-                                    "previous event — a claim's history "
-                                    "cannot run backwards."]
-        prev_ts = ts
-        expected_prev = r["entry_hash"]
-    return True, []
+    closed vocabulary, canonical payload bytes, canonical monotone UTC.
+    One implementation, in chain.verify_rows, shared with custody and
+    authority. Meaning comes after, in replay_claim()."""
+    return _chain.verify_rows(SPEC, claim_id, rows)
 
 
 @dataclass
@@ -383,9 +343,7 @@ def replay_claim(claim_id: str,
 
 
 def load_claim_rows(cur, claim_id: str) -> list[dict[str, Any]]:
-    cur.execute("SELECT " + ", ".join(CLAIM_COLS) + " FROM claim_chain "
-                "WHERE claim_id = ? ORDER BY seq ASC", (claim_id,))
-    return [dict(zip(CLAIM_COLS, r)) for r in cur.fetchall()]
+    return _chain.load_rows(cur, SPEC, claim_id)
 
 
 def load_claim_state(cur, claim_id: str) -> ClaimState:

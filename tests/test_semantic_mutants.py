@@ -42,6 +42,17 @@ instead. A mutation suite over evidence is the wrong instrument for a rule
 about what may be written, and pretending otherwise would be the second
 way this file could mislead.
 
+ONE MUTANT HERE TESTS THE VERIFIERS AGAINST EACH OTHER rather than the
+protocol against a writer. custody, authority and claims share a single
+implementation of the chain shape (mneme/chain.py); collapsing their three
+genesis prefixes into one is invisible to the package, because the package
+verifier re-derives genesis through the same code the writer used. Only
+verify_offline.py — which transcribes the three prefixes by hand and shares
+nothing with the package — refuses. That is the argument for keeping THAT
+duplication stated as a test instead of a paragraph: deduplicating inside
+the package is safe exactly to the extent that an independent implementation
+still disagrees when the package is wrong about itself.
+
 It did NOT find the two that Round 3 did — the counterfactual disclosure
 oracle and the unreachable root check — and that is the more useful fact
 about it. The author of a mutant who also wrote the defenses writes
@@ -63,8 +74,8 @@ from fractions import Fraction
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from mneme import (authority, bundle, causality, claims, counterfactual,  # noqa: E402
-                   custody, field, trust)
+from mneme import (authority, bundle, causality, chain, claims,  # noqa: E402
+                   counterfactual, custody, field, trust)
 
 _real_load_claim_state = claims.load_claim_state
 from mneme.canonical import canonical_json  # noqa: E402
@@ -567,6 +578,73 @@ def _forced_open(mod, cur, cid):
         mod.load_claim_state, "__wrapped__") else _real_load_claim_state(cur, cid)
     st.state = "ASSERTED"
     return st
+
+
+@mutant("the three chain kinds collapse onto one genesis prefix")
+def m_one_genesis_prefix():
+    """
+    The mutant this refactor makes possible, and the reason it is safe.
+
+    custody, authority and claims now share ONE implementation of the
+    chain shape (mneme/chain.py), each carrying its own genesis prefix in
+    a ChainSpec. That is a real concentration of risk: three prefixes
+    behind one line of code. A reimplementation — or a careless edit —
+    that folds them into a single constant destroys the property those
+    prefixes exist for, namely that a chain of one KIND cannot be
+    presented as a chain of another. Under this mutation an authority
+    chain and a claim chain for the same subject id share a seq-0
+    prev_hash, so a history of what an actor was ALLOWED to do and a
+    history of what someone CLAIMED are no longer distinguishable at
+    genesis.
+
+    And the package verifier cannot see it, correctly: it re-derives
+    genesis through the same mutated function, so writer and verifier
+    agree perfectly. A field like this is internally flawless.
+
+    What kills it is verify_offline.py, which transcribes all three
+    prefixes by hand and shares no code with the package. This is the
+    clearest demonstration in the suite of why THAT duplication is kept
+    while this one was removed: deduplicating inside the package is safe
+    precisely because an independent implementation still disagrees when
+    the package is wrong about itself.
+    """
+    one_prefix = b"MNEME_GENESIS:"
+
+    def collapsed(spec, subject_id):
+        chain.require_id(subject_id, spec.subject_key)
+        return hashlib.sha256(
+            one_prefix + subject_id.encode("utf-8")).hexdigest()
+
+    # The WHOLE field is built under the mutation — this models a build
+    # that never had three prefixes, not one that changed its mind. A
+    # field half-written under each would be caught by the package's own
+    # verifier as a broken chain, which would kill the mutant for the
+    # wrong reason and prove nothing about the offline verifier.
+    conn = sqlite3.connect(":memory:")
+    with open(os.path.join(os.path.dirname(__file__), "..",
+                           "mneme", "schema.sql")) as f:
+        conn.executescript(f.read())
+    cur = conn.cursor()
+    with patched(chain, "genesis_hash", collapsed):
+        authority.bootstrap_root(cur, actor_id="root", display_name="Root",
+                                 reason="field genesis")
+        authority.register_actor(cur, actor_id="ingest", display_name="ingest",
+                                 kind="AGENT", issuer_id="root",
+                                 reason="staffing")
+        authority.grant(cur, subject_id="ingest", capabilities=["STORE"],
+                        issuer_id="root", reason="duty")
+        field.store(cur, memory_id="m-1", content="a document",
+                    embedding=emb(1.0, 0.0), embedding_model="dev",
+                    actor_id="ingest", reason="ingest")
+        conn.commit()
+        ok_pkg, _ = bundle.verify_bundle(bundle.export_bundle(cur))
+        ok, errs = verdict(bundle.export_bundle(cur))
+    conn.close()
+    if not ok_pkg:
+        return False, ("the package verifier refused — the mutation was "
+                       "caught inside the package, so this says nothing "
+                       "about the independent one")
+    return (not ok), (errs[0] if errs else "")
 
 
 @mutant("a hostile exporter omits an authority chain entirely",

@@ -235,9 +235,17 @@ What neither had, and MNEME adds:
     mneme/claims.py       propositions as first-class objects with their
                           own chains, n-ary contradiction sets, standing
                           derived from evidence and never stored
+    mneme/chain.py        the shape all three chains share, once: genesis
+                          bound to the subject, the hashed envelope, dense
+                          seq, the birth-event rule, structural
+                          verification. Each chain declares a ChainSpec —
+                          its table, its prefix, its own words for
+                          refusing. What the events MEAN stays in the
+                          module that owns them.
     mneme/custody.py      per-memory hash chains: closed event vocabulary,
                           genesis bound to memory_id, append (caller owns
-                          the transaction), pure verification
+                          the transaction), pure verification, and replay
+                          — the part no other chain shares
     mneme/trust.py        actor quarantine, deterministic taint sweeps
                           sealed by hash, direct memory quarantine,
                           audited rehabilitation
