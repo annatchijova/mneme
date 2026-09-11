@@ -240,3 +240,82 @@ CREATE TABLE IF NOT EXISTS decisions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_decisions_receipt ON decisions (receipt_sha256);
+
+-- -----------------------------------------------------------------------------
+-- claims — the PROPOSITION, separated from the document (mneme/claims.py).
+--
+-- A memory used to do two jobs: the container (this text was stored, with
+-- this chain) and the epistemic unit (this is what the field believes).
+-- raven's topic+claim contradiction rule works only while every
+-- proposition lives in exactly one document and every document asserts
+-- exactly one proposition; neither is true of anything real.
+--
+-- statement is immutable (C1) — revision is supersession, an event, never
+-- an edit, the same rule M1 holds memories to. No confidence column
+-- exists anywhere here ON PURPOSE (C3): a claim's STANDING is recomputed
+-- from evidence, because a stored confidence is a number whose derivation
+-- has been thrown away.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS claims (
+    claim_id         TEXT PRIMARY KEY,
+    statement        TEXT NOT NULL CHECK (length(trim(statement)) > 0),
+    statement_sha256 TEXT NOT NULL CHECK (length(statement_sha256) = 64),
+    topic            TEXT,
+    created_by       TEXT NOT NULL REFERENCES actors(actor_id),
+    created_at       TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_claims_topic ON claims (topic);
+
+-- -----------------------------------------------------------------------------
+-- claim_chain — per-CLAIM tamper-evident hash chain. Third of its kind, and
+-- deliberately the same shape as the other two: genesis bound to claim_id,
+-- seq dense from 0, forks a constraint violation, reason NOT NULL, nothing
+-- deleted. Evidence links live HERE and not on the memory's chain: a claim
+-- is about memories, memories are not about claims, and a document whose
+-- history grew with every proposition that ever cited it would be carrying
+-- the epistemic unit's weight again.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS claim_chain (
+    claim_id      TEXT NOT NULL REFERENCES claims(claim_id),
+    seq           INTEGER NOT NULL CHECK (seq >= 0),
+    event_type    TEXT NOT NULL CHECK (event_type IN (
+                      'CLAIM_ASSERTED','EVIDENCE_LINKED','RELATED_TO',
+                      'SET_MEMBERSHIP','CLAIM_VALIDATED','CLAIM_REFUTED',
+                      'CLAIM_WITHDRAWN','CLAIM_SUPERSEDED')),
+    actor_id      TEXT NOT NULL REFERENCES actors(actor_id),
+    reason        TEXT NOT NULL CHECK (length(trim(reason)) > 0),
+    created_at    TEXT NOT NULL,
+    payload_json  TEXT NOT NULL,
+    prev_hash     TEXT NOT NULL CHECK (length(prev_hash) = 64),
+    entry_hash    TEXT NOT NULL CHECK (length(entry_hash) = 64),
+    PRIMARY KEY (claim_id, seq),
+    UNIQUE (claim_id, prev_hash),
+    UNIQUE (entry_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_claim_chain_actor ON claim_chain (actor_id);
+
+-- -----------------------------------------------------------------------------
+-- claim_sets — n-ary contradiction. "A contradicts B" is too poor for most
+-- real conflicts: a date is one of three candidates, a policy is one of
+-- several readings. A set is a CONSTRAINT over many hypotheses —
+-- AT_MOST_ONE, EXACTLY_ONE, or the weaker INCOMPATIBLE (they cannot all
+-- hold), which is often the only thing actually known.
+--
+-- members_sha256 seals the sorted member list, like a taint sweep, and
+-- every member's chain carries a SET_MEMBERSHIP event so the membership is
+-- RE-DERIVABLE from evidence rather than trusted to this row — the lesson
+-- taint_protocol 2.0.0 learned the hard way.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS claim_sets (
+    set_id          TEXT PRIMARY KEY,
+    constraint_type TEXT NOT NULL CHECK (constraint_type IN (
+                        'AT_MOST_ONE','EXACTLY_ONE','INCOMPATIBLE')),
+    topic           TEXT,
+    reason          TEXT NOT NULL CHECK (length(trim(reason)) > 0),
+    created_by      TEXT NOT NULL REFERENCES actors(actor_id),
+    created_at      TEXT NOT NULL,
+    members_json    TEXT NOT NULL,
+    members_sha256  TEXT NOT NULL CHECK (length(members_sha256) = 64)
+);

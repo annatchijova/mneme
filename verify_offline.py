@@ -102,6 +102,7 @@ AUTHORITY_EVENT_TYPES = frozenset({
 CAPABILITIES = frozenset({
     "STORE", "REINFORCE", "SUPERSEDE", "QUARANTINE_ACTOR",
     "QUARANTINE_MEMORY", "REHABILITATE", "GRANT", "REVOKE", "DECIDE",
+    "ASSERT", "ADJUDICATE",
 })
 # Custody event type -> capability its actor had to hold (authority.py).
 REQUIRED_CAPABILITY = {
@@ -124,17 +125,34 @@ AUTHORITY_EVENT_CAPABILITY = {
     "ACTOR_REINSTATED": "QUARANTINE_ACTOR",
 }
 PROTOCOL_NAMES = ("custody_protocol", "replay_protocol", "ranking_protocol",
-                  "taint_protocol", "authority_protocol", "receipt_protocol")
+                  "taint_protocol", "authority_protocol", "receipt_protocol",
+                  "claim_protocol")
+CLAIM_GENESIS_PREFIX = b"MNEME_CLAIM_GENESIS:"
+CLAIM_EVENT_TYPES = frozenset({
+    "CLAIM_ASSERTED", "EVIDENCE_LINKED", "RELATED_TO", "SET_MEMBERSHIP",
+    "CLAIM_VALIDATED", "CLAIM_REFUTED", "CLAIM_WITHDRAWN", "CLAIM_SUPERSEDED",
+})
+STANCES = ("SUPPORTS", "CONTRADICTS")
+RELATIONS = ("SUPPORTS", "CONTRADICTS", "SUPERSEDES", "DERIVED_FROM")
+# Which capability each claim event required of its actor. Asserting a
+# proposition and ruling between hypotheses are their own authorities.
+CLAIM_EVENT_CAPABILITY = {
+    "CLAIM_ASSERTED": "ASSERT", "EVIDENCE_LINKED": "ASSERT",
+    "RELATED_TO": "ASSERT", "SET_MEMBERSHIP": "ASSERT",
+    "CLAIM_VALIDATED": "ADJUDICATE", "CLAIM_REFUTED": "ADJUDICATE",
+    "CLAIM_WITHDRAWN": "ASSERT", "CLAIM_SUPERSEDED": "ASSERT",
+}
 # Every version this verifier actually implements (mneme/protocol.py).
 SUPPORTED_PROTOCOLS = {
     "custody_protocol": frozenset({"1.0.0", "1.1.0"}),
     "replay_protocol": frozenset({"1.0.0", "1.1.0"}),
     "ranking_protocol": frozenset({"1.0.0"}),
     "taint_protocol": frozenset({"1.0.0", "1.1.0", "2.0.0"}),
-    "authority_protocol": frozenset({"1.0.0"}),
+    "authority_protocol": frozenset({"1.0.0", "1.1.0"}),
     # receipt 1.0.0 is absent on purpose: its digest body differs, so this
     # verifier genuinely cannot check one.
     "receipt_protocol": frozenset({"2.0.0"}),
+    "claim_protocol": frozenset({"1.0.0"}),
 }
 GRANT_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_\-.:]{1,64}$")
 SUPPORTED_QUANTIZATION = frozenset({
@@ -816,6 +834,273 @@ def verify_causality(body: dict, memory_chains: list) -> tuple[list, list]:
     return errors, notes
 
 
+# --- B9: epistemic provenance (transcribed from mneme/claims.py) -----------
+
+def verify_claim_chain(claim_id: str, chain: list, errors: list) -> bool:
+    if not chain:
+        errors.append(f"B9: {claim_id}: empty claim chain.")
+        return False
+    expected_prev = sha256_hex(CLAIM_GENESIS_PREFIX + claim_id.encode("utf-8"))
+    prev_ts = None
+    for i, r in enumerate(chain):
+        where = f"B9: {claim_id} claim seq {r.get('seq')}"
+        if r.get("seq") != i:
+            errors.append(f"{where}: seq not dense (expected {i})."); return False
+        et = r.get("event_type")
+        if et not in CLAIM_EVENT_TYPES:
+            errors.append(f"{where}: unknown event_type {et!r}."); return False
+        if i == 0 and et != "CLAIM_ASSERTED":
+            errors.append(f"{where}: chain does not begin with CLAIM_ASSERTED."); return False
+        if i > 0 and et == "CLAIM_ASSERTED":
+            errors.append(f"{where}: CLAIM_ASSERTED after birth."); return False
+        if r.get("prev_hash") != expected_prev:
+            errors.append(f"{where}: prev_hash does not link (broken or grafted)."); return False
+        try:
+            payload = json.loads(r["payload_json"])
+        except Exception:
+            errors.append(f"{where}: payload_json is not valid JSON."); return False
+        try:
+            if canonical_json(payload) != r["payload_json"]:
+                errors.append(f"{where}: payload_json is not canonical bytes."); return False
+        except ValueError as e:
+            errors.append(f"{where}: {e}"); return False
+        envelope = {"claim_id": claim_id, "seq": r["seq"], "event_type": et,
+                    "actor_id": r["actor_id"], "reason": r["reason"],
+                    "created_at": r["created_at"], "payload": payload}
+        if sha256_hex(r["prev_hash"].encode("ascii")
+                      + canonical_json(envelope).encode("utf-8")) != r["entry_hash"]:
+            errors.append(f"{where}: entry_hash does not recompute — claim "
+                          "evidence tampered."); return False
+        ts = r["created_at"]
+        if not isinstance(ts, str) or not TS_PATTERN.match(ts):
+            errors.append(f"{where}: created_at {ts!r} is not canonical UTC."); return False
+        if prev_ts is not None and ts < prev_ts:
+            errors.append(f"{where}: created_at {ts} precedes the previous "
+                          "event — a claim's history cannot run backwards."); return False
+        prev_ts = ts
+        expected_prev = r["entry_hash"]
+    return True
+
+
+def replay_claim(claim_id: str, chain: list, errors: list) -> dict:
+    """The claim state machine (normative statement in claims.replay_claim)."""
+    st = {"state": "ASSERTED", "statement_sha256": "", "supports": [],
+          "contradicts": [], "relations": [], "sets": []}
+    for r in chain:
+        et, payload = r["event_type"], json.loads(r["payload_json"])
+        where = f"B9: {claim_id} claim seq {r['seq']}"
+        if et == "CLAIM_ASSERTED":
+            sha = payload.get("statement_sha256")
+            if not (isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{64}", sha)):
+                errors.append(f"{where}: CLAIM_ASSERTED without a statement hash.")
+            st["statement_sha256"] = sha or ""
+        elif et == "EVIDENCE_LINKED":
+            mid, stance = payload.get("memory_id"), payload.get("stance")
+            if not isinstance(mid, str) or stance not in STANCES:
+                errors.append(f"{where}: EVIDENCE_LINKED without a memory and a stance.")
+            elif stance == "SUPPORTS":
+                st["supports"].append(mid)
+            else:
+                st["contradicts"].append(mid)
+        elif et == "RELATED_TO":
+            other, rel = payload.get("other_claim_id"), payload.get("relation")
+            direction = payload.get("direction")
+            if not isinstance(other, str) or rel not in RELATIONS \
+                    or direction not in ("OUT", "IN"):
+                errors.append(f"{where}: RELATED_TO without a claim, a relation "
+                              "and a direction.")
+            else:
+                st["relations"].append((rel, direction, other))
+        elif et == "SET_MEMBERSHIP":
+            sid = payload.get("set_id")
+            if not isinstance(sid, str):
+                errors.append(f"{where}: SET_MEMBERSHIP without a set_id.")
+            else:
+                st["sets"].append(sid)
+        elif et == "CLAIM_VALIDATED":
+            if st["state"] != "ASSERTED":
+                errors.append(f"{where}: CLAIM_VALIDATED from {st['state']}, "
+                              "valid only from ASSERTED.")
+            st["state"] = "VALIDATED"
+        elif et == "CLAIM_REFUTED":
+            if st["state"] not in ("ASSERTED", "VALIDATED"):
+                errors.append(f"{where}: CLAIM_REFUTED from {st['state']}.")
+            st["state"] = "REFUTED"
+        elif et == "CLAIM_WITHDRAWN":
+            if st["state"] != "ASSERTED":
+                errors.append(f"{where}: CLAIM_WITHDRAWN from {st['state']} — an "
+                              "adjudicated claim cannot be taken back.")
+            st["state"] = "WITHDRAWN"
+        elif et == "CLAIM_SUPERSEDED":
+            if st["state"] not in ("ASSERTED", "VALIDATED"):
+                errors.append(f"{where}: CLAIM_SUPERSEDED from {st['state']}.")
+            st["state"] = "SUPERSEDED"
+    st["supports"] = sorted(set(st["supports"]))
+    st["contradicts"] = sorted(set(st["contradicts"]))
+    st["relations"] = sorted(set(st["relations"]))
+    st["sets"] = sorted(set(st["sets"]))
+    return st
+
+
+def evaluate_constraint(constraint_type: str, states: dict) -> tuple:
+    """"Holds" means VALIDATED — adjudicated to hold. ASSERTED is under
+    consideration; reading "nobody objected yet" as "true" would be
+    manufacturing agreement."""
+    held = sorted(c for c, s in states.items() if s == "VALIDATED")
+    open_ = sorted(c for c, s in states.items() if s == "ASSERTED")
+    n = len(states)
+    if constraint_type == "AT_MOST_ONE":
+        if len(held) > 1:
+            return "VIOLATED", f"{len(held)} members hold simultaneously: {held}"
+        return ("SATISFIED" if not open_ else "UNDETERMINED",
+                f"{len(held)} holding, {len(open_)} still open")
+    if constraint_type == "EXACTLY_ONE":
+        if len(held) > 1:
+            return "VIOLATED", f"{len(held)} members hold simultaneously: {held}"
+        if len(held) == 1:
+            return ("SATISFIED" if not open_ else "UNDETERMINED",
+                    f"{held[0]} holds, {len(open_)} still open")
+        if not open_:
+            return "VIOLATED", "no member holds, and none is still open"
+        return "UNDETERMINED", f"no member holds yet, {len(open_)} still open"
+    if len(held) == n:
+        return "VIOLATED", "every member holds, and they cannot all hold"
+    return ("SATISFIED" if not open_ else "UNDETERMINED",
+            f"{len(held)} of {n} holding, {len(open_)} still open")
+
+
+def verify_claims(body: dict, memory_chains: list) -> tuple:
+    errors: list = []
+    notes: list = []
+    claim_entries = body.get("claims", [])
+    if not isinstance(claim_entries, list):
+        return ["B9: 'claims' is not a list."], notes
+
+    states, chains = {}, {}
+    for entry in sorted(claim_entries, key=lambda e: str(e.get("claim_id"))):
+        cid, chain = entry.get("claim_id"), entry.get("chain")
+        if not isinstance(cid, str) or not isinstance(chain, list) or not chain:
+            errors.append(f"B9: malformed claim entry for {cid!r}.")
+            continue
+        if not verify_claim_chain(cid, chain, errors):
+            continue
+        before = len(errors)
+        st = replay_claim(cid, chain, errors)
+        if len(errors) != before:
+            continue
+        states[cid], chains[cid] = st, chain
+        if entry.get("state") != st["state"]:
+            errors.append(f"B9: {cid}: declared state {entry.get('state')!r}, "
+                          f"claim replay says {st['state']!r}.")
+        statement = entry.get("statement")
+        if not isinstance(statement, str) or \
+                sha256_hex(statement.encode("utf-8")) != st["statement_sha256"]:
+            errors.append(f"B9: {cid}: the statement shipped does not hash to "
+                          "the one its assertion sealed.")
+        elif entry.get("statement_sha256") != st["statement_sha256"]:
+            errors.append(f"B9: {cid}: declared statement_sha256 disagrees with "
+                          "the assertion event.")
+
+    for cid in sorted(states):
+        for rel, direction, other in states[cid]["relations"]:
+            if other not in states:
+                errors.append(f"B9: {cid}: relates to {other}, whose chain is "
+                              "not in this bundle.")
+                continue
+            mirror = "IN" if direction == "OUT" else "OUT"
+            if (rel, mirror, cid) not in states[other]["relations"]:
+                errors.append(f"B9: {cid}: records {rel} {direction} {other}, "
+                              f"but {other}'s chain has no matching {rel} "
+                              f"{mirror} back — a relation only one side asserts.")
+
+    declared_members = {}
+    for sw in body.get("claim_sets", []):
+        sid = sw.get("set_id")
+        try:
+            members = json.loads(sw["members_json"])["members"]
+        except Exception:
+            errors.append(f"B9: set {sid}: members_json is not valid JSON.")
+            continue
+        declared_members[sid] = set(members)
+        derived = sha256_hex(canonical_json(
+            {"members": sorted(members)}).encode("utf-8"))
+        if derived != sw.get("members_sha256"):
+            errors.append(f"B9: set {sid}: member list does not hash to the seal.")
+        absent = sorted(set(members) - set(states))
+        if absent:
+            errors.append(f"B9: set {sid}: members {absent} are not carried.")
+            continue
+        for cid in sorted(members):
+            if sid not in states[cid]["sets"]:
+                errors.append(f"B9: set {sid}: names {cid}, but {cid}'s chain "
+                              "carries no SET_MEMBERSHIP for it.")
+        status, explanation = evaluate_constraint(
+            sw.get("constraint_type"), {c: states[c]["state"] for c in members})
+        if sw.get("status") != status:
+            errors.append(f"B9: set {sid}: declared {sw.get('status')!r}, but the "
+                          f"claim states carried here evaluate to {status!r} "
+                          f"({explanation}).")
+        if status == "VIOLATED":
+            notes.append(f"claim set {sid} is VIOLATED: {explanation}. The bundle "
+                         "reports the conflict rather than resolving it.")
+    for cid in sorted(states):
+        for sid in states[cid]["sets"]:
+            if sid not in declared_members:
+                errors.append(f"B9: {cid}: claims membership of set {sid}, which "
+                              "the bundle does not carry.")
+            elif cid not in declared_members[sid]:
+                errors.append(f"B9: {cid}: claims membership of set {sid}, whose "
+                              "member list does not include it.")
+
+    carried = {mid for mid, _ in memory_chains}
+    outside = sorted({m for cid in states
+                      for m in (states[cid]["supports"] + states[cid]["contradicts"])
+                      if m not in carried})
+    if outside:
+        notes.append(f"{len(outside)} evidence link(s) point at memories this "
+                     "bundle does not carry; those links are named by the claim "
+                     "chains but not checkable here.")
+
+    declared_genesis = body.get("authority_genesis_at")
+    if isinstance(declared_genesis, str):
+        auth = {}
+        for entry in body.get("authority", []):
+            sid, chain = entry.get("subject_id"), entry.get("chain")
+            if isinstance(sid, str) and isinstance(chain, list) and chain:
+                local: list = []
+                st_ = replay_authority(sid, chain, local)
+                if not local:
+                    auth[sid] = st_
+        for cid in sorted(chains):
+            for r in chains[cid]:
+                at, payload = r["created_at"], json.loads(r["payload_json"])
+                if at < declared_genesis:
+                    continue
+                where = f"B9: {cid} claim seq {r['seq']} ({r['event_type']})"
+                gid, actor = payload.get("grant_id"), r["actor_id"]
+                if not isinstance(gid, str):
+                    errors.append(f"{where}: no grant_id, and it postdates the "
+                                  "authority genesis. Recorded is not authorized.")
+                    continue
+                if actor not in auth:
+                    errors.append(f"{where}: actor {actor!r} has no authority "
+                                  "chain in this bundle.")
+                    continue
+                if quarantined_at(auth[actor], at):
+                    errors.append(f"{where}: actor {actor!r} was QUARANTINED at "
+                                  f"{at} and held no capability (A5).")
+                    continue
+                caps = grant_capabilities_at(auth[actor], gid, at)
+                needed = CLAIM_EVENT_CAPABILITY[r["event_type"]]
+                if caps is None:
+                    errors.append(f"{where}: grant {gid!r} was not active for "
+                                  f"{actor!r} at {at}.")
+                elif needed not in caps:
+                    errors.append(f"{where}: grant {gid!r} confers {sorted(caps)}, "
+                                  f"which does not include {needed}.")
+    return errors, notes
+
+
 # --- B6: Merkle over heads ---------------------------------------------------
 
 def heads_merkle_root(heads: dict[str, str]) -> str:
@@ -1004,6 +1289,10 @@ def verify(bundle_json: str) -> tuple[bool, list[str], list[str]]:
     errors.extend(cerrors)
     notes.extend(cnotes)
 
+    clerrors, clnotes = verify_claims(body, verified_chains)
+    errors.extend(clerrors)
+    notes.extend(clnotes)
+
     return (not errors), errors, notes
 
 
@@ -1015,7 +1304,7 @@ def main() -> int:
         raw = f.read()
     ok, errors, notes = verify(raw)
     if ok:
-        print("VERIFIED: every check (B0-B8) passed.")
+        print("VERIFIED: every check (B0-B9) passed.")
         # A declared exclusion is a claim the auditor must SEE, not
         # something a passing verdict may bury. So is a field whose events
         # nobody was ever authorized to cause.

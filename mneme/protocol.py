@@ -19,7 +19,7 @@ on. A verifier that meets a version it does not implement REFUSES —
 loudly, naming the version — instead of quietly applying today's rules
 to yesterday's evidence.
 
-The six protocols, and what "changing" each one means:
+The seven protocols, and what "changing" each one means:
 
   custody_protocol    The custody envelope and its chain rules: the hash
                       formula, the genesis derivation, seq density, the
@@ -51,6 +51,12 @@ The six protocols, and what "changing" each one means:
   receipt_protocol    The recall-receipt digest body, and the decision
                       record that binds a receipt to the decision it
                       served (B8).
+
+  claim_protocol      The claim chain and its state machine, the
+                      bilaterality of claim-to-claim relations, the three
+                      set constraints and how a violation is evaluated,
+                      and the rule that standing is derived, never stored
+                      (B9).
 
 Versioning discipline, stated once so nobody has to guess:
 
@@ -109,7 +115,11 @@ TAINT_PROTOCOL = "2.0.0"
 
 # 1.0.0 — capability vocabulary, per-actor authority chains, no-amplification,
 #         quarantine as a write barrier, the event_type -> capability map.
-AUTHORITY_PROTOCOL = "1.0.0"
+# 1.1.0 — 1.0.0's rules plus two capabilities, ASSERT and ADJUDICATE, for
+#         the epistemic layer. MINOR: every 1.0.0 check is unchanged, the
+#         custody event -> capability map is untouched, and a 1.0.0 bundle
+#         simply carries no claim events.
+AUTHORITY_PROTOCOL = "1.1.0"
 
 # 2.0.0 — MAJOR, and the honest label. 1.0.0's receipt body recorded what
 #         a recall RETURNED but never what it was ASKED (no top_k, no hops,
@@ -121,6 +131,13 @@ AUTHORITY_PROTOCOL = "1.0.0"
 #         version, and its bilateral DECISION_USED_MEMORY evidence.
 RECEIPT_PROTOCOL = "2.0.0"
 
+# 1.0.0 — the claim chain (genesis bound to claim_id, closed 8-event
+#         vocabulary), the claim state machine in claims.replay_claim, the
+#         bilaterality of claim-to-claim relations, the three set
+#         constraints and how a violation is evaluated, and the rule that
+#         a claim's standing is DERIVED and never stored.
+CLAIM_PROTOCOL = "1.0.0"
+
 PROTOCOL_NAMES = (
     "custody_protocol",
     "replay_protocol",
@@ -128,6 +145,7 @@ PROTOCOL_NAMES = (
     "taint_protocol",
     "authority_protocol",
     "receipt_protocol",
+    "claim_protocol",
 )
 
 CURRENT_PROTOCOLS: dict[str, str] = {
@@ -137,6 +155,7 @@ CURRENT_PROTOCOLS: dict[str, str] = {
     "taint_protocol": TAINT_PROTOCOL,
     "authority_protocol": AUTHORITY_PROTOCOL,
     "receipt_protocol": RECEIPT_PROTOCOL,
+    "claim_protocol": CLAIM_PROTOCOL,
 }
 
 # Every version this build can still verify, per protocol. A version is in
@@ -154,11 +173,12 @@ SUPPORTED_PROTOCOLS: dict[str, frozenset[str]] = {
     "replay_protocol": frozenset({"1.0.0", "1.1.0"}),
     "ranking_protocol": frozenset({"1.0.0"}),
     "taint_protocol": frozenset({"1.0.0", "1.1.0", "2.0.0"}),
-    "authority_protocol": frozenset({"1.0.0"}),
+    "authority_protocol": frozenset({"1.0.0", "1.1.0"}),
     # receipt 1.0.0 is NOT here. Its digest body differs, so this build
     # genuinely cannot check a 1.0.0 receipt — and an entry claiming
     # otherwise would be the one kind of lie this table exists to prevent.
     "receipt_protocol": frozenset({"2.0.0"}),
+    "claim_protocol": frozenset({"1.0.0"}),
 }
 
 

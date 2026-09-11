@@ -119,6 +119,15 @@ that makes disagreement loud):
         6. every decision_id referenced by a DECISION_USED_MEMORY event
            appears in one of the two lists, and that event's memory
            appears in that decision's used list.
+  B9  EPISTEMIC PROVENANCE: every claim chain verifies and replays, its
+      declared state reproduces, the statement shipped hashes to the one
+      its assertion sealed, claim-to-claim relations are bilateral, set
+      membership is re-derived from the member chains and hashes to its
+      seal, a set's declared status is recomputed from the carried claim
+      states and must agree, and every claim event at or after the
+      authority genesis names a grant conferring ASSERT or ADJUDICATE as
+      the event requires. Evidence pointing at memories the bundle does
+      not carry is counted and named on success.
 
 Replay state machine (B4): the single normative statement now lives in
 custody.replay_state's docstring, next to the event vocabulary it
@@ -150,7 +159,7 @@ import json
 from typing import Any
 
 from .canonical import canonical_json
-from . import authority, causality, custody, field as _field, protocol
+from . import authority, causality, claims as _claims, custody, field as _field, protocol
 from .trust import NON_INFLUENCE_EVENTS
 
 BUNDLE_FORMAT = "MNEME_BUNDLE_V2"
@@ -288,13 +297,41 @@ def export_bundle(cur, *, memory_ids: list[str] | None = None) -> str:
               if flagged_by_sweep.get(s["sweep_id"], set()) <= exported]
     excluded_sweeps = [s for s in all_sweeps if s not in sweeps]
 
-    # Authority evidence (B7). Always exported — an authority chain is a
-    # few rows and an unauthorized-looking bundle that merely omitted the
-    # proof is the worst of both outcomes.
+    # Every actor whose acts appear anywhere in this bundle — memory
+    # chains and claim chains alike — because B7 must be able to check
+    # that each of those acts was authorized.
     actors_in_evidence: set[str] = set()
     for mem in memories:
         for r in mem["custody"]:
             actors_in_evidence.add(r["actor_id"])
+
+    # Epistemic evidence (B9). Claims and sets travel WHOLE: a claim chain
+    # is self-contained and small, and a bundle that carried memories but
+    # not the propositions they were cited for would hand an auditor the
+    # documents while withholding what anyone concluded from them.
+    cur.execute("SELECT claim_id, statement, statement_sha256, topic "
+                "FROM claims ORDER BY claim_id ASC")
+    claim_rows = []
+    for cid, statement, ssha, topic in cur.fetchall():
+        chain = _claims.load_claim_rows(cur, cid)
+        state, _errs = _claims.replay_claim(cid, chain)
+        claim_rows.append({
+            "claim_id": cid, "statement": statement,
+            "statement_sha256": ssha, "topic": topic,
+            "state": state.state, "chain": chain,
+        })
+    claim_set_rows = []
+    for row in _claims.load_set_rows(cur):
+        ev = _claims.evaluate_set(cur, row["set_id"])
+        claim_set_rows.append(dict(row, status=ev.status))
+    for c in claim_rows:
+        for r in c["chain"]:
+            actors_in_evidence.add(r["actor_id"])
+
+    # Authority evidence (B7). Always exported — an authority chain is a
+    # few rows and an unauthorized-looking bundle that merely omitted the
+    # proof is the worst of both outcomes.
+    #
     # The root always travels, even when no exported memory's actor leads
     # to it. Without it a bundle could declare an authority genesis whose
     # evidence it does not carry — a claim about a ledger nobody can see —
@@ -336,6 +373,7 @@ def export_bundle(cur, *, memory_ids: list[str] | None = None) -> str:
         if set(json.loads(r["served_json"])["served"]) <= exported_ids:
             receipts[r["receipt_sha256"]] = r
 
+
     body = {
         "format": BUNDLE_FORMAT,
         "protocols": dict(protocol.CURRENT_PROTOCOLS),
@@ -346,6 +384,8 @@ def export_bundle(cur, *, memory_ids: list[str] | None = None) -> str:
         "receipts": [receipts[k] for k in sorted(receipts)],
         "decisions": decisions,
         "excluded_decisions": excluded_decisions,
+        "claims": claim_rows,
+        "claim_sets": claim_set_rows,
         "authority": authority_rows,
         "authority_genesis_at": authority.genesis_at(cur),
         "authority_merkle_root": heads_merkle_root(auth_heads),
@@ -733,6 +773,187 @@ def verify_causality(
 
 
 
+def verify_claims(
+    body: dict[str, Any],
+    memory_chains: list[tuple[str, list[dict[str, Any]]]],
+) -> tuple[list[str], list[str]]:
+    """
+    B9 — epistemic provenance. Returns (errors, notes). Pure; the
+    standalone verifier transcribes this function.
+
+    What it proves, in order:
+      1. every claim chain verifies structurally and replays without
+         contradiction, and the declared state reproduces from the replay
+         — the claim analogue of B4;
+      2. the statement shipped hashes to the one its assertion sealed
+         (Invariant C1: a proposition is immutable, revision is
+         supersession);
+      3. claim-to-claim relations are BILATERAL — each OUT has its IN and
+         each IN has its OUT, so neither party's export can hide a
+         relationship the other records (C4);
+      4. set membership is RE-DERIVED from the member chains rather than
+         trusted to the set row: every member carries SET_MEMBERSHIP for
+         the set, every claim carrying SET_MEMBERSHIP is a member, and the
+         member list hashes to its seal;
+      5. a set's DECLARED status is recomputed from the carried claim
+         states and must agree — a bundle cannot assert that a constraint
+         is satisfied while the evidence it ships says otherwise;
+      6. every claim event at or after the authority genesis names a grant
+         that was live for its actor and conferred the capability the
+         event required. Asserting and adjudicating are their own
+         capabilities, so a writer that may store cannot quietly become
+         the field's epistemic authority.
+    Evidence pointing at memories this bundle does not carry is COUNTED
+    and named on a passing verdict — absence stated, never implied.
+    """
+    errors: list[str] = []
+    notes: list[str] = []
+
+    claim_entries = body.get("claims", [])
+    if not isinstance(claim_entries, list):
+        return ["B9: 'claims' is not a list."], notes
+
+    states: dict[str, Any] = {}
+    chains: dict[str, list[dict[str, Any]]] = {}
+    for entry in sorted(claim_entries, key=lambda e: str(e.get("claim_id"))):
+        cid, chain = entry.get("claim_id"), entry.get("chain")
+        if not isinstance(cid, str) or not isinstance(chain, list) or not chain:
+            errors.append(f"B9: malformed claim entry for {cid!r}.")
+            continue
+        try:
+            ok, errs = _claims.verify_claim_rows(cid, chain)
+        except (ValueError, TypeError, KeyError) as exc:
+            errors.append(f"B9: {cid}: claim chain is unreadable ({exc}).")
+            continue
+        if not ok:
+            errors.extend(f"B9: {e}" for e in errs)
+            continue
+        st, rerrs = _claims.replay_claim(cid, chain)
+        if rerrs:
+            errors.extend(f"B9: {e}" for e in rerrs)
+            continue
+        states[cid], chains[cid] = st, chain
+        if entry.get("state") != st.state:
+            errors.append(f"B9: {cid}: declared state {entry.get('state')!r}, "
+                          f"claim replay says {st.state!r}.")
+        statement = entry.get("statement")
+        if not isinstance(statement, str) or \
+                _claims.statement_sha256(statement) != st.statement_sha256:
+            errors.append(f"B9: {cid}: the statement shipped does not hash to "
+                          "the one its assertion sealed — the proposition was "
+                          "edited (Invariant C1).")
+        elif entry.get("statement_sha256") != st.statement_sha256:
+            errors.append(f"B9: {cid}: declared statement_sha256 disagrees "
+                          "with the assertion event.")
+
+    # 3 — bilaterality
+    for cid in sorted(states):
+        for rel, direction, other in states[cid].relations:
+            if other not in states:
+                errors.append(f"B9: {cid}: relates to {other}, whose chain is "
+                              "not in this bundle — the relation is unprovable.")
+                continue
+            mirror = ("IN" if direction == "OUT" else "OUT")
+            if (rel, mirror, cid) not in states[other].relations:
+                errors.append(
+                    f"B9: {cid}: records {rel} {direction} {other}, but "
+                    f"{other}'s chain has no matching {rel} {mirror} back — a "
+                    "relation only one side asserts (Invariant C4).")
+
+    # 4/5 — sets: membership re-derived, status recomputed
+    set_entries = body.get("claim_sets", [])
+    declared_members: dict[str, set[str]] = {}
+    for sw in set_entries:
+        sid = sw.get("set_id")
+        try:
+            members = json.loads(sw["members_json"])["members"]
+        except Exception:
+            errors.append(f"B9: set {sid}: members_json is not valid JSON.")
+            continue
+        declared_members[sid] = set(members)
+        derived = hashlib.sha256(canonical_json(
+            {"members": sorted(members)}).encode("utf-8")).hexdigest()
+        if derived != sw.get("members_sha256"):
+            errors.append(f"B9: set {sid}: member list does not hash to the seal.")
+        absent = sorted(set(members) - set(states))
+        if absent:
+            errors.append(f"B9: set {sid}: members {absent} are not carried — a "
+                          "constraint cannot be checked against claims the "
+                          "bundle does not ship.")
+            continue
+        for cid in sorted(members):
+            if sid not in states[cid].sets:
+                errors.append(f"B9: set {sid}: names {cid}, but {cid}'s chain "
+                              "carries no SET_MEMBERSHIP for it.")
+        member_states = {cid: states[cid].state for cid in members}
+        status, explanation = _claims.evaluate_constraint(
+            sw.get("constraint_type"), member_states)
+        if sw.get("status") != status:
+            errors.append(
+                f"B9: set {sid}: declared {sw.get('status')!r}, but the claim "
+                f"states carried here evaluate to {status!r} ({explanation}).")
+        if status == "VIOLATED":
+            notes.append(f"claim set {sid} is VIOLATED: {explanation}. The "
+                         "bundle reports the conflict rather than resolving it.")
+    for cid in sorted(states):
+        for sid in states[cid].sets:
+            if sid not in declared_members:
+                errors.append(f"B9: {cid}: claims membership of set {sid}, "
+                              "which the bundle does not carry.")
+            elif cid not in declared_members[sid]:
+                errors.append(f"B9: {cid}: claims membership of set {sid}, "
+                              "whose member list does not include it.")
+
+    # evidence pointing outside the bundle — counted, never implied
+    carried = {mid for mid, _ in memory_chains}
+    outside = sorted({m for cid in states
+                      for m in (states[cid].supports + states[cid].contradicts)
+                      if m not in carried})
+    if outside:
+        notes.append(f"{len(outside)} evidence link(s) point at memories this "
+                     "bundle does not carry; those links are named by the "
+                     "claim chains but not checkable here.")
+
+    # 6 — authority over epistemic acts
+    declared_genesis = body.get("authority_genesis_at")
+    if isinstance(declared_genesis, str):
+        auth: dict[str, Any] = {}
+        for entry in body.get("authority", []):
+            sid, chain = entry.get("subject_id"), entry.get("chain")
+            if isinstance(sid, str) and isinstance(chain, list) and chain:
+                st_, errs_ = authority.replay_authority(sid, chain)
+                if not errs_:
+                    auth[sid] = st_
+        for cid in sorted(chains):
+            for r in chains[cid]:
+                at, payload = r["created_at"], json.loads(r["payload_json"])
+                if at < declared_genesis:
+                    continue
+                where = f"B9: {cid} claim seq {r['seq']} ({r['event_type']})"
+                gid, actor = payload.get("grant_id"), r["actor_id"]
+                if not isinstance(gid, str):
+                    errors.append(f"{where}: no grant_id, and it postdates the "
+                                  "authority genesis. Recorded is not authorized.")
+                    continue
+                if actor not in auth:
+                    errors.append(f"{where}: actor {actor!r} has no authority "
+                                  "chain in this bundle.")
+                    continue
+                if authority.quarantined_at(auth[actor], at):
+                    errors.append(f"{where}: actor {actor!r} was QUARANTINED "
+                                  f"at {at} and held no capability (A5).")
+                    continue
+                caps = authority.grant_capabilities_at(auth[actor], gid, at)
+                needed = _claims.CLAIM_EVENT_CAPABILITY[r["event_type"]]
+                if caps is None:
+                    errors.append(f"{where}: grant {gid!r} was not active for "
+                                  f"{actor!r} at {at}.")
+                elif needed not in caps:
+                    errors.append(f"{where}: grant {gid!r} confers "
+                                  f"{sorted(caps)}, which does not include "
+                                  f"{needed}.")
+    return errors, notes
+
 def verify_bundle(bundle_json: str) -> tuple[bool, list[str]]:
     """
     Full B1–B7 verification of an exported bundle string.
@@ -940,5 +1161,10 @@ def verify_bundle_verbose(bundle_json: str) -> tuple[bool, list[str], list[str]]
     cerrors, cnotes = verify_causality(body, verified_chains)
     errors.extend(cerrors)
     notes.extend(cnotes)
+
+    # B9 — epistemic provenance
+    clerrors, clnotes = verify_claims(body, verified_chains)
+    errors.extend(clerrors)
+    notes.extend(clnotes)
 
     return (not errors), errors, notes

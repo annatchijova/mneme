@@ -60,7 +60,7 @@ from mcp.server.fastmcp import FastMCP
 # Ensure the package resolves regardless of the invoking CWD
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from mneme import (authority, bundle, causality, counterfactual,
+from mneme import (authority, bundle, causality, claims, counterfactual,
                    custody, field, protocol, trust)
 from mneme.canonical import canonical_json, quantize, CANONICAL_SCALE
 
@@ -1204,6 +1204,313 @@ def mneme_embeddings() -> dict:
 
 
 @mcp.tool()
+def mneme_assert_claim(
+    statement: str,
+    actor_id: str,
+    reason: str,
+    topic: str = "",
+    claim_id: str = "",
+) -> dict:
+    """
+    Assert a PROPOSITION, as an object distinct from any document.
+
+    A memory is a container: this text was stored, by this actor, with
+    this chain. A claim is what someone says is true. Conflating them
+    works only while every proposition lives in exactly one document and
+    every document asserts exactly one proposition — neither of which is
+    true of anything real.
+
+    The claim gets its own hash chain, genesis-bound to its id, and its
+    statement is immutable (revision is supersession, an event, never an
+    edit). Requires ASSERT — a capability distinct from STORE, because
+    saying something is true is not the same act as filing a document.
+
+    Args:
+        statement: The proposition, in words.
+        actor_id: Who asserts it — must hold ASSERT.
+        reason: Why (mandatory — an unreasoned epistemic act cannot exist).
+        topic: Optional grouping, e.g. "release-date".
+        claim_id: Optional explicit id.
+
+    Returns:
+        The claim id and its statement hash.
+    """
+    actor_id = _sanitize_id(actor_id, "actor_id")
+    if not statement.strip():
+        return {"error": "statement must be non-empty."}
+    if not reason.strip():
+        return {"error": "reason must be non-empty."}
+    conn = _get_conn()
+    cur = conn.cursor()
+    try:
+        cid = claims.assert_claim(
+            cur, statement=_trunc(statement), actor_id=actor_id,
+            reason=_trunc(reason, 512), topic=topic or None,
+            claim_id=_sanitize_id(claim_id, "claim_id") if claim_id else None)
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        conn.close()
+        return {"error": str(exc)}
+    conn.close()
+    return {"claim_id": cid,
+            "statement_sha256": claims.statement_sha256(_trunc(statement)),
+            "state": "ASSERTED"}
+
+
+@mcp.tool()
+def mneme_link_evidence(
+    claim_id: str,
+    memory_id: str,
+    stance: str,
+    actor_id: str,
+    reason: str,
+) -> dict:
+    """
+    Record that a memory supports or contradicts a claim.
+
+    Links live on the CLAIM's chain, not the memory's: a claim is about
+    memories, memories are not about claims, and a document whose history
+    grew with every proposition that ever cited it would be carrying the
+    epistemic unit's weight all over again.
+
+    A tainted memory may be linked — "this claim rests on material we
+    later quarantined" is exactly what an incident review needs to say.
+    What the gate does is refuse to COUNT it: standing reads only CLEAN
+    evidence and reports the rest separately.
+
+    Args:
+        claim_id: The proposition.
+        memory_id: The artifact.
+        stance: SUPPORTS or CONTRADICTS.
+        actor_id: Who links it — must hold ASSERT.
+        reason: Why (mandatory).
+
+    Returns:
+        The claim's recomputed standing.
+    """
+    conn = _get_conn()
+    cur = conn.cursor()
+    try:
+        claims.link_evidence(
+            cur, claim_id=_sanitize_id(claim_id, "claim_id"),
+            memory_id=_sanitize_id(memory_id, "memory_id"),
+            stance=stance.strip().upper(),
+            actor_id=_sanitize_id(actor_id, "actor_id"),
+            reason=_trunc(reason, 512))
+        conn.commit()
+        st = claims.standing(cur, claim_id)
+    except Exception as exc:
+        conn.rollback()
+        conn.close()
+        return {"error": str(exc)}
+    conn.close()
+    return {"claim_id": st.claim_id, "state": st.state,
+            "supporting": list(st.supporting),
+            "contradicting": list(st.contradicting),
+            "withheld_evidence": [list(x) for x in st.withheld_evidence]}
+
+
+@mcp.tool()
+def mneme_relate_claims(
+    from_claim: str,
+    to_claim: str,
+    relation: str,
+    actor_id: str,
+    reason: str,
+) -> dict:
+    """
+    Relate two propositions: SUPPORTS, CONTRADICTS, SUPERSEDES or
+    DERIVED_FROM. Bilateral — the event lands on both chains, one marked
+    OUT and one IN, so neither party's export can hide a relationship the
+    other records. Requires ASSERT.
+
+    Args:
+        from_claim: The subject claim.
+        to_claim: The object claim.
+        relation: SUPPORTS, CONTRADICTS, SUPERSEDES or DERIVED_FROM.
+        actor_id: Who relates them — must hold ASSERT.
+        reason: Why (mandatory).
+
+    Returns:
+        Confirmation of the bilateral relation.
+    """
+    conn = _get_conn()
+    cur = conn.cursor()
+    try:
+        claims.relate(cur, from_claim=_sanitize_id(from_claim, "from_claim"),
+                      to_claim=_sanitize_id(to_claim, "to_claim"),
+                      relation=relation.strip().upper(),
+                      actor_id=_sanitize_id(actor_id, "actor_id"),
+                      reason=_trunc(reason, 512))
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        conn.close()
+        return {"error": str(exc)}
+    conn.close()
+    return {"from_claim": from_claim, "to_claim": to_claim,
+            "relation": relation.strip().upper(), "bilateral": True}
+
+
+@mcp.tool()
+def mneme_claim_set(
+    claim_ids: str,
+    constraint_type: str,
+    actor_id: str,
+    reason: str,
+    topic: str = "",
+) -> dict:
+    """
+    Declare that a group of claims is mutually constrained — n-ary
+    contradiction, because "A contradicts B" is too poor for a date that
+    is one of three candidates.
+
+      AT_MOST_ONE   at most one member may hold
+      EXACTLY_ONE   exactly one member must hold
+      INCOMPATIBLE  they cannot ALL hold together — weaker, and often the
+                    only thing actually known
+
+    The member list is sealed and every member's chain records its
+    membership, so the set is re-derivable from evidence rather than
+    trusted to one row. Requires ASSERT.
+
+    Args:
+        claim_ids: Comma-separated claim ids (at least two).
+        constraint_type: AT_MOST_ONE, EXACTLY_ONE or INCOMPATIBLE.
+        actor_id: Who declares it — must hold ASSERT.
+        reason: Why these are mutually constrained (mandatory).
+        topic: Optional grouping.
+
+    Returns:
+        The set id and its current evaluation.
+    """
+    ids = [_sanitize_id(c.strip(), "claim_id")
+           for c in claim_ids.split(",") if c.strip()]
+    conn = _get_conn()
+    cur = conn.cursor()
+    try:
+        sid = claims.declare_set(
+            cur, members=ids, constraint_type=constraint_type.strip().upper(),
+            actor_id=_sanitize_id(actor_id, "actor_id"),
+            reason=_trunc(reason, 512), topic=topic or None)
+        conn.commit()
+        ev = claims.evaluate_set(cur, sid)
+    except Exception as exc:
+        conn.rollback()
+        conn.close()
+        return {"error": str(exc)}
+    conn.close()
+    return {"set_id": sid, "constraint_type": ev.constraint_type,
+            "members": list(ev.members), "status": ev.status,
+            "explanation": ev.explanation,
+            "members_sha256": ev.members_sha256}
+
+
+@mcp.tool()
+def mneme_resolve_set(
+    set_id: str,
+    validate: str,
+    refute: str,
+    actor_id: str,
+    reason: str,
+) -> dict:
+    """
+    Decide between hypotheses, as ONE audited operation over the whole
+    set. Requires ADJUDICATE — a capability distinct from ASSERT, because
+    ruling between competing claims is not the same act as making one.
+
+    The resolution must LEAVE THE CONSTRAINT SATISFIED, checked after the
+    writes in the same transaction: a partial resolution that still
+    violates its own constraint is refused, so the field never records an
+    adjudication that settled nothing.
+
+    Rescuing a validated truth used to be surgery on an arbitrary
+    inhibitory pair. Here it is what it always was — choosing among the
+    hypotheses, on the record, with the constraint as the check.
+
+    Args:
+        set_id: The constrained set.
+        validate: Comma-separated members that hold (may be empty).
+        refute: Comma-separated members that do not (may be empty).
+        actor_id: Who adjudicates — must hold ADJUDICATE.
+        reason: The grounds (mandatory — this is the ruling's rationale).
+
+    Returns:
+        The set's evaluation after the resolution.
+    """
+    v = [_sanitize_id(c.strip(), "claim_id") for c in validate.split(",") if c.strip()]
+    r = [_sanitize_id(c.strip(), "claim_id") for c in refute.split(",") if c.strip()]
+    conn = _get_conn()
+    cur = conn.cursor()
+    try:
+        ev = claims.resolve_set(
+            cur, set_id=_sanitize_id(set_id, "set_id"), validate=v, refute=r,
+            actor_id=_sanitize_id(actor_id, "actor_id"),
+            reason=_trunc(reason, 512))
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        conn.close()
+        return {"error": str(exc)}
+    conn.close()
+    return {"set_id": ev.set_id, "status": ev.status,
+            "explanation": ev.explanation,
+            "member_states": [list(x) for x in ev.member_states]}
+
+
+@mcp.tool()
+def mneme_claim(claim_id: str) -> dict:
+    """
+    What the field can say about a proposition, recomputed from evidence.
+
+    Nothing here is stored. A persisted confidence is a number whose
+    derivation has been thrown away, and a number whose derivation is gone
+    is what an audit cannot use — so standing is derived every time it is
+    asked for, from the claim's chain and the current custody status of
+    every artifact linked to it.
+
+    Evidence whose memory is not CLEAN is excluded from the counts and
+    reported separately: the gate that keeps a quarantined memory out of
+    recall keeps it out of the epistemic tally too.
+
+    Args:
+        claim_id: The proposition.
+
+    Returns:
+        Its provenance, its evidence, its constraints, and a seal over
+        the whole standing.
+    """
+    conn = _get_conn()
+    cur = conn.cursor()
+    try:
+        st = claims.standing(cur, _sanitize_id(claim_id, "claim_id"))
+    except Exception as exc:
+        conn.close()
+        return {"error": str(exc)}
+    conn.close()
+    return {
+        "claim_id": st.claim_id,
+        "statement": st.statement,
+        "state": st.state,
+        "provenance": {"asserted_by": st.asserted_by,
+                       "asserted_at": st.asserted_at},
+        "evidence": {"supporting": list(st.supporting),
+                     "contradicting": list(st.contradicting),
+                     "withheld": [list(x) for x in st.withheld_evidence]},
+        "relations": [list(r) for r in st.relations],
+        "constrained_by": [{"set_id": e.set_id,
+                            "constraint_type": e.constraint_type,
+                            "status": e.status,
+                            "explanation": e.explanation}
+                           for e in st.set_evaluations],
+        "standing_sha256": st.standing_sha256,
+        "note": ("derived from evidence, never stored — ask again after the "
+                 "evidence moves and this changes"),
+    }
+
+
+@mcp.tool()
 def mneme_export_bundle(memory_ids: str = "") -> dict:
     """
     Export a sealed evidence bundle as JSON.
@@ -1213,7 +1520,7 @@ def mneme_export_bundle(memory_ids: str = "") -> dict:
     sweeps, and a Merkle root over all chain heads.
 
     Send the bundle + verify_offline.py to anyone who distrusts the
-    system. They can verify B0-B8 checks with nothing but stdlib Python.
+    system. They can verify B0-B9 checks with nothing but stdlib Python.
 
     Args:
         memory_ids: Comma-separated list of memory IDs to export.
@@ -1247,7 +1554,7 @@ def mneme_export_bundle(memory_ids: str = "") -> dict:
 @mcp.tool()
 def mneme_verify_bundle(bundle_json: str) -> dict:
     """
-    Verify a MNEME evidence bundle (B0-B8 checks).
+    Verify a MNEME evidence bundle (B0-B9 checks).
 
     This is the forensic handoff tool: an auditor who distrusts the
     entire deployment can call this with a bundle received from any
@@ -1284,7 +1591,7 @@ def mneme_verify_bundle(bundle_json: str) -> dict:
         # was ever authorized to cause.
         "notes": notes,
         "verdict": (
-            "VERIFIED: every check (B0-B8) passed."
+            "VERIFIED: every check (B0-B9) passed."
             if ok else
             f"FAILED: {len(errors)} problem(s) detected."
         ),

@@ -132,6 +132,8 @@ CAPABILITIES = frozenset(
         "GRANT",             # confer capabilities on another actor
         "REVOKE",            # end a grant
         "DECIDE",            # emit a decision record binding a recall receipt
+        "ASSERT",            # assert a proposition, link evidence, relate claims
+        "ADJUDICATE",        # decide between mutually exclusive hypotheses
     }
 )
 
@@ -154,6 +156,12 @@ AUTHORITY_EVENT_TYPES = frozenset(
 # the stylometry pipeline named in KNOWN_LIMITATIONS is the obvious
 # candidate — arrives with its own capability and its own version bump, not
 # by widening this row.
+#
+# ASSERT and ADJUDICATE are separate from STORE and from each other because
+# the acts are different in kind: storing a document, asserting that a
+# proposition is true, and ruling between competing hypotheses are three
+# different authorities, and a model that cannot tell them apart is a role
+# system wearing capability vocabulary.
 #
 # DECISION_USED_MEMORY maps to DECIDE and to nothing else. Recording that a
 # decision consumed a memory changes no memory state, but it is a claim

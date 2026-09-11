@@ -447,7 +447,11 @@ agree("a bundle sealed under replay semantics we do not implement",
       reseal(t), False, {"B0"})
 
 t = json.loads(honest)
-t["body"]["protocols"]["claim_protocol"] = "1.0.0"
+# This test named "claim_protocol" until claim_protocol became real, which
+# is the mechanism working: a name this build has never heard of is a
+# bundle from a newer MNEME, and a verdict from an older verifier on newer
+# evidence is the retroactive-semantics problem read backwards.
+t["body"]["protocols"]["stylometry_protocol"] = "1.0.0"
 agree("a bundle from a newer MNEME naming a protocol we never heard of",
       reseal(t), False, {"B0"})
 
