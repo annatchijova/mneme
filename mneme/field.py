@@ -481,6 +481,13 @@ class RecallReceipt:
     top_k: int
     hops: int
     ranking_protocol: str
+    # The WORLD this recall was taken in. Empty for a real recall against
+    # the field's actual custody state; non-empty for a counterfactual —
+    # a recall run against a hypothetical custody state, e.g. "as if the
+    # poisoned memory had never been contained". It is inside the digest
+    # on purpose: a counterfactual receipt must be structurally impossible
+    # to launder into evidence about the actual field.
+    custody_override: tuple[tuple[str, str], ...]
     receipt_sha256: str
 
 
@@ -500,18 +507,22 @@ def receipt_body(r: RecallReceipt) -> dict[str, Any]:
         "top_k": r.top_k,
         "hops": r.hops,
         "ranking_protocol": r.ranking_protocol,
+        "custody_override": [list(p) for p in r.custody_override],
     }
 
 
 def _receipt(query_sha: str, seed: str | None, served: list[str],
              exc_c: int, exc_f: int, exc_i: int,
-             top_k: int, hops: int) -> RecallReceipt:
+             top_k: int, hops: int,
+             override: dict[str, str] | None = None) -> RecallReceipt:
     import hashlib
     r = RecallReceipt(query_sha256=query_sha, seed_memory_id=seed,
                       served=tuple(served), excluded_custody=exc_c,
                       excluded_forgotten=exc_f, excluded_inhibited=exc_i,
                       top_k=top_k, hops=hops,
                       ranking_protocol=protocol.RANKING_PROTOCOL,
+                      custody_override=tuple(
+                          (k, override[k]) for k in sorted(override or {})),
                       receipt_sha256="")
     digest = hashlib.sha256(
         canonical_json(receipt_body(r)).encode("utf-8")).hexdigest()
@@ -548,13 +559,16 @@ def persist_receipt(cur, receipt: RecallReceipt, *,
     cur.execute(
         "INSERT INTO recall_receipts (receipt_sha256, query_sha256, "
         "seed_memory_id, served_json, excluded_custody, excluded_forgotten, "
-        "excluded_inhibited, top_k, hops, ranking_protocol, persisted_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "excluded_inhibited, top_k, hops, ranking_protocol, "
+        "custody_override_json, persisted_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (digest, receipt.query_sha256, receipt.seed_memory_id,
          canonical_json({"served": list(receipt.served)}),
          receipt.excluded_custody, receipt.excluded_forgotten,
          receipt.excluded_inhibited, receipt.top_k, receipt.hops,
-         receipt.ranking_protocol, ts),
+         receipt.ranking_protocol,
+         canonical_json({"override": [list(p) for p in receipt.custody_override]}),
+         ts),
     )
 
 
@@ -582,7 +596,7 @@ def verify_receipts(cur) -> tuple[bool, list[str]]:
 RECEIPT_COLS = ["receipt_sha256", "query_sha256", "seed_memory_id",
                 "served_json", "excluded_custody", "excluded_forgotten",
                 "excluded_inhibited", "top_k", "hops", "ranking_protocol",
-                "persisted_at"]
+                "custody_override_json", "persisted_at"]
 
 
 def load_receipt_rows(cur, receipt_sha256s: list[str] | None = None) -> list[dict[str, Any]]:
@@ -616,8 +630,13 @@ def receipt_digest_from_row(row: dict[str, Any], served: list[str]) -> str:
         "top_k": int(row["top_k"]),
         "hops": int(row["hops"]),
         "ranking_protocol": row["ranking_protocol"],
+        "custody_override": json.loads(row["custody_override_json"])["override"],
     }
     return hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
+
+
+CUSTODY_STATUSES = frozenset({"CLEAN", "TAINT_FLAGGED", "QUARANTINED",
+                              "SUPERSEDED"})
 
 
 def recall(
@@ -626,6 +645,7 @@ def recall(
     query_embedding: list[Decimal],
     top_k: int = 5,
     hops: int = DEFAULT_HOPS,
+    custody_override: dict[str, str] | None = None,
 ) -> tuple[list[RecallHit], RecallReceipt]:
     """
     Custody-gated, exactly-ranked recall.
@@ -651,7 +671,33 @@ def recall(
     Read-only by design: recall does not write custody events (serving
     is not a state transition). Reinforcement driven by recall results
     is the caller's explicit, audited act via reinforce().
+
+    custody_override runs the SAME recall against a HYPOTHETICAL custody
+    state: {memory_id: status}. It is the primitive the counterfactual
+    analysis is built on — "what would this query have returned in a
+    world where the poisoned memory had never been contained" — and it
+    works in both directions, since a memory can be forced CLEAN as
+    easily as forced QUARANTINED.
+
+    Two disciplines make this safe rather than a hole:
+      - it changes nothing. No write, no status column touched; the
+        override lives only in this call's arithmetic.
+      - the receipt SAYS SO. The override is inside the receipt digest,
+        so a counterfactual receipt is structurally distinguishable from
+        a real one and cannot be laundered into evidence about the actual
+        field — and record_decision refuses to let a decision cite one,
+        because no agent ever decided from a world that did not exist.
+
+    ranking_protocol stays 1.0.0: with an empty override the behaviour is
+    byte-identical, and with a non-empty one the SCORING rules are
+    untouched — only which memories the (unchanged) gate admits.
     """
+    override = dict(custody_override or {})
+    for mid, status in override.items():
+        if status not in CUSTODY_STATUSES:
+            raise ValueError(
+                f"custody_override[{mid!r}] = {status!r} is not a custody "
+                f"status. A hypothetical world must still be a possible one.")
     q = [Fraction(x) for x in query_embedding]
     nq = _dot(q, q)
     if nq == 0:
@@ -661,15 +707,29 @@ def recall(
         embedding_to_json(list(query_embedding)).encode("utf-8")
     ).hexdigest()
 
+    # The gate, computed once from (actual status, overridden status). Read
+    # every memory rather than filtering in SQL, because the override can
+    # move a memory in EITHER direction and a WHERE clause can only ever
+    # narrow.
     cur.execute(
-        "SELECT memory_id, content, embedding_json, field_state "
-        "FROM memories WHERE custody_status = 'CLEAN' ORDER BY memory_id ASC",
+        "SELECT memory_id, content, embedding_json, field_state, custody_status "
+        "FROM memories ORDER BY memory_id ASC",
     )
-    rows = cur.fetchall()
-    cur.execute(
-        "SELECT COUNT(*) FROM memories WHERE custody_status != 'CLEAN'",
-    )
-    excluded_custody = int(cur.fetchone()[0])
+    all_rows = cur.fetchall()
+    unknown = sorted(set(override) - {r[0] for r in all_rows})
+    if unknown:
+        raise ValueError(
+            f"custody_override names memories this field does not have: "
+            f"{unknown}. A counterfactual is about THIS field or it is fiction.")
+    rows = []
+    excluded_custody = 0
+    servable_ids: set[str] = set()
+    for mid, content, ej, state, status in all_rows:
+        if override.get(mid, status) == "CLEAN":
+            rows.append((mid, content, ej, state))
+            servable_ids.add(mid)
+        else:
+            excluded_custody += 1
 
     candidates = []       # (memory_id, content, vec, norm², dot, state)
     excluded_forgotten = 0
@@ -685,7 +745,7 @@ def recall(
 
     if not candidates:
         return [], _receipt(query_sha, None, [], excluded_custody,
-                            excluded_forgotten, 0, top_k, hops)
+                            excluded_forgotten, 0, top_k, hops, override)
 
     # --- Seed: exact argmax of dot/sqrt(nv) — sign-aware squared compare.
     def sim_key(c):
@@ -712,8 +772,6 @@ def recall(
     # quarantined node sitting on a resonant path — confirmed by
     # induction and refused here. Gate on custody_status only: FORGOTTEN
     # is a weak field_state, not an untrusted one, so its links stay.
-    cur.execute("SELECT memory_id FROM memories WHERE custody_status = 'CLEAN'")
-    servable_ids = {r[0] for r in cur.fetchall()}
     cur.execute("SELECT from_id, to_id, link_type FROM cell_links "
                 "ORDER BY from_id ASC, to_id ASC")
     links: dict[str, list[tuple[str, str]]] = {}
@@ -775,5 +833,5 @@ def recall(
 
     receipt = _receipt(query_sha, seed_id, [h.memory_id for h in hits],
                        excluded_custody, excluded_forgotten, excluded_inhibited,
-                       top_k, hops)
+                       top_k, hops, override)
     return hits, receipt

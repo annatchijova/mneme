@@ -197,6 +197,12 @@ CREATE TABLE IF NOT EXISTS recall_receipts (
     top_k              INTEGER NOT NULL CHECK (top_k > 0),
     hops               INTEGER NOT NULL CHECK (hops >= 0),
     ranking_protocol   TEXT NOT NULL,
+    -- The WORLD the recall was taken in: canonical {"override": [[id, status]…]}.
+    -- Empty for a real recall; non-empty for a counterfactual run against a
+    -- hypothetical custody state. It is inside the receipt digest so a
+    -- counterfactual receipt cannot be laundered into evidence about the
+    -- actual field, and record_decision refuses to let a decision cite one.
+    custody_override_json TEXT NOT NULL DEFAULT '{"override":[]}',
     persisted_at       TEXT NOT NULL
 );
 

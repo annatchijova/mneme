@@ -595,6 +595,7 @@ def receipt_digest_from_row(row: dict, served: list) -> str:
         "top_k": int(row["top_k"]),
         "hops": int(row["hops"]),
         "ranking_protocol": row["ranking_protocol"],
+        "custody_override": json.loads(row["custody_override_json"])["override"],
     }
     return sha256_hex(canonical_json(body).encode("utf-8"))
 

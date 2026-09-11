@@ -21,7 +21,9 @@ unfolds:
   4. recall again: the custody gate withholds the flagged memories and
      the receipt counts them — and the quarantined actor discovers the
      containment is prospective too: it can no longer write at all;
-  5. the false positive is rehabilitated by audited event;
+  5. the false positive is rehabilitated by audited event, the blast
+     radius is reconstructed, and the counterfactual measures what the
+     poison actually DID rather than asserting it was handled;
   6. the whole field ships as a sealed bundle, verified by the
      standalone auditor file; a tampered copy is caught; a partial
      export declares — not hides — the sweep evidence it cannot carry.
@@ -38,7 +40,8 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from mneme import authority, bundle, custody, field, trust  # noqa: E402
+from mneme import (authority, bundle, causality, counterfactual,  # noqa: E402
+                   custody, field, trust)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 VERIFIER = os.path.join(HERE, "verify_offline.py")
@@ -82,7 +85,8 @@ def main() -> None:
     print(f"root-ops bootstrapped the ledger  (grant {root_grant[:18]}…)")
     print("  the one act authority cannot authorize; refused ever after")
     for aid, kind, caps, why in [
-        ("agent-ada", "AGENT", ["STORE", "REINFORCE"], "runbook ingestion"),
+        ("agent-ada", "AGENT", ["STORE", "REINFORCE", "DECIDE"],
+         "runbook ingestion and on-call answers"),
         ("pipeline-feeds", "PIPELINE", ["STORE", "REINFORCE"], "feed sync duty"),
         ("analyst-omar", "HUMAN",
          ["REINFORCE", "QUARANTINE_ACTOR", "QUARANTINE_MEMORY", "REHABILITATE"],
@@ -138,6 +142,32 @@ def main() -> None:
                 "query near the POISON: it is served — REINFORCED mem-gate "
                 "survives its inhibition (rescue rule), but the lie is out")
 
+    print("\nand then the agent ACTS on it — the step that turns a bad recall")
+    print("into an incident, recorded as evidence instead of lost:")
+    _, served_receipt = field.recall(cur, query_embedding=e([0.97, 0.02, 0.0]),
+                                     top_k=5)
+    field.persist_receipt(cur, served_receipt)
+    decision = causality.record_decision(
+        cur, receipt=served_receipt, used_memory_ids=["mem-poison"],
+        decision_sha256=causality.decision_hash(
+            "Hotfix 4.2 may ship without the staging gate."),
+        policy_version="deploy-policy@3", actor_id="agent-ada",
+        reason="answered the on-call operator's deploy question")
+    field.store(
+        cur, memory_id="mem-note", actor_id="agent-ada",
+        reason="recording what was told to the operator",
+        content="Told on-call: hotfix 4.2 may skip the staging gate.",
+        embedding=e([0.95, 0.06, 0.0]), embedding_model="demo",
+        derived_from_decision=decision.decision_id)
+    conn.commit()
+    print(f"  decision {decision.decision_id}")
+    print(f"    receipt   {decision.receipt_sha256[:16]}…   (what it was shown)")
+    print(f"    decision  {decision.decision_sha256[:16]}…   (what it produced,"
+          " by hash — MNEME never sees the text)")
+    print(f"    policy    {decision.policy_version}")
+    print(f"    used      {list(decision.used_memory_ids)}")
+    print("  and mem-note declares it was written BECAUSE of that decision")
+
     section("3. Quarantine: one sealed sweep over everything the actor touched")
     sweep = trust.quarantine_actor(cur, actor_id="pipeline-feeds",
                                    initiated_by="analyst-omar",
@@ -179,6 +209,41 @@ def main() -> None:
         except ValueError as exc:
             conn.rollback()
             print(f"  {label:<32} refused: {str(exc).split(' — ')[0]}")
+
+    section("3b. The agent had already ACTED on it — blast radius and "
+            "counterfactual")
+    print("impact mem-poison — the blast radius, graded:")
+    report = causality.impact(cur, "mem-poison")
+    print(f"  DIRECT    recalls={len(report.direct_receipts)} "
+          f"decisions={list(report.direct_decisions)}")
+    print(f"  DERIVED   memories={list(report.derived_memories)}")
+    print(f"  POSSIBLE  memories={list(report.possible_memories)}  "
+          "<- contact, not contamination; reported, never auto-flagged")
+    print(f"  sealed:   sha256={report.impact_sha256[:16]}…")
+
+    print("\ncounterfactual — what did the poison actually DO?")
+    for label, query in [("near the poisoned policy", e([0.97, 0.02, 0.0])),
+                         ("about rollbacks (far away)", e([0.1, 1.0, 0.0]))]:
+        d = counterfactual.containment_effect(
+            cur, query_embedding=query, contained=["mem-poison"], top_k=5)
+        print(f"  query {label}:")
+        print(f"    {d.summary()}")
+        if d.removed_from_serving:
+            print(f"    removed_from_serving: {list(d.removed_from_serving)}")
+        if d.claim_outcome_changed:
+            print(f"    claim_outcome_changed: "
+                  f"{[list(x) for x in d.claim_outcome_changed]}")
+        print(f"    sealed: sha256={d.delta_sha256[:16]}…")
+    print("  the second line is the finding people least expect: for that")
+    print("  query the poison was present, was excluded, and changed nothing.")
+    print("  Damage measured at zero, not assumed at unknown.")
+    print()
+    print("and the first line is why blast radius exists at all: look at the")
+    print("recall above — mem-note is still SERVED. The sweep flagged what the")
+    print("compromised pipeline touched, and mem-note was written by a clean")
+    print("agent acting in good faith on a poisoned answer. Actor quarantine")
+    print("cannot reach it; the causal DAG can name it. What to do about it is")
+    print("an analyst's authorized act, not something this report performs.")
 
     section("4. The false positive is REHABILITATED — by audited event, "
             "never by column edit")

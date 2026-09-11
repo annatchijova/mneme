@@ -207,6 +207,12 @@ def record_decision(
             f"Receipt {rsha[:16]}… is not persisted. A decision may only cite "
             "a receipt the field kept (field.persist_receipt) — otherwise the "
             "causal claim rests on a read that left no evidence.")
+    if json.loads(rows[0]["custody_override_json"])["override"]:
+        raise ValueError(
+            f"Receipt {rsha[:16]}… is COUNTERFACTUAL — it was taken against a "
+            "hypothetical custody state. No agent ever decided from a world "
+            "that did not exist, and a decision citing one would launder a "
+            "simulation into the causal record.")
     served = json.loads(rows[0]["served_json"])["served"]
     used = sorted(set(used_memory_ids))
     if not used:

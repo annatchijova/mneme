@@ -60,7 +60,8 @@ from mcp.server.fastmcp import FastMCP
 # Ensure the package resolves regardless of the invoking CWD
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from mneme import authority, bundle, causality, custody, field, protocol, trust
+from mneme import (authority, bundle, causality, counterfactual,
+                   custody, field, protocol, trust)
 from mneme.canonical import canonical_json, quantize, CANONICAL_SCALE
 
 log = logging.getLogger("mneme.mcp")
@@ -972,6 +973,109 @@ def mneme_impact(memory_id: str) -> dict:
                               "analyst review, never auto-flagged")},
         "edges": [list(e) for e in r.edges],
         "impact_sha256": r.impact_sha256,
+    }
+
+
+@mcp.tool()
+def mneme_counterfactual(
+    query: str,
+    memory_ids: str,
+    direction: str = "containment",
+    top_k: int = 5,
+    hops: int = 2,
+) -> dict:
+    """
+    Measure what excluding a set of memories ACTUALLY changes — the exact,
+    sealed, reproducible causal delta between two worlds.
+
+    Containment usually ends with "we found the poison and excluded it",
+    which says what was done and not what it did. This answers the
+    counterfactual instead: given this sealed state, does removing those
+    memories change the agent's behaviour, and in exactly which outputs?
+
+    direction="containment"  W = as if those memories had never been
+        contained; W' = the field as it stands. Use AFTER an incident:
+        "this was the exact observable effect of the poison."
+    direction="exclusion"    W = the field as it stands; W' = the same
+        field with those memories quarantined. Use BEFORE containing:
+        a forecast of the blast radius of your own quarantine.
+
+    The delta names removed_from_serving, entered_top_k, rank_changed,
+    score_changed, claim_outcome_changed (a topic whose winning claim
+    flips) and decision_dependency_changed. The first five are about THIS
+    query; the last is a field-wide fact about recorded decisions whose
+    evidence base moves, reported beside the verdict and never folded
+    into it.
+
+    An empty query-scoped delta is a real and unusual finding:
+    NON-INTERFERENCE — the poison was there, it was excluded, and for
+    this query it had changed nothing. Damage measured at zero rather
+    than assumed at unknown.
+
+    Changes nothing: no write, no status moved. A measurement that could
+    perturb its own subject would not be worth sealing.
+
+    Args:
+        query: The query text to compare the two worlds on.
+        memory_ids: Comma-separated ids to exclude / un-exclude.
+        direction: "containment" (default) or "exclusion".
+        top_k: Results compared (1-20).
+        hops: BFS expansion depth (0-4).
+
+    Returns:
+        The enumerated delta, both worlds' receipts, and the seal.
+    """
+    if not query.strip():
+        return {"error": "query must be non-empty."}
+    ids = [_sanitize_id(m.strip(), "memory_id")
+           for m in memory_ids.split(",") if m.strip()]
+    if not ids:
+        return {"error": "memory_ids must name at least one memory."}
+    if direction not in ("containment", "exclusion"):
+        return {"error": "direction must be 'containment' or 'exclusion'."}
+    top_k = max(1, min(int(top_k), 20))
+    hops = max(0, min(int(hops), 4))
+    q = _deterministic_embedding(_trunc(query))
+
+    conn = _get_conn()
+    cur = conn.cursor()
+    try:
+        if direction == "containment":
+            d = counterfactual.containment_effect(
+                cur, query_embedding=q, contained=ids, top_k=top_k, hops=hops)
+        else:
+            d = counterfactual.exclusion_effect(
+                cur, query_embedding=q, excluded=ids, top_k=top_k, hops=hops)
+    except Exception as exc:
+        conn.close()
+        return {"error": str(exc)}
+    conn.close()
+    return {
+        "direction": direction,
+        "verdict": d.summary(),
+        "interference": d.interference,
+        "query_scoped": {
+            "removed_from_serving": list(d.removed_from_serving),
+            "entered_top_k": list(d.entered_top_k),
+            "rank_changed": [list(x) for x in d.rank_changed],
+            "score_changed": [list(x) for x in d.score_changed],
+            "claim_outcome_changed": [list(x) for x in d.claim_outcome_changed],
+        },
+        "field_wide": {
+            "decision_dependency_changed": list(d.decision_dependency_changed),
+            "note": ("recorded decisions whose evidence base this change "
+                     "moves — most from other queries; reported beside the "
+                     "verdict, never folded into it"),
+        },
+        "worlds": {
+            "A": {"override": [list(p) for p in d.world_a_override],
+                  "served": list(d.served_a),
+                  "receipt_sha256": d.receipt_a_sha256},
+            "B": {"override": [list(p) for p in d.world_b_override],
+                  "served": list(d.served_b),
+                  "receipt_sha256": d.receipt_b_sha256},
+        },
+        "delta_sha256": d.delta_sha256,
     }
 
 
