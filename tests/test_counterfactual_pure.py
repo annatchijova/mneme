@@ -83,6 +83,7 @@ authority.bootstrap_root(cur, actor_id="root", display_name="Root",
                          reason="field genesis")
 for aid, caps in [("ingest", ["STORE", "REINFORCE"]),
                   ("agent", ["STORE", "DECIDE"]),
+                  ("auditor", ["COUNTERFACTUAL"]),
                   ("ir", ["QUARANTINE_ACTOR", "QUARANTINE_MEMORY"])]:
     authority.register_actor(cur, actor_id=aid, display_name=aid, kind="AGENT",
                              issuer_id="root", reason="staffing")
@@ -158,7 +159,8 @@ check("the poison is contained",
 print("\n[after containment: the exact observable causal effect]")
 before = field_snapshot(cur)
 effect = counterfactual.containment_effect(
-    cur, query_embedding=query, contained=["mem-poison"], top_k=5)
+    cur, query_embedding=query, contained=["mem-poison"], top_k=5,
+    actor_id="auditor")
 check("measuring after the fact also changes nothing",
       field_snapshot(cur) == before)
 check("the poison is named as removed from serving",
@@ -188,7 +190,8 @@ check("removing the truth flips the winning claim on the topic",
 print("\n[the finding people least expect: the poison changed nothing]")
 # A query far from the poison: excluding it moves no output at all.
 quiet = counterfactual.containment_effect(
-    cur, query_embedding=emb(0.0, 0.0, 1.0), contained=["mem-poison"], top_k=1)
+    cur, query_embedding=emb(0.0, 0.0, 1.0), contained=["mem-poison"], top_k=1,
+    actor_id="auditor")
 check("no memory left the served set", quiet.removed_from_serving == ())
 check("no memory entered it", quiet.entered_top_k == ())
 check("nothing was reranked", quiet.rank_changed == ())
@@ -202,7 +205,7 @@ check("...and the field-wide decision fact is said beside it, not folded in",
 check("...and it is sealed, so the claim is recomputable",
       counterfactual.containment_effect(
           cur, query_embedding=emb(0.0, 0.0, 1.0), contained=["mem-poison"],
-          top_k=1).delta_sha256 == quiet.delta_sha256)
+          top_k=1, actor_id="auditor").delta_sha256 == quiet.delta_sha256)
 check("a decision that used the poison still counts as dependency-changed",
       decision.decision_id in quiet.decision_dependency_changed,
       "input removal is a fact about the decision, not about this query")
@@ -210,7 +213,8 @@ check("a decision that used the poison still counts as dependency-changed",
 # ============================== a counterfactual receipt is not real evidence
 print("\n[a simulation must never become the record]")
 _, cf_receipt = field.recall(cur, query_embedding=query, top_k=5,
-                             custody_override={"mem-poison": "CLEAN"})
+                             custody_override={"mem-poison": "CLEAN"},
+                             actor_id="auditor")
 _, real_receipt = field.recall(cur, query_embedding=query, top_k=5)
 check("the two receipts have different digests",
       cf_receipt.receipt_sha256 != real_receipt.receipt_sha256)
@@ -231,8 +235,46 @@ raises("but no decision may cite one",
 conn.rollback()
 raises("a hypothetical world must still be a possible one",
        lambda: field.recall(cur, query_embedding=query,
-                            custody_override={"mem-poison": "DELETED"}),
+                            custody_override={"mem-poison": "DELETED"},
+                            actor_id="auditor"),
        ValueError, "not a custody status")
+
+# ============ the hole this project put in itself, and the shape of the fix
+print("\n[widening the custody gate is an authority-bearing read]")
+raises("an unnamed caller cannot widen the gate",
+       lambda: field.recall(cur, query_embedding=query, top_k=5,
+                            custody_override={"mem-poison": "CLEAN"}),
+       ValueError, "needs an actor_id holding COUNTERFACTUAL")
+raises("...and neither can an actor without the capability",
+       lambda: field.recall(cur, query_embedding=query, top_k=5,
+                            custody_override={"mem-poison": "CLEAN"},
+                            actor_id="ingest"),
+       ValueError, "conferring COUNTERFACTUAL")
+raises("the same refusal reaches containment_effect",
+       lambda: counterfactual.containment_effect(
+           cur, query_embedding=query, contained=["mem-poison"], top_k=5),
+       ValueError, "COUNTERFACTUAL")
+served_by_auditor = field.recall(cur, query_embedding=query, top_k=5,
+                                 custody_override={"mem-poison": "CLEAN"},
+                                 actor_id="auditor")[0]
+check("an actor that HOLDS it may look",
+      "mem-poison" in [h.memory_id for h in served_by_auditor])
+check("NARROWING needs nothing — it can only show you less",
+      isinstance(counterfactual.exclusion_effect(
+          cur, query_embedding=query, excluded=["mem-truth"], top_k=5
+      ).delta_sha256, str))
+check("...and the same holds through recall directly",
+      "mem-truth" not in [h.memory_id for h in field.recall(
+          cur, query_embedding=query, top_k=5,
+          custody_override={"mem-truth": "QUARANTINED"})[0]])
+trust.quarantine_actor(cur, actor_id="auditor", initiated_by="ir",
+                       reason="the auditor's own credentials were compromised")
+conn.commit()
+raises("a QUARANTINED holder loses the capability like any other (A5)",
+       lambda: field.recall(cur, query_embedding=query, top_k=5,
+                            custody_override={"mem-poison": "CLEAN"},
+                            actor_id="auditor"),
+       ValueError, "is QUARANTINED")
 
 check("the field still exports and verifies after all of it",
       bundle.verify_bundle(bundle.export_bundle(cur))[0],

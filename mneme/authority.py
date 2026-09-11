@@ -134,6 +134,7 @@ CAPABILITIES = frozenset(
         "DECIDE",            # emit a decision record binding a recall receipt
         "ASSERT",            # assert a proposition, link evidence, relate claims
         "ADJUDICATE",        # decide between mutually exclusive hypotheses
+        "COUNTERFACTUAL",    # run a recall against a WIDER custody state
     }
 )
 
@@ -156,6 +157,21 @@ AUTHORITY_EVENT_TYPES = frozenset(
 # the stylometry pipeline named in KNOWN_LIMITATIONS is the obvious
 # candidate — arrives with its own capability and its own version bump, not
 # by widening this row.
+#
+# COUNTERFACTUAL is the one capability that governs a READ, and it exists
+# because of a hole this project put there itself. `custody_override` lets
+# a recall run against a hypothetical custody state — the primitive the
+# whole counterfactual analysis is built on — and forcing a QUARANTINED
+# memory to CLEAN made its CONTENT servable to anyone who could call
+# recall(). The custody gate is the thing MNEME is for, and a read path
+# that steps around it is not a smaller problem for being a read.
+#
+# Only the WIDENING direction is gated, and the asymmetry is the point: an
+# override that makes something servable can reveal what the gate withheld;
+# one that only makes something UNservable can show a caller strictly less
+# than it could already see. So `exclusion_effect` ("what would quarantining
+# these do?") stays open to anyone, and `containment_effect` ("what would
+# they have shown?") does not.
 #
 # ASSERT and ADJUDICATE are separate from STORE and from each other because
 # the acts are different in kind: storing a document, asserting that a
@@ -714,20 +730,34 @@ def ledger_exists(cur) -> bool:
     return cur.fetchone() is not None
 
 
-def root_subject(cur) -> str | None:
+def root_subjects(cur) -> list[str]:
     """
-    The actor the whole ledger hangs from, or None in a field that never
-    bootstrapped. Found from evidence — the chain carrying a self-issued
-    root grant — never from a config value, because a root nobody can
-    point at in the record is not a root an auditor can check.
+    EVERY actor whose chain carries a self-issued root grant, sorted.
+
+    Plural on purpose, and the plural is the fix. B7 checks that a ledger
+    declares exactly ONE root — but `export_bundle` used to seed its
+    authority closure from a singular `root_subject()`, so a field with
+    two roots shipped only the first and the check counted one and passed.
+    A check that cannot see the thing it checks is not a check.
+
+    Found from evidence — the chains themselves — never from
+    `ledger_root`, which is a write-time constraint and not the record.
     """
     cur.execute(
         "SELECT subject_id, payload_json FROM authority_chain "
         "WHERE event_type = 'GRANTED' ORDER BY subject_id ASC, seq ASC")
+    out: list[str] = []
     for sid, pj in cur.fetchall():
-        if json.loads(pj).get("root") is True:
-            return sid
-    return None
+        if json.loads(pj).get("root") is True and sid not in out:
+            out.append(sid)
+    return out
+
+
+def root_subject(cur) -> str | None:
+    """The first root, for callers that want to name one. Prefer
+    root_subjects() anywhere the COUNT matters."""
+    roots = root_subjects(cur)
+    return roots[0] if roots else None
 
 
 def genesis_at(cur) -> str | None:
@@ -847,6 +877,14 @@ def bootstrap_root(
             "VALUES (?, ?, ?, 'ACTIVE', ?)",
             (actor_id, display_name, kind, ts),
         )
+    # The structural guard. The COUNT above is a read, and two writers can
+    # both pass a read before either commits; this INSERT cannot both
+    # succeed. A second root is now a constraint violation rather than a
+    # race outcome — the idiom UNIQUE(memory_id, prev_hash) already uses
+    # against forked chains.
+    cur.execute(
+        "INSERT INTO ledger_root (singleton, actor_id, created_at) "
+        "VALUES (1, ?, ?)", (actor_id, ts))
     append_authority_event(
         cur, subject_id=actor_id, event_type="ACTOR_REGISTERED",
         issuer_id=actor_id, reason=reason,

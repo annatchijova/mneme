@@ -11,7 +11,7 @@ unfolds:
 
   0. an authority ledger is bootstrapped and capabilities are granted:
      every mutation below carries two separable proofs, integrity and
-     authority;
+     authority — and one READ, the counterfactual, is gated too;
   1. a compromised pipeline plants a poisoned memory and inflates a
      legitimate one;
   2. recall shows the field's own defences (inhibition, the rescue
@@ -89,7 +89,8 @@ def main() -> None:
          "runbook ingestion and on-call answers"),
         ("pipeline-feeds", "PIPELINE", ["STORE", "REINFORCE"], "feed sync duty"),
         ("analyst-omar", "HUMAN",
-         ["REINFORCE", "QUARANTINE_ACTOR", "QUARANTINE_MEMORY", "REHABILITATE"],
+         ["REINFORCE", "QUARANTINE_ACTOR", "QUARANTINE_MEMORY", "REHABILITATE",
+          "COUNTERFACTUAL"],
          "incident response duty"),
     ]:
         authority.register_actor(cur, actor_id=aid, display_name=aid, kind=kind,
@@ -222,10 +223,21 @@ def main() -> None:
     print(f"  sealed:   sha256={report.impact_sha256[:16]}…")
 
     print("\ncounterfactual — what did the poison actually DO?")
+    print("  asking what a contained memory WOULD have shown is asking to see")
+    print("  what containment took away, so it needs COUNTERFACTUAL:")
+    try:
+        counterfactual.containment_effect(
+            cur, query_embedding=e([0.97, 0.02, 0.0]),
+            contained=["mem-poison"], top_k=5, actor_id="agent-ada")
+        print("    agent-ada (no such grant)      SUCCEEDED  <- the gate leaks")
+    except ValueError as exc:
+        print(f"    agent-ada (no such grant)      refused: "
+              f"{str(exc).split(' at ')[0]}")
     for label, query in [("near the poisoned policy", e([0.97, 0.02, 0.0])),
                          ("about rollbacks (far away)", e([0.1, 1.0, 0.0]))]:
         d = counterfactual.containment_effect(
-            cur, query_embedding=query, contained=["mem-poison"], top_k=5)
+            cur, query_embedding=query, contained=["mem-poison"], top_k=5,
+            actor_id="analyst-omar")
         print(f"  query {label}:")
         print(f"    {d.summary()}")
         if d.removed_from_serving:

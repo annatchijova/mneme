@@ -72,7 +72,7 @@ decision, not a quiet patch.
   audited event with a stated reason, never a row removal or column
   edit.
 
-- **A1–A6 — Authority is delegated, never invented.** Every mutation
+- **A1–A7 — Authority is delegated, never invented.** Every mutation
   names the grant it acted under (A1). Authority chains are per-actor,
   append-only, genesis bound to actor_id (A2). A grantor may only grant
   what it holds (A3), so every capability traces back by checkable
@@ -82,7 +82,10 @@ decision, not a quiet patch.
   as the mutation, not a note in the margin (A5). And the last grant
   conferring GRANT cannot be revoked, because a field nobody can ever
   authorize anything in is indistinguishable from a successful attack
-  (A6).
+  (A6). And widening the custody gate — the counterfactual's one
+  privilege — is itself an authorized read, because a gate with a
+  documented bypass is a gate with a bypass (A7, found by Round 3 in
+  this project's own new code).
 
 - **C1–C5 — A proposition is not a document.** A claim's statement is
   immutable; revision is supersession (C1). Claim chains are per-claim
@@ -375,6 +378,12 @@ both of which were prose in KNOWN_LIMITATIONS and are now executable.
 
 Writing it produced `replay_protocol` 1.1.0 and `taint_protocol` 2.0.0.
 That is the argument for keeping it.
+
+And it found neither of Round 3's two confirmed vulnerabilities, which is
+the argument for not mistaking it for an audit. The same author wrote the
+mutants and the defenses; a mutation score is a floor on what a suite
+would notice, never a ceiling on what is there. Both findings are mutants
+now, kept as markers of the blind spot.
 
 ## Phase 2 sketch (not designed, only reserved)
 

@@ -109,6 +109,8 @@ caught, in both verifiers:
 | Rewrite a proposition under its own seal | B9 — the statement hashes to what its assertion sealed |
 | Declare a constraint satisfied while the shipped claims violate it | B9 — the status is recomputed, not read |
 | Change a rule and let old bundles acquire it | B0 — a bundle declares the semantics it was checked under |
+| Read a quarantined memory by pretending it is clean | Widening the custody gate needs COUNTERFACTUAL (Round 3, R3-01) |
+| Stand up a second root and ship one of them | B7 — every root chain travels, so the count is the real count (R3-02) |
 
 ## The disciplines, in one paragraph
 
@@ -259,6 +261,12 @@ What neither had, and MNEME adds:
                           confirmed containment and recovery-boundary gaps,
                           a falsified rollback vector, and the guarantees
                           that must transfer to distributed memory systems
+    SECURITY_AUDIT_ROUND_3.md
+                          Round-3 audit of the layers that closed Round 2:
+                          two confirmed vulnerabilities (both fixed), three
+                          reported limitations, one falsified-on-SQLite
+                          portability defect — and why the mutation suite
+                          found none of them
     tests/                pure suites: no pip installs, no infrastructure,
                           SQLite :memory: only — including
                           test_semantic_mutants.py, which mutates the
@@ -328,13 +336,25 @@ provider.
 Phase 1 core complete. Phase 1.5 adds the authority ledger, causal
 decision receipts, counterfactual contamination analysis, the influence
 budget, embedding provenance, temporal replay, the epistemic claims
-layer, and protocol versioning — 554/554 pure checks passing, plus 12/12
-semantic mutants killed with 2 boundaries explicitly declared.
+layer, and protocol versioning.
+
+Round 3 then audited that new surface and found two confirmed
+vulnerabilities in it — a disclosure oracle in the counterfactual read
+path, and a global check the export made unreachable. Both are fixed
+here; three further findings are reported and named in
+`KNOWN_LIMITATIONS.md` rather than quietly closed.
+
+569/569 pure checks passing, plus 14/14 semantic mutants killed with
+3 boundaries explicitly declared — and an audit that explains why that
+second number is a floor and not a ceiling.
 
 Round 2's findings are closed: a quarantined actor can no longer write
 (R2-01), and nobody can nominate themselves the rehabilitation authority
 by choosing a string (R2-02). The audit's own closing line — *you found
 that "audited" does not imply "authorized"* — became the next invariant.
+Round 3's lesson is smaller and just as portable: when a check becomes
+global, audit what the export makes visible to it, and when a read path
+gains a parameter, ask what it now reveals.
 
 Not yet built: HTTP API, k-NN graph for large corpora, STDP synaptic
 dynamics, stylometric authorship checks. And ten or so new limitations

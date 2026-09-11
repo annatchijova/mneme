@@ -993,6 +993,7 @@ def mneme_counterfactual(
     query: str,
     memory_ids: str,
     direction: str = "containment",
+    actor_id: str = "",
     top_k: int = 5,
     hops: int = 2,
 ) -> dict:
@@ -1007,7 +1008,10 @@ def mneme_counterfactual(
 
     direction="containment"  W = as if those memories had never been
         contained; W' = the field as it stands. Use AFTER an incident:
-        "this was the exact observable effect of the poison."
+        "this was the exact observable effect of the poison." This
+        direction WIDENS the custody gate, so it requires an actor_id
+        holding COUNTERFACTUAL — asking what the poison would have shown
+        is asking to see what containment took away.
     direction="exclusion"    W = the field as it stands; W' = the same
         field with those memories quarantined. Use BEFORE containing:
         a forecast of the blast radius of your own quarantine.
@@ -1031,6 +1035,9 @@ def mneme_counterfactual(
         query: The query text to compare the two worlds on.
         memory_ids: Comma-separated ids to exclude / un-exclude.
         direction: "containment" (default) or "exclusion".
+        actor_id: Required for "containment" — must hold COUNTERFACTUAL.
+            Not needed for "exclusion", which can only show you less than
+            you could already see.
         top_k: Results compared (1-20).
         hops: BFS expansion depth (0-4).
 
@@ -1054,7 +1061,8 @@ def mneme_counterfactual(
     try:
         if direction == "containment":
             d = counterfactual.containment_effect(
-                cur, query_embedding=q, contained=ids, top_k=top_k, hops=hops)
+                cur, query_embedding=q, contained=ids, top_k=top_k, hops=hops,
+                actor_id=_sanitize_id(actor_id, "actor_id") if actor_id else None)
         else:
             d = counterfactual.exclusion_effect(
                 cur, query_embedding=q, excluded=ids, top_k=top_k, hops=hops)

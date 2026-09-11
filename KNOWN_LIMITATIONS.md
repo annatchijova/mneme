@@ -230,6 +230,89 @@ which is the honest handling of pre-authority history — but it is
 handling, not prevention. The regime is one-way: once a field is
 bootstrapped, nothing removes a chain, so it can never return.
 
+## Widening the custody gate is an authority-bearing READ
+
+(Source: `counterfactual.py`, `field.recall`; Round 3, R3-01.) The
+counterfactual needs to see the other world, and `custody_override`
+is how. Forcing a QUARANTINED memory to CLEAN made its CONTENT
+servable to anyone who could call recall — the gate this project exists
+to hold, with a documented bypass. It is now gated by the
+`COUNTERFACTUAL` capability, and only in the WIDENING direction:
+narrowing can only ever show a caller less than it could already see.
+
+WHAT REMAINS. The check happens and nothing is written. **MNEME does not
+audit reads**, anywhere, and gating one did not start. So a refused
+attempt to widen the gate leaves no trace, and a successful one leaves no
+trace either — the grant is checked and never recorded, because recall is
+read-only and making it write would invert M2's intent on the hottest
+path. If who looked at what ever needs to be evidence, that is a
+different design, not a flag on this one.
+
+## Existence and status of withheld memories is not secret
+
+(Round 3, R3-05.) Three un-gated paths confirm that a memory the custody
+gate withholds EXISTS, to a caller who cannot see it:
+`receipt.excluded_custody` counts it, `exclusion_effect` accepts its id
+without error, and `claims.standing().withheld_evidence` names it with
+its status. None discloses content — that was R3-01 and it is closed.
+
+Two of the three are deliberate and would cost more to remove than they
+cost to keep. *What was withheld and why is a number, not a mystery* is a
+transparency property this project chose on purpose, and error messages
+that distinguish "unknown memory" from "not permitted" are what make a
+forensic tool debuggable. Together they compose into id enumeration for
+an actor with a narrow grant, and that is the honest statement of the
+trade rather than a bug anyone should fix by reflex.
+
+## Denial of epistemics: ASSERT is cheap, ADJUDICATE is not
+
+(Round 3, R3-03, CONFIRMED and NOT FIXED.) An actor holding only
+`ASSERT` can mint junk hypotheses and bind an already-VALIDATED claim
+into new EXACTLY_ONE sets with them. Each set reads UNDETERMINED —
+correctly, because an open hypothesis must never be read as agreement —
+and only an `ADJUDICATE` holder can clear it. One cheap call creates work
+that only a privileged actor can do.
+
+Nothing is corrupted: the claim stays VALIDATED, the settled set stays
+SATISFIED, the bundle verifies. What degrades is the readability of
+`standing()` and the adjudicator's queue. It is the taint DoS one level
+up, and the influence budget's answer there suggests the shape of the
+answer here. The recommendation on the table — requiring `ADJUDICATE` to
+bind a VALIDATED claim into a NEW constraint, since re-opening a settled
+question is an adjudication-level act — is designed and not built.
+
+## DERIVED is the one relation MNEME does not make bilateral
+
+(Round 3, R3-04, CONFIRMED and NOT FIXED.) Contradiction, lineage and
+decision-use are all bilateral: both sides record them or the relation
+does not exist. Descent is not. `derived_from_decision` is written by the
+storing actor into its own STORED payload, and neither the named decision
+nor the ancestor memory corroborates it.
+
+So an actor holding `STORE` and `DECIDE` can make its own memory appear
+DERIVED from an honest one, and co-serving inflates POSSIBLE for free.
+`impact()` never quarantines, so the damage is to an analyst's reading
+rather than to the field — but a report an attacker can shape is weaker
+evidence than its seal suggests, and that is worth knowing before anyone
+treats a blast radius as proof rather than as a lead.
+
+## A6 is read-then-write, and SQLite hides it
+
+(Round 3, R3-06, FALSIFIED on SQLite, CONFIRMED as a portability defect.)
+`revoke()` checks "would this leave the field without a GRANT holder?"
+and then appends. Two concurrent revokes each skipping a different holder
+both pass that check — confirmed by induction — and SQLite's
+single-writer lock refuses the second transaction, which is the only
+reason A6 holds today.
+
+Under snapshot isolation, both would commit and A6 would be an unenforced
+comment. The same shape as Round 2's H4 in code written after it, and the
+fix pattern is already in this codebase: re-assert the precondition inside
+the write and let `rowcount` be the verdict. `bootstrap_root`'s COUNT had
+the identical defect and is now closed structurally by the `ledger_root`
+singleton; A6 is not, and it should be ported before the CockroachDB
+port rather than during it.
+
 ## Non-interference is proven per QUERY, and only over recall
 
 (Source: `counterfactual.py`.) An empty delta licenses exactly this
@@ -328,7 +411,7 @@ export is the only one that proves a sweep flagged everything it should
 have — the same shape as the existing partial-export limitation below,
 for the same reason.
 
-## Semantic mutants: 12 killed, 2 declared survivors
+## Semantic mutants: 14 killed, 3 declared survivors — and what they missed
 
 `tests/test_semantic_mutants.py` patches MNEME's SEMANTICS, lets the
 patched code produce real evidence, and asks whether anything refuses
@@ -336,14 +419,22 @@ it. The metric is mutants killed over total, and an UNDECLARED survivor
 fails the suite — a metric that improves by lowering its standards is
 not a metric.
 
-The two declared survivors are the entries above: a model that returns a
-vector it never computed, and an adversary who fabricates a coherent
-field. Both were prose in this file for a long time. They are now
-executable.
+The declared survivors are entries above: a model that returns a vector
+it never computed, an adversary who fabricates a coherent field, and a
+hostile exporter that omits an authority chain. All three were prose in
+this file. They are now executable.
 
 Writing that suite found two real gaps, both since closed and both
 visible in the protocol versions: `replay_protocol` 1.1.0 (a promotion
 must be arithmetically DUE, not merely recorded — a writer that quietly
 narrowed the comparison satisfied every check MNEME had) and
-`taint_protocol` 2.0.0 (the sweep re-derivation above). The suite is
-worth keeping mainly because it will do that again.
+`taint_protocol` 2.0.0 (the sweep re-derivation above).
+
+AND IT MISSED THE TWO THAT MATTERED MOST. Round 3 found the
+counterfactual disclosure oracle and the unreachable root check, and 14/14
+had nothing to say about either. The reason is structural and worth
+keeping in view: the same author wrote the mutants and the defenses, so
+the metric measured internal coherence rather than robustness. Both are
+mutants now — kept as markers of the blind spot, not as evidence of
+coverage. A mutation score is a floor on what a suite would notice, never
+a ceiling on what is there.

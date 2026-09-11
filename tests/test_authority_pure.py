@@ -501,6 +501,45 @@ check("both implementations map events to the same capabilities",
       and authority.AUTHORITY_EVENT_CAPABILITY == offline.AUTHORITY_EVENT_CAPABILITY
       and set(authority.CAPABILITIES) == set(offline.CAPABILITIES))
 
+# ================================================== two roots, and the export
+print("\n[a check that cannot see what it checks is not a check]")
+raises("the root act is now refused by a CONSTRAINT, not only a read",
+       lambda: cur.execute(
+           "INSERT INTO ledger_root (singleton, actor_id, created_at) "
+           "VALUES (1, 'root-op', ?)", (custody.now_ts(),)),
+       Exception, "UNIQUE")
+conn.rollback()
+
+# A field that already carries two self-issued roots — the state a racing
+# pair of bootstraps used to be able to reach. Built by direct SQL, because
+# the constraint above now makes it unreachable through the API.
+conn8, cur8 = fresh_db()
+authority.bootstrap_root(cur8, actor_id="root-a", display_name="A",
+                         reason="genesis")
+ts8 = custody.now_ts()
+cur8.execute("INSERT INTO actors (actor_id, display_name, kind, created_at) "
+             "VALUES ('root-b','B','HUMAN',?)", (ts8,))
+authority.append_authority_event(
+    cur8, subject_id="root-b", event_type="ACTOR_REGISTERED",
+    issuer_id="root-b", reason="a second, racing bootstrap",
+    payload={"display_name": "B", "kind": "HUMAN", "root": True},
+    created_at=ts8)
+authority.append_authority_event(
+    cur8, subject_id="root-b", event_type="GRANTED", issuer_id="root-b",
+    reason="a second, racing bootstrap",
+    payload={"grant_id": "grant-b",
+             "capabilities": sorted(authority.CAPABILITIES), "root": True},
+    created_at=ts8)
+conn8.commit()
+check("both roots are found from evidence, not just the first",
+      authority.root_subjects(cur8) == ["root-a", "root-b"],
+      str(authority.root_subjects(cur8)))
+agree("a two-root ledger is refused", bundle.export_bundle(cur8), False, {"B7"})
+check("...and the error names the count rather than hinting at it",
+      any("2 root grants" in e
+          for e in bundle.verify_bundle(bundle.export_bundle(cur8))[1]),
+      str(bundle.verify_bundle(bundle.export_bundle(cur8))[1][:2]))
+
 # =============================================== the pre-authority carve-out
 print("\n[a field that never had a ledger says so]")
 conn6, cur6 = fresh_db()

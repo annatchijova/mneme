@@ -144,6 +144,28 @@ CREATE TABLE IF NOT EXISTS authority_chain (
 CREATE INDEX IF NOT EXISTS idx_authority_issuer ON authority_chain (issuer_id);
 
 -- -----------------------------------------------------------------------------
+-- ledger_root — the root act, made unrepeatable by a CONSTRAINT rather than
+-- by a check that a second writer could pass.
+--
+-- bootstrap_root() reads COUNT(authority_chain) and then writes. Two writers
+-- can both pass that read before either commits, and the result is a field
+-- with two self-issued root grants — each chain internally perfect, no
+-- constraint violated. This table is the structural answer, in the idiom the
+-- rest of the schema already uses: the PRIMARY KEY pinned to the literal 1
+-- makes a second root a constraint violation, not a race outcome.
+--
+-- It holds no authority of its own. It is a cache of "which chain carries the
+-- root grant", derivable from the chains themselves — exactly as actors.status
+-- is a cache of the authority replay — and B7 re-derives the root from
+-- evidence and never from here.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS ledger_root (
+    singleton  INTEGER PRIMARY KEY CHECK (singleton = 1),
+    actor_id   TEXT NOT NULL REFERENCES actors(actor_id),
+    created_at TEXT NOT NULL
+);
+
+-- -----------------------------------------------------------------------------
 -- cell_links — raven-memory's ternary links between memories.
 -- RESONANT amplifies neighbours; INHIBITORY silences contradictions.
 -- Link creation/removal is a state change => custody events on BOTH ends.

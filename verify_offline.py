@@ -102,7 +102,7 @@ AUTHORITY_EVENT_TYPES = frozenset({
 CAPABILITIES = frozenset({
     "STORE", "REINFORCE", "SUPERSEDE", "QUARANTINE_ACTOR",
     "QUARANTINE_MEMORY", "REHABILITATE", "GRANT", "REVOKE", "DECIDE",
-    "ASSERT", "ADJUDICATE",
+    "ASSERT", "ADJUDICATE", "COUNTERFACTUAL",
 })
 # Custody event type -> capability its actor had to hold (authority.py).
 REQUIRED_CAPABILITY = {
@@ -148,7 +148,7 @@ SUPPORTED_PROTOCOLS = {
     "replay_protocol": frozenset({"1.0.0", "1.1.0"}),
     "ranking_protocol": frozenset({"1.0.0"}),
     "taint_protocol": frozenset({"1.0.0", "1.1.0", "2.0.0"}),
-    "authority_protocol": frozenset({"1.0.0", "1.1.0"}),
+    "authority_protocol": frozenset({"1.0.0", "1.1.0", "1.2.0"}),
     # receipt 1.0.0 is absent on purpose: its digest body differs, so this
     # verifier genuinely cannot check one.
     "receipt_protocol": frozenset({"2.0.0"}),

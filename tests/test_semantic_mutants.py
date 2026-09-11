@@ -31,6 +31,12 @@ closed, and both are in the protocol versions: replay_protocol 1.1.0
 (a promotion must be arithmetically DUE, not merely recorded) and
 taint_protocol 2.0.0 (an included sweep's flagged set is re-derived from
 custody evidence rather than trusted to agree with its own seal).
+
+It did NOT find the two that Round 3 did — the counterfactual disclosure
+oracle and the unreachable root check — and that is the more useful fact
+about it. The author of a mutant who also wrote the defenses writes
+killable mutants. Both are now mutants here, and the reason to keep them
+is that they mark the blind spot rather than the coverage.
 """
 
 from __future__ import annotations
@@ -117,6 +123,14 @@ SURVIVED: list = []
 # demonstrates. These are not excuses; they are the two limits MNEME has
 # always declared, now with a test that proves they are real.
 DECLARED_SURVIVORS = {
+    "a hostile exporter omits an authority chain entirely": (
+        "A verifier cannot detect the absence of evidence it has no other "
+        "pointer to. Already stated for sweeps — a partial export proves what "
+        "it carries, never what it omits — and it holds identically for an "
+        "authority chain belonging to an actor that wrote nothing. What the "
+        "Round 3 fix changed is real and smaller: MNEME's own exporter no "
+        "longer hides a second root, so an honest export of a two-root field "
+        "now fails instead of passing."),
     "the model returns a vector it never computed": (
         "The embedding boundary. MNEME records what a provider HANDED it and "
         "makes drift across memories detectable; it cannot witness the "
@@ -435,6 +449,108 @@ def m_recall_traverses_tainted():
         return True, ("invariant: a non-CLEAN memory moved the scores of "
                       f"CLEAN ones ({honest} -> {mutated})")
     return False, "the mutation changed nothing observable"
+
+
+@mutant("the custody gate is widened by an unauthorized read")
+def m_counterfactual_disclosure():
+    """
+    The hole this project put in itself. `custody_override` can force a
+    QUARANTINED memory CLEAN, which makes its CONTENT servable — and
+    recall has never required a capability. The mutation removes the
+    COUNTERFACTUAL gate; the invariant that catches it is the one the
+    whole system rests on: a non-CLEAN memory is invisible to the agent.
+    """
+    conn, cur = fresh()
+    field.store(cur, memory_id="m-secret",
+                content="SECRET: the admin password is hunter2",
+                embedding=emb(1.0, 0.0), embedding_model="dev",
+                actor_id="ingest", reason="doc")
+    trust.quarantine_memory(cur, memory_id="m-secret", actor_id="ir",
+                            reason="contains a leaked credential")
+    conn.commit()
+    try:
+        hits, _ = field.recall(cur, query_embedding=emb(1.0, 0.0), top_k=3,
+                               custody_override={"m-secret": "CLEAN"})
+    except ValueError as exc:
+        conn.close()
+        return True, f"refused at read: {exc}"
+    conn.close()
+    leaked = [h.content for h in hits if h.memory_id == "m-secret"]
+    if leaked:
+        return False, f"withheld content served to an unauthorized caller: {leaked[0][:40]}"
+    return True, "the gate held"
+
+
+@mutant("a field carries two self-issued roots")
+def m_second_root():
+    """
+    B7 counts root grants among the chains a bundle CARRIES, and the
+    export used to seed its authority closure from a SINGULAR root — so a
+    two-root field shipped only the first, the verifier counted one, and
+    the bundle verified clean. A check that cannot see the thing it
+    checks is not a check.
+    """
+    conn, cur = fresh()
+    ts = custody.now_ts()
+    cur.execute("INSERT INTO actors (actor_id, display_name, kind, created_at) "
+                "VALUES ('root-b','B','HUMAN',?)", (ts,))
+    authority.append_authority_event(
+        cur, subject_id="root-b", event_type="ACTOR_REGISTERED",
+        issuer_id="root-b", reason="a second, racing bootstrap",
+        payload={"display_name": "B", "kind": "HUMAN", "root": True},
+        created_at=ts)
+    authority.append_authority_event(
+        cur, subject_id="root-b", event_type="GRANTED", issuer_id="root-b",
+        reason="a second, racing bootstrap",
+        payload={"grant_id": "grant-b",
+                 "capabilities": sorted(authority.CAPABILITIES), "root": True},
+        created_at=ts)
+    conn.commit()
+    ok, errs = verdict(bundle.export_bundle(cur))
+    conn.close()
+    return (not ok), (errs[0] if errs else "")
+
+
+@mutant("a hostile exporter omits an authority chain entirely",
+        expect="survives")
+def m_hostile_export_omission():
+    """
+    The boundary the previous mutant sits next to, and the reason the two
+    are separate entries. Fixing the EXPORT means MNEME's own tooling can
+    no longer hide a second root: an honest export of a two-root field now
+    fails. It does not mean a hostile exporter cannot omit the chain — and
+    a verifier cannot detect the absence of evidence it has no other
+    pointer to.
+
+    Exactly the limitation KNOWN_LIMITATIONS already states for sweeps: a
+    partial export proves what it carries, never what it omits. The
+    full-field export is the only one that proves absence.
+    """
+    conn, cur = fresh()
+    ts = custody.now_ts()
+    cur.execute("INSERT INTO actors (actor_id, display_name, kind, created_at) "
+                "VALUES ('root-b','B','HUMAN',?)", (ts,))
+    for et, payload in (
+        ("ACTOR_REGISTERED", {"display_name": "B", "kind": "HUMAN", "root": True}),
+        ("GRANTED", {"grant_id": "grant-b",
+                     "capabilities": sorted(authority.CAPABILITIES),
+                     "root": True}),
+    ):
+        authority.append_authority_event(
+            cur, subject_id="root-b", event_type=et, issuer_id="root-b",
+            reason="a second, racing bootstrap", payload=payload, created_at=ts)
+    conn.commit()
+    b = json.loads(bundle.export_bundle(cur))
+    b["body"]["authority"] = [e for e in b["body"]["authority"]
+                              if e["subject_id"] != "root-b"]
+    b["body"]["authority_merkle_root"] = bundle.heads_merkle_root(
+        {e["subject_id"]: e["chain"][-1]["entry_hash"]
+         for e in b["body"]["authority"]})
+    b["bundle_sha256"] = hashlib.sha256(
+        canonical_json(b["body"]).encode("utf-8")).hexdigest()
+    ok, errs = verdict(json.dumps(b))
+    conn.close()
+    return (not ok), (errs[0] if errs else "")
 
 
 @mutant("the model returns a vector it never computed", expect="survives")

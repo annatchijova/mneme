@@ -332,13 +332,16 @@ def export_bundle(cur, *, memory_ids: list[str] | None = None) -> str:
     # few rows and an unauthorized-looking bundle that merely omitted the
     # proof is the worst of both outcomes.
     #
-    # The root always travels, even when no exported memory's actor leads
-    # to it. Without it a bundle could declare an authority genesis whose
-    # evidence it does not carry — a claim about a ledger nobody can see —
-    # and the earliest-instant check (B7) would have nothing to compare.
-    root = authority.root_subject(cur)
-    if root is not None:
-        actors_in_evidence.add(root)
+    # EVERY root travels, even when no exported memory's actor leads to
+    # one. Two reasons, and the second was found by auditing this export:
+    #   - without the root, a bundle could declare an authority genesis
+    #     whose evidence it does not carry — a claim about a ledger nobody
+    #     can see — and B7's earliest-instant check would have nothing to
+    #     compare against;
+    #   - seeding from a SINGULAR root made B7's "exactly one root" check
+    #     unreachable: a field with two roots shipped only the first, the
+    #     verifier counted one, and the bundle verified clean.
+    actors_in_evidence.update(authority.root_subjects(cur))
     authority_rows: list[dict[str, Any]] = []
     auth_heads: dict[str, str] = {}
     for sid in _authority_closure(cur, actors_in_evidence):

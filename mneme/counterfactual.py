@@ -177,6 +177,7 @@ def compare_worlds(
     world_b: dict[str, str] | None = None,
     top_k: int = 5,
     hops: int = field.DEFAULT_HOPS,
+    actor_id: str | None = None,
 ) -> CounterfactualDelta:
     """
     The primitive: run one query against two hypothetical custody states
@@ -185,13 +186,17 @@ def compare_worlds(
     Neither world is privileged. `containment_effect` and
     `exclusion_effect` below are the two directions people actually ask
     for, expressed in terms of this.
+
+    `actor_id` is required only when a world WIDENS what the custody gate
+    serves, because only widening can disclose what the gate withheld.
+    See field.recall and the COUNTERFACTUAL capability.
     """
     hits_a, receipt_a = field.recall(
         cur, query_embedding=query_embedding, top_k=top_k, hops=hops,
-        custody_override=world_a)
+        custody_override=world_a, actor_id=actor_id)
     hits_b, receipt_b = field.recall(
         cur, query_embedding=query_embedding, top_k=top_k, hops=hops,
-        custody_override=world_b)
+        custody_override=world_b, actor_id=actor_id)
 
     rank_a = {h.memory_id: i for i, h in enumerate(hits_a)}
     rank_b = {h.memory_id: i for i, h in enumerate(hits_b)}
@@ -296,6 +301,7 @@ def _actual_status(cur, memory_id: str) -> str | None:
 def containment_effect(
     cur, *, query_embedding: list[Any], contained: list[str],
     top_k: int = 5, hops: int = field.DEFAULT_HOPS,
+    actor_id: str | None = None,
 ) -> CounterfactualDelta:
     """
     "What did the poison actually DO?"
@@ -311,10 +317,13 @@ def containment_effect(
     at unknown.
     """
     _require_known(cur, contained)
+    # World A forces contained memories CLEAN, which WIDENS the gate — so
+    # this direction needs COUNTERFACTUAL. Asking what the poison would
+    # have shown is asking to see what containment took away.
     return compare_worlds(
         cur, query_embedding=query_embedding,
         world_a={m: "CLEAN" for m in sorted(set(contained))},
-        world_b=None, top_k=top_k, hops=hops)
+        world_b=None, top_k=top_k, hops=hops, actor_id=actor_id)
 
 
 def exclusion_effect(

@@ -908,6 +908,7 @@ def recall(
     hops: int = DEFAULT_HOPS,
     custody_override: dict[str, str] | None = None,
     as_of: str | None = None,
+    actor_id: str | None = None,
 ) -> tuple[list[RecallHit], RecallReceipt]:
     """
     Custody-gated, exactly-ranked recall.
@@ -941,7 +942,8 @@ def recall(
     works in both directions, since a memory can be forced CLEAN as
     easily as forced QUARANTINED.
 
-    Two disciplines make this safe rather than a hole:
+    Three disciplines make this safe rather than a hole, and the third
+    was missing until an audit of this very function found it:
       - it changes nothing. No write, no status column touched; the
         override lives only in this call's arithmetic.
       - the receipt SAYS SO. The override is inside the receipt digest,
@@ -949,6 +951,14 @@ def recall(
         a real one and cannot be laundered into evidence about the actual
         field — and record_decision refuses to let a decision cite one,
         because no agent ever decided from a world that did not exist.
+      - WIDENING REQUIRES AUTHORITY. An override that makes a memory
+        servable which the base world would not serve can disclose
+        exactly what the custody gate withheld — the gate this whole
+        project exists to hold. So a widening override demands `actor_id`
+        naming an actor that holds COUNTERFACTUAL. A NARROWING override
+        needs nothing: it can only ever show the caller less than it
+        could already see. Fields with no authority ledger are unchanged,
+        as everywhere.
 
     ranking_protocol stays 1.0.0: with an empty override the behaviour is
     byte-identical, and with a non-empty one the SCORING rules are
@@ -990,6 +1000,32 @@ def recall(
         raise ValueError(
             f"custody_override names memories this field does not have: "
             f"{unknown}. A counterfactual is about THIS field or it is fiction.")
+    # The authority check on WIDENING, computed against the base world the
+    # override is being applied to — which is the historical state when
+    # as_of is given, and today's columns otherwise.
+    if override:
+        widening = []
+        for mid, _c, _e, _f, status in all_rows:
+            if override.get(mid) != "CLEAN":
+                continue
+            if historical is not None:
+                base = historical.get(mid, (None, None))[0]
+            else:
+                base = status
+            if base != "CLEAN":
+                widening.append(mid)
+        if widening and authority.ledger_exists(cur):
+            if actor_id is None:
+                raise ValueError(
+                    f"This override would make {sorted(widening)} servable, "
+                    "which the custody gate does not. Widening the gate can "
+                    "disclose exactly what it withheld, so it needs an "
+                    "actor_id holding COUNTERFACTUAL. A narrowing override "
+                    "needs nothing — it can only show you less.")
+            authority.require(cur, actor_id=actor_id,
+                              capability="COUNTERFACTUAL",
+                              at_ts=as_of or custody.now_ts())
+
     rows = []
     excluded_custody = 0
     servable_ids: set[str] = set()

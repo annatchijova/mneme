@@ -119,7 +119,12 @@ TAINT_PROTOCOL = "2.0.0"
 #         the epistemic layer. MINOR: every 1.0.0 check is unchanged, the
 #         custody event -> capability map is untouched, and a 1.0.0 bundle
 #         simply carries no claim events.
-AUTHORITY_PROTOCOL = "1.1.0"
+# 1.2.0 — adds COUNTERFACTUAL, the one capability that governs a READ.
+#         Found by auditing this project's own new code: custody_override
+#         let any caller widen the custody gate and read what it withheld.
+#         MINOR — every 1.0.0/1.1.0 check is unchanged, and the capability
+#         gates a path that writes nothing and appears in no bundle.
+AUTHORITY_PROTOCOL = "1.2.0"
 
 # 2.0.0 — MAJOR, and the honest label. 1.0.0's receipt body recorded what
 #         a recall RETURNED but never what it was ASKED (no top_k, no hops,
@@ -173,7 +178,7 @@ SUPPORTED_PROTOCOLS: dict[str, frozenset[str]] = {
     "replay_protocol": frozenset({"1.0.0", "1.1.0"}),
     "ranking_protocol": frozenset({"1.0.0"}),
     "taint_protocol": frozenset({"1.0.0", "1.1.0", "2.0.0"}),
-    "authority_protocol": frozenset({"1.0.0", "1.1.0"}),
+    "authority_protocol": frozenset({"1.0.0", "1.1.0", "1.2.0"}),
     # receipt 1.0.0 is NOT here. Its digest body differs, so this build
     # genuinely cannot check a 1.0.0 receipt — and an entry claiming
     # otherwise would be the one kind of lie this table exists to prevent.
