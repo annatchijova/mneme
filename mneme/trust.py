@@ -73,6 +73,21 @@ from .canonical import canonical_json
 from . import authority, custody, protocol
 
 
+# Event types through which an actor writes its identity onto a chain
+# WITHOUT influencing the memory. Taint tracks influence; these are not it.
+#
+#   CONTRADICTED_BY      being attacked by X is not being influenced by X
+#                        (the full argument is in this module's header).
+#   DECISION_USED_MEMORY consuming a memory in a decision does not change
+#                        the memory. Without this carve-out, a quarantined
+#                        agent's own decision records would taint every
+#                        memory they cite — handing an attacker a second
+#                        version of the same lever the first carve-out
+#                        already denies them: cite every truth you want
+#                        suspected, then get yourself quarantined.
+NON_INFLUENCE_EVENTS = ("CONTRADICTED_BY", "DECISION_USED_MEMORY")
+
+
 @dataclass(frozen=True)
 class TaintSweep:
     sweep_id: str
@@ -127,10 +142,10 @@ def quarantine_actor(
          already-quarantined actor is refused with our words — a second
          sweep for the same incident would double-write custody events
          and split the evidence across two sweep ids).
-      2. SELECT DISTINCT memory_id FROM custody_chain WHERE actor_id = X
-         AND event_type != 'CONTRADICTED_BY' ORDER BY memory_id — the
-         deterministic flagged set (see the module header for why being
-         contradicted by X is not being touched by X).
+      2. every memory carrying an event by X whose type is not in
+         NON_INFLUENCE_EVENTS, ordered by memory_id — the deterministic
+         flagged set (see NON_INFLUENCE_EVENTS for why being contradicted
+         by X, or cited by X's decision, is not being touched by X).
       3. For each: custody event TAINT_FLAGGED + custody_status update
          (only if currently CLEAN; QUARANTINED/SUPERSEDED memories keep
          their stronger status, but the custody event is still written —
@@ -178,8 +193,9 @@ def quarantine_actor(
 
     cur.execute(
         "SELECT DISTINCT memory_id FROM custody_chain WHERE actor_id = ? "
-        "AND event_type != 'CONTRADICTED_BY' ORDER BY memory_id ASC",
-        (actor_id,),
+        "AND event_type NOT IN (%s) ORDER BY memory_id ASC"
+        % ",".join("?" for _ in NON_INFLUENCE_EVENTS),
+        (actor_id, *NON_INFLUENCE_EVENTS),
     )
     flagged = [r[0] for r in cur.fetchall()]
 

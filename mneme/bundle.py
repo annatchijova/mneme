@@ -50,7 +50,14 @@ that makes disagreement loud):
            than its flagged_count — excluding a fully-evidenced sweep
            would dodge its seal check;
         4. every sweep_id referenced by a TAINT_FLAGGED event in the
-           bundle must appear in one of the two lists.
+           bundle must appear in one of the two lists;
+        5. under taint_protocol 2.0.0, an included sweep's flagged set is
+           RE-DERIVED from custody evidence rather than merely checked
+           against its own seal — for every memory the bundle carries, an
+           influencing event by the quarantined actor at or before the
+           sweep must correspond to a flag and vice versa. Under 1.x a
+           sweep that over-flagged or under-flagged passed every check,
+           because its seal was computed over whatever it chose to flag.
       An excluded sweep's seal is NOT checked (its evidence lives
       outside this bundle); exclusion is a declared claim the auditor
       can see, not a verified one. A bundle without the
@@ -99,9 +106,10 @@ that makes disagreement loud):
         2. no decision_id appears in both "decisions" and
            "excluded_decisions";
         3. every decision (in either list) re-derives its record seal,
-           cites a receipt carried here, and claims only memories that
-           receipt actually SERVED — a decision naming a memory the
-           recall never handed it is refused;
+           cites a NON-COUNTERFACTUAL receipt carried here, and claims
+           only memories that receipt actually SERVED — a decision naming
+           a memory the recall never handed it is refused, and so is one
+           citing a recall against a world that did not exist;
         4. an included decision's used memories all travel here, and each
            one's custody chain carries a DECISION_USED_MEMORY event
            naming that decision back. Bilateral, like contradiction and
@@ -143,6 +151,7 @@ from typing import Any
 
 from .canonical import canonical_json
 from . import authority, causality, custody, field as _field, protocol
+from .trust import NON_INFLUENCE_EVENTS
 
 BUNDLE_FORMAT = "MNEME_BUNDLE_V2"
 INITIAL_CONFIDENCE = "0.5000000000"
@@ -621,7 +630,13 @@ def verify_causality(
                 f"{declared_ranking!r}. Two recalls are only comparable under "
                 "one ranking semantics.")
             continue
-        receipts_by_sha[sha] = {"served": served}
+        try:
+            cf = json.loads(row["custody_override_json"])["override"]
+        except Exception:
+            errors.append(f"B8: receipt {sha[:16]}…: custody_override_json is "
+                          "not valid JSON.")
+            continue
+        receipts_by_sha[sha] = {"served": served, "counterfactual": bool(cf)}
 
     carried_memories = {mid for mid, _ in memory_chains}
     used_events: dict[str, set[str]] = {}     # decision_id -> memories claiming it
@@ -665,6 +680,11 @@ def verify_causality(
                           f"{d['receipt_sha256'][:16]}…, which this bundle does "
                           "not carry — a causal claim with no anchor.")
             continue
+        if rec["counterfactual"]:
+            errors.append(
+                f"B8: decision {did}: cites a COUNTERFACTUAL receipt — one "
+                "taken against a hypothetical custody state. No agent ever "
+                "decided from a world that did not exist.")
         not_served = sorted(set(used) - set(rec["served"]))
         if not_served:
             errors.append(f"B8: decision {did}: claims memories {not_served} "
@@ -798,7 +818,8 @@ def verify_bundle_verbose(bundle_json: str) -> tuple[bool, list[str], list[str]]
             undeclared_provenance += 1
 
         # B4 — state replay
-        status, fstate, conf, rerrs = replay_state(chain)
+        status, fstate, conf, rerrs = replay_state(
+            chain, body["protocols"]["replay_protocol"])
         errors.extend(f"B4: {e}" for e in rerrs)
         if mem.get("custody_status") != status:
             errors.append(f"B4: {mid}: declared custody_status "
@@ -860,6 +881,40 @@ def verify_bundle_verbose(bundle_json: str) -> tuple[bool, list[str], list[str]]
     for sid in sorted(set(tf_by_sweep) - included_ids - excluded_ids):
         errors.append(f"B5: sweep {sid}: TAINT_FLAGGED events reference it but "
                       "the bundle neither carries it nor declares it excluded.")
+
+    # taint_protocol 2.0.0: RE-DERIVE the flagged set from custody
+    # evidence instead of only checking that the sweep agrees with
+    # itself. A 1.x bundle could over-flag or under-flag and still pass
+    # every check, because its seal was computed over whatever it chose
+    # to flag — internally consistent and semantically wrong. The
+    # mutation suite found exactly that.
+    #
+    # Checked only for the memories the bundle CARRIES: a partial export
+    # cannot be asked about memories it does not have, so the rule is
+    # one-directional on absence and total on presence.
+    if body["protocols"]["taint_protocol"] == "2.0.0":
+        for sw in included:
+            sid, actor, at = (sw["sweep_id"], sw["quarantined_actor"],
+                              sw["created_at"])
+            flagged = set(tf_by_sweep.get(sid, []))
+            for mid, chain in verified_chains:
+                influenced = any(
+                    r["actor_id"] == actor
+                    and r["event_type"] not in NON_INFLUENCE_EVENTS
+                    and r["created_at"] <= at
+                    for r in chain)
+                if influenced and mid not in flagged:
+                    errors.append(
+                        f"B5: sweep {sid}: {mid} carries an influencing event "
+                        f"by {actor} at or before the sweep, but the sweep did "
+                        "not flag it — under-flagged.")
+                elif mid in flagged and not influenced:
+                    errors.append(
+                        f"B5: sweep {sid}: {mid} was flagged, but nothing in "
+                        f"its chain shows {actor} influencing it before the "
+                        "sweep — over-flagged (being contradicted by an actor, "
+                        "or cited by its decision, is not being influenced by "
+                        "it).")
 
     if undeclared_provenance:
         notes.append(

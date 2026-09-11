@@ -84,6 +84,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from decimal import Decimal
+from fractions import Fraction
+
 from .canonical import canonical_json
 
 # ---------------------------------------------------------------------------
@@ -350,8 +353,16 @@ def append_event(
 # Where a memory's confidence begins, before any REINFORCED event.
 INITIAL_CONFIDENCE = "0.5000000000"
 
+# The confidence at which NEUTRAL becomes REINFORCED. It lives here rather
+# than in field.py because replay_protocol 1.1.0 CHECKS it: a promotion is
+# no longer merely recorded, it must be arithmetically due. A semantic
+# mutant that turns the comparison from >= into > is caught by this and by
+# nothing else, which is exactly how the mutation suite found it.
+PROMOTION_THRESHOLD = Fraction(3, 4)
 
-def replay_state(chain: list[dict[str, Any]]) -> tuple[str, str, str, list[str]]:
+
+def replay_state(chain: list[dict[str, Any]],
+                 replay_protocol: str = "1.1.0") -> tuple[str, str, str, list[str]]:
     """
     Replay a verified chain's events through the normative state machine.
     Returns (custody_status, field_state, confidence, errors). Pure; the
@@ -376,10 +387,29 @@ def replay_state(chain: list[dict[str, Any]]) -> tuple[str, str, str, list[str]]
       fact about a relationship, and DECISION_USED_MEMORY records a fact
       about a decision. Neither is a state transition, and a replay that
       moved state on them would be inventing history.
+
+    replay_protocol 1.1.0 adds ONE rule, and the mutation suite is why:
+
+      PROMOTION IS ARITHMETICALLY DUE. A STATE_CHANGED from NEUTRAL to
+      REINFORCED is valid only when the replayed confidence has reached
+      PROMOTION_THRESHOLD, and a REINFORCED that carries confidence to or
+      past the threshold while NEUTRAL must be followed by that
+      promotion. Under 1.0.0 the replay only checked that a declared
+      state was DERIVABLE from the events, which a writer that quietly
+      changed >= to > satisfied perfectly — it simply emitted fewer
+      events, and every one of them was consistent. That mutant survived
+      every check MNEME had. Now it does not.
+
+      1.0.0 is still implemented and still supported: a bundle sealed
+      under it is checked under it, promotion rule and all, because
+      applying a rule its sealer never agreed to is the retroactive
+      semantics this project refuses.
     """
     import json
     errors: list[str] = []
+    check_promotion = replay_protocol != "1.0.0"
     status, fstate, conf = "CLEAN", "NEUTRAL", INITIAL_CONFIDENCE
+    promotion_due = False
     for r in chain:
         et = r["event_type"]
         where = f"{r['memory_id']} seq {r['seq']}"
@@ -397,6 +427,16 @@ def replay_state(chain: list[dict[str, Any]]) -> tuple[str, str, str, list[str]]
                               "valid only from TAINT_FLAGGED.")
             status = "CLEAN"
         elif et == "STATE_CHANGED":
+            if check_promotion and payload.get("to") == "REINFORCED" \
+                    and payload.get("from") == "NEUTRAL" \
+                    and Fraction(Decimal(conf)) < PROMOTION_THRESHOLD:
+                errors.append(
+                    f"{where}: promotion to REINFORCED at confidence {conf}, "
+                    f"below the threshold "
+                    f"{PROMOTION_THRESHOLD.numerator}/"
+                    f"{PROMOTION_THRESHOLD.denominator} — a promotion that was "
+                    "not arithmetically due.")
+            promotion_due = False
             if payload.get("from") != fstate:
                 errors.append(f"{where}: STATE_CHANGED claims from="
                               f"{payload.get('from')!r} but replay says {fstate!r}.")
@@ -415,6 +455,16 @@ def replay_state(chain: list[dict[str, Any]]) -> tuple[str, str, str, list[str]]
                 errors.append(f"{where}: REINFORCED without confidence_after.")
             else:
                 conf = after
+                if check_promotion and fstate == "NEUTRAL" \
+                        and Fraction(Decimal(conf)) >= PROMOTION_THRESHOLD:
+                    promotion_due = True
+    if check_promotion and promotion_due:
+        errors.append(
+            f"{chain[-1]['memory_id']}: confidence reached {conf}, at or past "
+            f"the promotion threshold "
+            f"{PROMOTION_THRESHOLD.numerator}/{PROMOTION_THRESHOLD.denominator}, "
+            "with no STATE_CHANGED to REINFORCED — a promotion that was due "
+            "and never recorded.")
     return status, fstate, conf, errors
 
 def verify_custody_rows(memory_id: str, rows: list[dict[str, Any]],

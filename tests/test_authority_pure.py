@@ -465,6 +465,33 @@ check("every current version is one this build supports",
 check("both implementations declare the same support table",
       {k: set(v) for k, v in protocol.SUPPORTED_PROTOCOLS.items()}
       == {k: set(v) for k, v in offline.SUPPORTED_PROTOCOLS.items()})
+# Versioning is not decorative: the SAME bundle must get DIFFERENT
+# verdicts under two declared replay semantics, or "a bundle commits to
+# the rules it was checked under" is a slogan rather than a mechanism.
+conn7, cur7 = fresh_db()
+cur7.execute("INSERT INTO actors (actor_id, display_name, kind, created_at) "
+             "VALUES ('w','w','AGENT',?)", (custody.now_ts(),))
+field.store(cur7, memory_id="p-1", content="corroborated", embedding=emb(1.0, 0.0),
+            embedding_model="dev", actor_id="w", reason="doc")
+# Reinforce past the threshold while the writer thinks the bar is higher:
+# confidence crosses 3/4 with no promotion event recorded.
+import mneme.field as _f  # noqa: E402
+_saved = _f.PROMOTION_THRESHOLD
+_f.PROMOTION_THRESHOLD = __import__("fractions").Fraction(99, 100)
+for _ in range(3):
+    field.reinforce(cur7, memory_id="p-1", actor_id="w", reason="corroboration")
+_f.PROMOTION_THRESHOLD = _saved
+conn7.commit()
+undue = json.loads(bundle.export_bundle(cur7))
+undue["body"]["protocols"]["replay_protocol"] = "1.0.0"
+check("under replay 1.0.0 an undue promotion is derivable, so it passes",
+      bundle.verify_bundle(reseal(undue))[0],
+      str(bundle.verify_bundle(reseal(undue))[1][:2]))
+agree("under replay 1.1.0 the same bundle is refused",
+      bundle.export_bundle(cur7), False, {"B4"})
+check("...and the two verifiers agree about BOTH versions",
+      offline.verify(reseal(undue))[0] is True)
+
 check("both implementations map events to the same capabilities",
       authority.REQUIRED_CAPABILITY == offline.REQUIRED_CAPABILITY
       and authority.AUTHORITY_EVENT_CAPABILITY == offline.AUTHORITY_EVENT_CAPABILITY

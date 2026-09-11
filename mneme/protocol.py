@@ -81,8 +81,11 @@ from __future__ import annotations
 #         carrying a 1.1.0 word is refused.
 CUSTODY_PROTOCOL = "1.1.0"
 
-# 1.0.0 — the B4 state machine exactly as stated in bundle.py's header.
-REPLAY_PROTOCOL = "1.0.0"
+# 1.1.0 — 1.0.0's state machine plus one rule the mutation suite forced:
+#         a promotion to REINFORCED must be ARITHMETICALLY DUE, not merely
+#         recorded. MINOR: every 1.0.0 check is unchanged and a 1.0.0
+#         bundle is still checked under 1.0.0. See custody.replay_state.
+REPLAY_PROTOCOL = "1.1.0"
 
 # 1.0.0 — exact Fraction ranking: STATE_BOOST {3/2, 1, 0}, DECAY_BASE 43/50,
 #         RESONANT_BOOST_STEP 1/2, rescue rule, t²/n key, memory_id tiebreak,
@@ -93,7 +96,16 @@ RANKING_PROTOCOL = "1.0.0"
 #         sorted-id seal) PLUS the influence-budget exposure report. Every
 #         1.0.0 check is unchanged, so this is a MINOR bump: a 1.0.0 bundle
 #         is still checked identically, it simply carries no exposure rows.
-TAINT_PROTOCOL = "1.1.0"
+# 2.0.0 — MAJOR, because a 1.x bundle can legitimately fail the new check.
+#         Two changes, both found by mutating the semantics rather than the
+#         operators: (a) the sweep's flagged set is now RE-DERIVED from the
+#         custody events an included bundle carries, so a sweep that
+#         over-flags or under-flags is caught even though its own seal is
+#         internally consistent; (b) DECISION_USED_MEMORY joins
+#         CONTRADICTED_BY in the non-influence carve-out — recording that a
+#         decision consumed a memory does not influence that memory, and a
+#         quarantined agent's decision records must not taint what they cite.
+TAINT_PROTOCOL = "2.0.0"
 
 # 1.0.0 — capability vocabulary, per-actor authority chains, no-amplification,
 #         quarantine as a write barrier, the event_type -> capability map.
@@ -139,9 +151,9 @@ CURRENT_PROTOCOLS: dict[str, str] = {
 # both verifiers, with tests, or the entry is a lie.
 SUPPORTED_PROTOCOLS: dict[str, frozenset[str]] = {
     "custody_protocol": frozenset({"1.0.0", "1.1.0"}),
-    "replay_protocol": frozenset({"1.0.0"}),
+    "replay_protocol": frozenset({"1.0.0", "1.1.0"}),
     "ranking_protocol": frozenset({"1.0.0"}),
-    "taint_protocol": frozenset({"1.0.0", "1.1.0"}),
+    "taint_protocol": frozenset({"1.0.0", "1.1.0", "2.0.0"}),
     "authority_protocol": frozenset({"1.0.0"}),
     # receipt 1.0.0 is NOT here. Its digest body differs, so this build
     # genuinely cannot check a 1.0.0 receipt — and an entry claiming

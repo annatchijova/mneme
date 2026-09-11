@@ -128,9 +128,9 @@ PROTOCOL_NAMES = ("custody_protocol", "replay_protocol", "ranking_protocol",
 # Every version this verifier actually implements (mneme/protocol.py).
 SUPPORTED_PROTOCOLS = {
     "custody_protocol": frozenset({"1.0.0", "1.1.0"}),
-    "replay_protocol": frozenset({"1.0.0"}),
+    "replay_protocol": frozenset({"1.0.0", "1.1.0"}),
     "ranking_protocol": frozenset({"1.0.0"}),
-    "taint_protocol": frozenset({"1.0.0", "1.1.0"}),
+    "taint_protocol": frozenset({"1.0.0", "1.1.0", "2.0.0"}),
     "authority_protocol": frozenset({"1.0.0"}),
     # receipt 1.0.0 is absent on purpose: its digest body differs, so this
     # verifier genuinely cannot check one.
@@ -141,6 +141,12 @@ SUPPORTED_QUANTIZATION = frozenset({
     "canonical-decimal/scale=10/rounding=ROUND_HALF_EVEN",
 })
 INITIAL_CONFIDENCE = "0.5000000000"
+# replay_protocol 1.1.0: a promotion must be arithmetically DUE, not merely
+# recorded. Held as an exact integer ratio — no float ever decides here.
+PROMOTION_THRESHOLD_NUM, PROMOTION_THRESHOLD_DEN = 3, 4
+# Events through which an actor writes its identity onto a chain WITHOUT
+# influencing the memory (taint_protocol 2.0.0).
+NON_INFLUENCE_EVENTS = ("CONTRADICTED_BY", "DECISION_USED_MEMORY")
 # Canonical timestamp shape (UTC, microseconds, +00:00). Verification
 # re-asserts it so lexicographic order equals chronological order.
 TS_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}\+00:00$")
@@ -258,7 +264,18 @@ def verify_chain(memory_id: str, chain: list[dict], errors: list[str],
 
 # --- B4: state replay (transcribed from mneme/bundle.py) --------------------
 
-def replay_state(chain: list[dict], errors: list[str]) -> tuple[str, str, str]:
+def _at_least_threshold(conf: str) -> bool:
+    """conf >= 3/4, by exact integer arithmetic on the fixed-point string."""
+    whole, _, frac = conf.partition(".")
+    scaled = int(whole) * (10 ** len(frac)) + int(frac or 0)
+    return scaled * PROMOTION_THRESHOLD_DEN >= \
+        PROMOTION_THRESHOLD_NUM * (10 ** len(frac))
+
+
+def replay_state(chain: list[dict], errors: list[str],
+                 replay_protocol: str = "1.1.0") -> tuple[str, str, str]:
+    check_promotion = replay_protocol != "1.0.0"
+    promotion_due = False
     status, fstate, conf = "CLEAN", "NEUTRAL", INITIAL_CONFIDENCE
     for r in chain:
         et = r["event_type"]
@@ -276,6 +293,15 @@ def replay_state(chain: list[dict], errors: list[str]) -> tuple[str, str, str]:
                 errors.append(f"{where}: REHABILITATED from {status}, valid only from TAINT_FLAGGED.")
             status = "CLEAN"
         elif et == "STATE_CHANGED":
+            if check_promotion and payload.get("to") == "REINFORCED" \
+                    and payload.get("from") == "NEUTRAL" \
+                    and not _at_least_threshold(conf):
+                errors.append(f"{where}: promotion to REINFORCED at confidence "
+                              f"{conf}, below the threshold "
+                              f"{PROMOTION_THRESHOLD_NUM}/"
+                              f"{PROMOTION_THRESHOLD_DEN} — a promotion that "
+                              "was not arithmetically due.")
+            promotion_due = False
             if payload.get("from") != fstate:
                 errors.append(f"{where}: STATE_CHANGED claims from={payload.get('from')!r} "
                               f"but replay says {fstate!r}.")
@@ -293,6 +319,15 @@ def replay_state(chain: list[dict], errors: list[str]) -> tuple[str, str, str]:
                 errors.append(f"{where}: REINFORCED without confidence_after.")
             else:
                 conf = after
+                if check_promotion and fstate == "NEUTRAL" \
+                        and _at_least_threshold(conf):
+                    promotion_due = True
+    if check_promotion and promotion_due:
+        errors.append(f"B4: {chain[-1]['memory_id']}: confidence reached "
+                      f"{conf}, at or past the promotion threshold "
+                      f"{PROMOTION_THRESHOLD_NUM}/{PROMOTION_THRESHOLD_DEN}, "
+                      "with no STATE_CHANGED to REINFORCED — a promotion that "
+                      "was due and never recorded.")
     return status, fstate, conf
 
 
@@ -687,7 +722,13 @@ def verify_causality(body: dict, memory_chains: list) -> tuple[list, list]:
                           f"ranking_protocol {row.get('ranking_protocol')!r} but "
                           f"this bundle declares {declared_ranking!r}.")
             continue
-        receipts_by_sha[sha] = served
+        try:
+            cf = json.loads(row["custody_override_json"])["override"]
+        except Exception:
+            errors.append(f"B8: receipt {sha[:16]}…: custody_override_json is "
+                          "not valid JSON.")
+            continue
+        receipts_by_sha[sha] = {"served": served, "counterfactual": bool(cf)}
 
     carried_memories = {mid for mid, _ in memory_chains}
     used_events: dict = {}
@@ -720,13 +761,18 @@ def verify_causality(body: dict, memory_chains: list) -> tuple[list, list]:
             errors.append(f"B8: decision {did}: record seal does not recompute "
                           "— decision evidence edited.")
             continue
-        served = receipts_by_sha.get(d["receipt_sha256"])
-        if served is None:
+        rec = receipts_by_sha.get(d["receipt_sha256"])
+        if rec is None:
             errors.append(f"B8: decision {did}: cites receipt "
                           f"{d['receipt_sha256'][:16]}…, which this bundle does "
                           "not carry — a causal claim with no anchor.")
             continue
-        not_served = sorted(set(used) - set(served))
+        if rec["counterfactual"]:
+            errors.append(f"B8: decision {did}: cites a COUNTERFACTUAL receipt "
+                          "— one taken against a hypothetical custody state. "
+                          "No agent ever decided from a world that did not "
+                          "exist.")
+        not_served = sorted(set(used) - set(rec["served"]))
         if not_served:
             errors.append(f"B8: decision {did}: claims memories {not_served} "
                           "its cited recall never served.")
@@ -850,7 +896,8 @@ def verify(bundle_json: str) -> tuple[bool, list[str], list[str]]:
         else:
             undeclared_provenance += 1
 
-        status, fstate, conf = replay_state(chain, errors)
+        status, fstate, conf = replay_state(
+            chain, errors, body["protocols"]["replay_protocol"])
         if mem.get("custody_status") != status:
             errors.append(f"B4: {mid}: declared custody_status "
                           f"{mem.get('custody_status')!r}, replay says {status!r}.")
@@ -908,6 +955,32 @@ def verify(bundle_json: str) -> tuple[bool, list[str], list[str]]:
     for sid in sorted(set(tf_by_sweep) - included_ids - excluded_ids):
         errors.append(f"B5: sweep {sid}: TAINT_FLAGGED events reference it but "
                       "the bundle neither carries it nor declares it excluded.")
+
+    # taint_protocol 2.0.0: RE-DERIVE the flagged set from custody evidence
+    # rather than only checking that the sweep agrees with itself. Under 1.x
+    # a sweep could over-flag or under-flag and pass every check, because
+    # its seal was computed over whatever it chose to flag.
+    if body["protocols"]["taint_protocol"] == "2.0.0":
+        for sw in included:
+            sid, actor, at = (sw["sweep_id"], sw["quarantined_actor"],
+                              sw["created_at"])
+            flagged = set(tf_by_sweep.get(sid, []))
+            for mid, chain in verified_chains:
+                influenced = any(
+                    r["actor_id"] == actor
+                    and r["event_type"] not in NON_INFLUENCE_EVENTS
+                    and r["created_at"] <= at
+                    for r in chain)
+                if influenced and mid not in flagged:
+                    errors.append(f"B5: sweep {sid}: {mid} carries an "
+                                  f"influencing event by {actor} at or before "
+                                  "the sweep, but the sweep did not flag it — "
+                                  "under-flagged.")
+                elif mid in flagged and not influenced:
+                    errors.append(f"B5: sweep {sid}: {mid} was flagged, but "
+                                  f"nothing in its chain shows {actor} "
+                                  "influencing it before the sweep — "
+                                  "over-flagged.")
 
     if undeclared_provenance:
         notes.append(f"{undeclared_provenance} of "

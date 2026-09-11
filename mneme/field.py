@@ -71,7 +71,9 @@ DEFAULT_HOPS = 2
 MAX_HOP_SEARCH = 10                 # raven's named BFS ceiling
 
 REINFORCEMENT_ALPHA = Fraction(1, 4)      # c' = c + α(1−c) — STIGMERGY's closed form
-PROMOTION_THRESHOLD = Fraction(3, 4)      # confidence ≥ 3/4 ⇒ field_state REINFORCED
+# Imported, not re-declared: replay_protocol 1.1.0 CHECKS this threshold, so
+# it belongs to the replay semantics and two copies could drift apart.
+PROMOTION_THRESHOLD = custody.PROMOTION_THRESHOLD
 
 _SCALE_INT = 10 ** CANONICAL_SCALE
 
