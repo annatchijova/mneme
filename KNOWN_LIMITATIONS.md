@@ -186,6 +186,28 @@ together will fail those tests. If the agreement section is ever
 weakened, the duplication stops being a decision and becomes the bug
 this file warns about.
 
+THE LINE BETWEEN DUPLICATION THAT EARNS ITS KEEP AND DUPLICATION THAT
+DOES NOT is now drawn in code rather than argued in prose. custody,
+authority and claims used to carry three near-identical implementations
+of the chain shape; they share one (`mneme/chain.py`), each declaring a
+`ChainSpec` with its own table, genesis prefix and refusal wording.
+Those three copies bought nothing — same import graph, same readers,
+same commits. `verify_offline.py`'s copy buys a property, and there is
+now a semantic mutant that demonstrates exactly which one: collapse the
+three genesis prefixes into a single constant and the package verifies
+its own field perfectly, because writer and verifier share the mutated
+code. Only the independent transcription refuses. Deduplicating inside
+the package is safe precisely to the extent that an independent
+implementation still disagrees when the package is wrong about itself.
+
+What that refactor also showed, and what is worth carrying forward: the
+golden vectors stayed green while `authority.py` held two complete
+implementations of its chain, one shadowing the other, producing
+identical bytes. Byte-level pinning proves the protocol did not move;
+it cannot see whether the code that moved it is still there. A
+duplicate-definition scan in `tests/test_protocol_vectors.py` covers
+that now.
+
 ## Excluded sweeps are declared claims, not verified ones
 
 (Successor to the former entry "Partial bundles fail B5 when sweeps
@@ -439,7 +461,7 @@ export is the only one that proves a sweep flagged everything it should
 have — the same shape as the existing partial-export limitation below,
 for the same reason.
 
-## Semantic mutants: 15 killed, 3 declared survivors — and what they missed
+## Semantic mutants: 16 killed, 3 declared survivors — and what they missed
 
 `tests/test_semantic_mutants.py` patches MNEME's SEMANTICS, lets the
 patched code produce real evidence, and asks whether anything refuses
@@ -451,6 +473,12 @@ The declared survivors are entries above: a model that returns a vector
 it never computed, an adversary who fabricates a coherent field, and a
 hostile exporter that omits an authority chain. All three were prose in
 this file. They are now executable.
+
+One mutant tests the two VERIFIERS against each other rather than the
+protocol against a writer: collapsing the three chain kinds onto one
+genesis prefix is invisible to the package and caught only by
+`verify_offline.py`. It is the executable form of the argument in
+"Duplicated verification logic", above.
 
 Writing that suite found two real gaps, both since closed and both
 visible in the protocol versions: `replay_protocol` 1.1.0 (a promotion

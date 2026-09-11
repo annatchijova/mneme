@@ -357,7 +357,7 @@ are fixed, together with the last outstanding Round 2 recommendation
 (`excluded_lineage`, closing R2-04). What was not fixed is named in
 `KNOWN_LIMITATIONS.md` with the reasoning, rather than quietly closed.
 
-615/615 pure checks passing, plus 15/15 semantic mutants killed with
+615/615 pure checks passing, plus 16/16 semantic mutants killed with
 3 boundaries explicitly declared — and an audit that explains why that
 second number is a floor and not a ceiling.
 
