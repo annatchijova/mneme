@@ -133,6 +133,201 @@ def _sqrt_fraction(f: Fraction) -> Fraction:
     return Fraction(math.isqrt(p * _SCALE_INT * _SCALE_INT * q), q * _SCALE_INT)
 
 
+
+# ---------------------------------------------------------------------------
+# Embedding provenance — making the trusted boundary at least DETECTABLE
+# ---------------------------------------------------------------------------
+#
+# KNOWN_LIMITATIONS states the boundary and it has not moved: quantization
+# makes a model's output exact FROM THAT POINT ON; it cannot make the model
+# deterministic, and nothing here proves the model computed the vector
+# honestly. What a single `embedding_model` string could not do, and this
+# record can, is make DRIFT DETECTABLE and make changing models a formal
+# migration rather than a config flip.
+#
+# The mechanism is one identity: for a fixed (provider, model, revision,
+# preprocessing) and a fixed input_content_hash, the output_vector_hash is
+# supposed to be a function. Two memories that agree on the left and differ
+# on the right are proof that something changed underneath — a silent model
+# update, a changed tokenizer, nondeterministic inference — and the field
+# can now say so instead of ranking two incomparable vectors against each
+# other and calling the result a similarity.
+#
+# input_content_hash is recorded separately from the memory's
+# content_sha256 ON PURPOSE: they coincide only when preprocessing is
+# "none". Whenever text is normalised, chunked or templated before the
+# model sees it, the model embedded something the field does not store, and
+# collapsing the two would hide exactly that.
+
+QUANTIZATION_PROTOCOL = f"canonical-decimal/scale={CANONICAL_SCALE}/rounding=ROUND_HALF_EVEN"
+
+_PROVENANCE_FIELDS = ("provider", "model", "revision", "dimension",
+                      "preprocessing", "input_content_hash",
+                      "output_vector_hash", "quantization_protocol")
+
+
+@dataclass(frozen=True)
+class EmbeddingProvenance:
+    provider: str
+    model: str
+    revision: str
+    dimension: int
+    preprocessing: str
+    input_content_hash: str
+    output_vector_hash: str
+    quantization_protocol: str = QUANTIZATION_PROTOCOL
+
+    def as_payload(self) -> dict[str, Any]:
+        return {k: getattr(self, k) for k in _PROVENANCE_FIELDS}
+
+
+def embedding_sha256(emb: list[Decimal]) -> str:
+    """
+    Identity of a quantized vector: the hash of the exact canonical bytes
+    the field stores. Not of the model's floats — those are the
+    measurement, and the whole discipline is that what MNEME can speak
+    about begins after quantization.
+    """
+    import hashlib
+    return hashlib.sha256(embedding_to_json(emb).encode("utf-8")).hexdigest()
+
+
+def declare_embedding(
+    *,
+    provider: str,
+    model: str,
+    revision: str,
+    embedding: list[Decimal],
+    model_input: str,
+    preprocessing: str = "none",
+) -> EmbeddingProvenance:
+    """
+    Build a provenance record from the vector and the EXACT text the model
+    was given.
+
+    `model_input` is what the provider saw, not what the field stores.
+    With preprocessing="none" they must be the same string, and B3
+    re-checks that: declaring no preprocessing while hashing something
+    else is a claim the verifier can falsify.
+    """
+    for name, value in (("provider", provider), ("model", model),
+                        ("revision", revision), ("preprocessing", preprocessing)):
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(
+                f"{name} must be non-empty. 'unknown' is a legitimate value and "
+                "an honest one; an empty string is neither.")
+    if not isinstance(model_input, str):
+        raise TypeError("model_input must be the exact str the model was given.")
+    return EmbeddingProvenance(
+        provider=provider, model=model, revision=revision,
+        dimension=len(embedding), preprocessing=preprocessing,
+        input_content_hash=custody.content_sha256(model_input),
+        output_vector_hash=embedding_sha256(embedding),
+        quantization_protocol=QUANTIZATION_PROTOCOL,
+    )
+
+
+def validate_provenance(prov: dict[str, Any], embedding: list[Decimal],
+                        content: str) -> None:
+    """
+    Refuse a provenance record that does not describe the vector it
+    travels with. Called at write time; B3 re-derives the same checks
+    offline from the bundle.
+    """
+    import re as _re
+    missing = [k for k in _PROVENANCE_FIELDS if k not in prov]
+    if missing:
+        raise ValueError(f"embedding provenance is missing {missing}.")
+    if prov["quantization_protocol"] != QUANTIZATION_PROTOCOL:
+        raise ValueError(
+            f"embedding provenance declares quantization protocol "
+            f"{prov['quantization_protocol']!r}; this build quantizes as "
+            f"{QUANTIZATION_PROTOCOL!r}. Two quantizations are two vectors.")
+    if prov["dimension"] != len(embedding):
+        raise ValueError(
+            f"embedding provenance declares dimension {prov['dimension']} but "
+            f"the vector has {len(embedding)} components.")
+    if prov["output_vector_hash"] != embedding_sha256(embedding):
+        raise ValueError(
+            "embedding provenance's output_vector_hash does not hash the "
+            "vector being stored — the record describes a different vector.")
+    for k in ("input_content_hash", "output_vector_hash"):
+        if not _re.fullmatch(r"[0-9a-f]{64}", str(prov[k])):
+            raise ValueError(f"embedding provenance {k} is not a 64-hex digest.")
+    if prov["preprocessing"] == "none" and \
+            prov["input_content_hash"] != custody.content_sha256(content):
+        raise ValueError(
+            "embedding provenance declares preprocessing 'none' but its "
+            "input_content_hash is not the content's. Either the model saw "
+            "something else — in which case name the preprocessing — or the "
+            "record is wrong.")
+
+
+def embedding_inventory(cur) -> list[dict[str, Any]]:
+    """
+    Every distinct (provider, model, revision, preprocessing) in the
+    field, with counts. More than one row is a field that has been
+    migrated — or one that is silently mixing incomparable vector spaces,
+    which is the same thing without the paperwork.
+    """
+    cur.execute("SELECT memory_id, payload_json FROM custody_chain WHERE seq = 0 "
+                "ORDER BY memory_id ASC")
+    seen: dict[tuple, int] = {}
+    undeclared = 0
+    for _mid, pj in cur.fetchall():
+        prov = json.loads(pj).get("embedding_provenance")
+        if not isinstance(prov, dict):
+            undeclared += 1
+            continue
+        key = (prov.get("provider"), prov.get("model"), prov.get("revision"),
+               prov.get("preprocessing"))
+        seen[key] = seen.get(key, 0) + 1
+    out = [{"provider": k[0], "model": k[1], "revision": k[2],
+            "preprocessing": k[3], "memories": v} for k, v in sorted(seen.items())]
+    if undeclared:
+        out.append({"provider": None, "model": None, "revision": None,
+                    "preprocessing": None, "memories": undeclared,
+                    "note": "embedding provenance undeclared — the boundary is "
+                            "trusted for these, and that is stated, not hidden"})
+    return out
+
+
+def detect_embedding_drift(cur) -> list[dict[str, Any]]:
+    """
+    The payoff. Group by (provider, model, revision, preprocessing,
+    input_content_hash) and report any group holding more than one
+    output_vector_hash.
+
+    Each hit is a fact, not a heuristic: the same declared model was given
+    the same declared input and produced two different vectors. It does
+    not say WHICH is right, and it does not say the model lied — a
+    nondeterministic model is enough. It says the field is no longer
+    ranking comparable things, and that is exactly the condition that used
+    to be invisible.
+    """
+    cur.execute("SELECT memory_id, payload_json FROM custody_chain WHERE seq = 0 "
+                "ORDER BY memory_id ASC")
+    groups: dict[tuple, dict[str, list[str]]] = {}
+    for mid, pj in cur.fetchall():
+        prov = json.loads(pj).get("embedding_provenance")
+        if not isinstance(prov, dict):
+            continue
+        key = (prov.get("provider"), prov.get("model"), prov.get("revision"),
+               prov.get("preprocessing"), prov.get("input_content_hash"))
+        groups.setdefault(key, {}).setdefault(
+            prov.get("output_vector_hash"), []).append(mid)
+    drift = []
+    for key, by_vector in sorted(groups.items()):
+        if len(by_vector) > 1:
+            drift.append({
+                "provider": key[0], "model": key[1], "revision": key[2],
+                "preprocessing": key[3], "input_content_hash": key[4],
+                "distinct_vectors": len(by_vector),
+                "memories": {v: sorted(ms) for v, ms in sorted(by_vector.items())},
+            })
+    return drift
+
+
 # ---------------------------------------------------------------------------
 # Store / contradict / reinforce (state changes ⇒ custody events)
 # ---------------------------------------------------------------------------
@@ -153,6 +348,7 @@ def store(
     embedding_model: str,
     actor_id: str,
     reason: str,
+    embedding_provenance: EmbeddingProvenance | None = None,
     topic: str | None = None,
     claim: str | None = None,
     supersedes: str | None = None,
@@ -202,6 +398,10 @@ def store(
         (memory_id, content, csha, emb_json, embedding_model, topic, actor_id, ts),
     )
     payload: dict[str, Any] = {"content_sha256": csha, "embedding_model": embedding_model}
+    if embedding_provenance is not None:
+        prov = embedding_provenance.as_payload()
+        validate_provenance(prov, embedding, content)
+        payload["embedding_provenance"] = prov
     if topic is not None:
         payload["topic"] = topic
     if claim is not None:
@@ -282,6 +482,7 @@ def supersede(
     embedding_model: str,
     actor_id: str,
     reason: str,
+    embedding_provenance: EmbeddingProvenance | None = None,
     topic: str | None = None,
     claim: str | None = None,
     created_at: str | None = None,
@@ -337,6 +538,7 @@ def supersede(
     stored = store(
         cur, memory_id=memory_id, content=content, embedding=embedding,
         embedding_model=embedding_model, actor_id=actor_id, reason=reason,
+        embedding_provenance=embedding_provenance,
         topic=topic, claim=claim, supersedes=old_memory_id, created_at=ts,
         grant_id=lineage_grant,
     )
@@ -488,6 +690,9 @@ class RecallReceipt:
     # on purpose: a counterfactual receipt must be structurally impossible
     # to launder into evidence about the actual field.
     custody_override: tuple[tuple[str, str], ...]
+    # The INSTANT this recall reconstructed, or None for "now". A receipt
+    # that does not say when it was looking cannot be replayed either.
+    as_of: str | None
     receipt_sha256: str
 
 
@@ -508,13 +713,15 @@ def receipt_body(r: RecallReceipt) -> dict[str, Any]:
         "hops": r.hops,
         "ranking_protocol": r.ranking_protocol,
         "custody_override": [list(p) for p in r.custody_override],
+        "as_of": r.as_of,
     }
 
 
 def _receipt(query_sha: str, seed: str | None, served: list[str],
              exc_c: int, exc_f: int, exc_i: int,
              top_k: int, hops: int,
-             override: dict[str, str] | None = None) -> RecallReceipt:
+             override: dict[str, str] | None = None,
+             as_of: str | None = None) -> RecallReceipt:
     import hashlib
     r = RecallReceipt(query_sha256=query_sha, seed_memory_id=seed,
                       served=tuple(served), excluded_custody=exc_c,
@@ -523,7 +730,7 @@ def _receipt(query_sha: str, seed: str | None, served: list[str],
                       ranking_protocol=protocol.RANKING_PROTOCOL,
                       custody_override=tuple(
                           (k, override[k]) for k in sorted(override or {})),
-                      receipt_sha256="")
+                      as_of=as_of, receipt_sha256="")
     digest = hashlib.sha256(
         canonical_json(receipt_body(r)).encode("utf-8")).hexdigest()
     return replace(r, receipt_sha256=digest)
@@ -560,15 +767,15 @@ def persist_receipt(cur, receipt: RecallReceipt, *,
         "INSERT INTO recall_receipts (receipt_sha256, query_sha256, "
         "seed_memory_id, served_json, excluded_custody, excluded_forgotten, "
         "excluded_inhibited, top_k, hops, ranking_protocol, "
-        "custody_override_json, persisted_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "custody_override_json, as_of, persisted_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (digest, receipt.query_sha256, receipt.seed_memory_id,
          canonical_json({"served": list(receipt.served)}),
          receipt.excluded_custody, receipt.excluded_forgotten,
          receipt.excluded_inhibited, receipt.top_k, receipt.hops,
          receipt.ranking_protocol,
          canonical_json({"override": [list(p) for p in receipt.custody_override]}),
-         ts),
+         receipt.as_of, ts),
     )
 
 
@@ -596,7 +803,7 @@ def verify_receipts(cur) -> tuple[bool, list[str]]:
 RECEIPT_COLS = ["receipt_sha256", "query_sha256", "seed_memory_id",
                 "served_json", "excluded_custody", "excluded_forgotten",
                 "excluded_inhibited", "top_k", "hops", "ranking_protocol",
-                "custody_override_json", "persisted_at"]
+                "custody_override_json", "as_of", "persisted_at"]
 
 
 def load_receipt_rows(cur, receipt_sha256s: list[str] | None = None) -> list[dict[str, Any]]:
@@ -631,12 +838,64 @@ def receipt_digest_from_row(row: dict[str, Any], served: list[str]) -> str:
         "hops": int(row["hops"]),
         "ranking_protocol": row["ranking_protocol"],
         "custody_override": json.loads(row["custody_override_json"])["override"],
+        "as_of": row["as_of"],
     }
     return hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
 
 
 CUSTODY_STATUSES = frozenset({"CLEAN", "TAINT_FLAGGED", "QUARANTINED",
                               "SUPERSEDED"})
+
+
+def logical_state_at(cur, as_of: str) -> dict[str, tuple[str, str]]:
+    """
+    What the field logically WAS at an instant: {memory_id: (custody_status,
+    field_state)} for every memory that existed by then.
+
+    Reconstructed by replaying each custody chain truncated at `as_of` —
+    the same state machine B4 uses, run over less evidence. Nothing is
+    read from the memories table's status columns, which describe today.
+
+    A memory whose STORED event is later than `as_of` is ABSENT from the
+    result: it did not exist, and "existed but was hidden" is a different
+    claim that would quietly inflate every historical exclusion count.
+
+    The forensic point, stated once: this answers "with what the agent
+    legitimately had at 14:03:17, what would it have retrieved?" rather
+    than "why does this decision look absurd today?". The second question
+    is unanswerable and the first is the one a review needs.
+    """
+    if not custody._TS_PATTERN.match(as_of or ""):
+        raise ValueError(
+            f"as_of {as_of!r} is not a canonical UTC microsecond timestamp "
+            "(…+00:00). Historical reconstruction compares timestamps "
+            "lexicographically, which is only chronological for that form.")
+    cur.execute(
+        "SELECT memory_id, seq, event_type, actor_id, reason, created_at, "
+        "payload_json, prev_hash, entry_hash FROM custody_chain "
+        "WHERE created_at <= ? ORDER BY memory_id ASC, seq ASC", (as_of,))
+    cols = ["memory_id", "seq", "event_type", "actor_id", "reason",
+            "created_at", "payload_json", "prev_hash", "entry_hash"]
+    chains: dict[str, list[dict[str, Any]]] = {}
+    for row in cur.fetchall():
+        r = dict(zip(cols, row))
+        chains.setdefault(r["memory_id"], []).append(r)
+
+    out: dict[str, tuple[str, str]] = {}
+    for mid, chain in chains.items():
+        if chain[0]["event_type"] != "STORED":
+            # The birth event is later than as_of while a later event is
+            # not — a chain that cannot have happened. Refusing beats
+            # guessing: a reconstruction built on impossible evidence is
+            # worse than no reconstruction.
+            raise ValueError(
+                f"{mid}: events at or before {as_of} do not begin with STORED. "
+                "This chain's history is not reconstructible at that instant.")
+        status, fstate, _conf, errors = custody.replay_state(chain)
+        if errors:
+            raise ValueError(f"{mid}: chain does not replay at {as_of}: {errors[0]}")
+        out[mid] = (status, fstate)
+    return out
 
 
 def recall(
@@ -646,6 +905,7 @@ def recall(
     top_k: int = 5,
     hops: int = DEFAULT_HOPS,
     custody_override: dict[str, str] | None = None,
+    as_of: str | None = None,
 ) -> tuple[list[RecallHit], RecallReceipt]:
     """
     Custody-gated, exactly-ranked recall.
@@ -698,6 +958,13 @@ def recall(
             raise ValueError(
                 f"custody_override[{mid!r}] = {status!r} is not a custody "
                 f"status. A hypothetical world must still be a possible one.")
+    # as_of reconstructs the field as it logically WAS, from chains alone,
+    # WITHOUT looking at anything later. It composes with custody_override
+    # — "what would it have retrieved at 14:03, in a world where the
+    # poison had already been contained" is a legitimate question — and
+    # the override is applied ON TOP of the historical state, so the
+    # caller's hypothesis always wins over the reconstruction.
+    historical = logical_state_at(cur, as_of) if as_of is not None else None
     q = [Fraction(x) for x in query_embedding]
     nq = _dot(q, q)
     if nq == 0:
@@ -725,6 +992,10 @@ def recall(
     excluded_custody = 0
     servable_ids: set[str] = set()
     for mid, content, ej, state, status in all_rows:
+        if historical is not None:
+            if mid not in historical:
+                continue          # did not exist yet; not an exclusion
+            status, state = historical[mid]
         if override.get(mid, status) == "CLEAN":
             rows.append((mid, content, ej, state))
             servable_ids.add(mid)
@@ -745,7 +1016,7 @@ def recall(
 
     if not candidates:
         return [], _receipt(query_sha, None, [], excluded_custody,
-                            excluded_forgotten, 0, top_k, hops, override)
+                            excluded_forgotten, 0, top_k, hops, override, as_of)
 
     # --- Seed: exact argmax of dot/sqrt(nv) — sign-aware squared compare.
     def sim_key(c):
@@ -772,8 +1043,16 @@ def recall(
     # quarantined node sitting on a resonant path — confirmed by
     # induction and refused here. Gate on custody_status only: FORGOTTEN
     # is a weak field_state, not an untrusted one, so its links stay.
-    cur.execute("SELECT from_id, to_id, link_type FROM cell_links "
-                "ORDER BY from_id ASC, to_id ASC")
+    # Links are dated too, so a historical recall must not traverse an
+    # edge that did not exist yet — an as-of reconstruction that used
+    # today's graph would be reporting a retrieval nobody could have had.
+    if as_of is not None:
+        cur.execute("SELECT from_id, to_id, link_type FROM cell_links "
+                    "WHERE created_at <= ? ORDER BY from_id ASC, to_id ASC",
+                    (as_of,))
+    else:
+        cur.execute("SELECT from_id, to_id, link_type FROM cell_links "
+                    "ORDER BY from_id ASC, to_id ASC")
     links: dict[str, list[tuple[str, str]]] = {}
     for f, t, lt in cur.fetchall():
         if f in servable_ids and t in servable_ids:
@@ -833,5 +1112,5 @@ def recall(
 
     receipt = _receipt(query_sha, seed_id, [h.memory_id for h in hits],
                        excluded_custody, excluded_forgotten, excluded_inhibited,
-                       top_k, hops, override)
+                       top_k, hops, override, as_of)
     return hits, receipt

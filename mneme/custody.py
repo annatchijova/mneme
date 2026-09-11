@@ -347,6 +347,76 @@ def append_event(
 # Verification (pure over rows; the offline verifier reuses this)
 # ---------------------------------------------------------------------------
 
+# Where a memory's confidence begins, before any REINFORCED event.
+INITIAL_CONFIDENCE = "0.5000000000"
+
+
+def replay_state(chain: list[dict[str, Any]]) -> tuple[str, str, str, list[str]]:
+    """
+    Replay a verified chain's events through the normative state machine.
+    Returns (custody_status, field_state, confidence, errors). Pure; the
+    standalone verifier transcribes this function, and bundle check B4
+    compares its output against what a bundle DECLARES.
+
+    THE NORMATIVE STATEMENT, written down once, here (replay_protocol):
+
+      custody_status: starts CLEAN at STORED.
+          QUARANTINED      -> QUARANTINED
+          SUPERSEDED_BY    -> SUPERSEDED
+          TAINT_FLAGGED    -> TAINT_FLAGGED only if currently CLEAN
+                              (stronger statuses are retained; the event
+                              still exists — the chain records that the
+                              sweep saw the memory)
+          REHABILITATED    -> CLEAN, valid only from TAINT_FLAGGED
+      field_state: starts NEUTRAL; STATE_CHANGED applies payload["to"] and
+          its payload["from"] must equal the current state.
+      confidence: starts 0.5000000000; each REINFORCED must declare
+          confidence_before equal to current, and sets confidence_after.
+      Every other event type changes nothing: CONTRADICTED_BY records a
+      fact about a relationship, and DECISION_USED_MEMORY records a fact
+      about a decision. Neither is a state transition, and a replay that
+      moved state on them would be inventing history.
+    """
+    import json
+    errors: list[str] = []
+    status, fstate, conf = "CLEAN", "NEUTRAL", INITIAL_CONFIDENCE
+    for r in chain:
+        et = r["event_type"]
+        where = f"{r['memory_id']} seq {r['seq']}"
+        payload = json.loads(r["payload_json"])
+        if et == "QUARANTINED":
+            status = "QUARANTINED"
+        elif et == "SUPERSEDED_BY":
+            status = "SUPERSEDED"
+        elif et == "TAINT_FLAGGED":
+            if status == "CLEAN":
+                status = "TAINT_FLAGGED"
+        elif et == "REHABILITATED":
+            if status != "TAINT_FLAGGED":
+                errors.append(f"{where}: REHABILITATED from {status}, "
+                              "valid only from TAINT_FLAGGED.")
+            status = "CLEAN"
+        elif et == "STATE_CHANGED":
+            if payload.get("from") != fstate:
+                errors.append(f"{where}: STATE_CHANGED claims from="
+                              f"{payload.get('from')!r} but replay says {fstate!r}.")
+            to = payload.get("to")
+            if to not in ("REINFORCED", "NEUTRAL", "FORGOTTEN"):
+                errors.append(f"{where}: STATE_CHANGED to unknown state {to!r}.")
+            else:
+                fstate = to
+        elif et == "REINFORCED":
+            before = payload.get("confidence_before")
+            after = payload.get("confidence_after")
+            if before != conf:
+                errors.append(f"{where}: REINFORCED claims before={before!r} "
+                              f"but replay says {conf!r}.")
+            if not isinstance(after, str):
+                errors.append(f"{where}: REINFORCED without confidence_after.")
+            else:
+                conf = after
+    return status, fstate, conf, errors
+
 def verify_custody_rows(memory_id: str, rows: list[dict[str, Any]],
                         event_types: frozenset[str] | None = None) -> tuple[bool, list[str]]:
     """

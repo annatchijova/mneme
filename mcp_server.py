@@ -596,6 +596,7 @@ def mneme_recall(
     top_k: int = 5,
     hops: int = 2,
     persist_receipt: bool = False,
+    as_of: str = "",
 ) -> dict:
     """
     Custody-gated, exactly-ranked recall.
@@ -614,6 +615,15 @@ def mneme_recall(
         query: Text to search for (embedded deterministically).
         top_k: Maximum results (1-20).
         hops: BFS expansion depth (0=seed only, 2=default).
+        as_of: Optional canonical UTC instant
+            ("2026-03-01T12:30:00.000000+00:00"). Reconstructs the field
+            as it logically WAS then, from custody chains alone, without
+            looking at anything later: memories not yet born are absent
+            (not "withheld"), statuses are replayed rather than read from
+            today's columns, and links created afterwards are not
+            traversed. The forensic question this answers is "with what
+            the agent legitimately had at that instant, what would it
+            have retrieved?" — not "why does this look absurd today?".
         persist_receipt: Keep the receipt as evidence. Recall stays
             read-only by default — serving is not a state transition, and
             forcing a write into the hottest read path would invert that.
@@ -640,6 +650,7 @@ def mneme_recall(
             query_embedding=query_embedding,
             top_k=top_k,
             hops=hops,
+            as_of=as_of.strip() or None,
         )
         if persist_receipt:
             field.persist_receipt(cur, receipt)
@@ -673,6 +684,7 @@ def mneme_recall(
             "top_k": receipt.top_k,
             "hops": receipt.hops,
             "ranking_protocol": receipt.ranking_protocol,
+            "as_of": receipt.as_of,
             "persisted": bool(persist_receipt),
         },
         "embedding_model": "deterministic-sha256-v1",
@@ -1140,6 +1152,54 @@ def mneme_exposure(memory_ids: str = "") -> dict:
         "exposure_sha256": r.exposure_sha256,
         "note": ("INFLUENCE_EXPOSED is a finding, not a custody status — "
                  "nothing here was flagged, and nothing was written"),
+    }
+
+
+@mcp.tool()
+def mneme_embeddings() -> dict:
+    """
+    Embedding provenance: what produced the vectors this field ranks on,
+    and whether any of it has drifted underneath you.
+
+    The boundary has not moved and this tool does not pretend otherwise:
+    nothing here proves a model computed a vector honestly, and no hash
+    can. What the provenance record makes possible is the one thing a
+    bare model-name string could not. For a fixed (provider, model,
+    revision, preprocessing) and a fixed input, the output vector is
+    supposed to be a FUNCTION. Two memories agreeing on the left and
+    differing on the right are proof that something changed underneath —
+    a silent model update, a changed tokenizer, nondeterministic
+    inference — and the field can now say so instead of ranking two
+    incomparable vectors against each other and calling it similarity.
+
+    More than one (provider, model, revision) in the inventory means the
+    field is mixing vector spaces. That is a migration whether or not
+    anyone called it one.
+
+    Returns:
+        The inventory, any detected drift, and the quantization protocol.
+    """
+    conn = _get_conn()
+    cur = conn.cursor()
+    try:
+        inv = field.embedding_inventory(cur)
+        drift = field.detect_embedding_drift(cur)
+    except Exception as exc:
+        conn.close()
+        return {"error": str(exc)}
+    conn.close()
+    families = {(r["provider"], r["model"], r["revision"])
+                for r in inv if r["model"] is not None}
+    return {
+        "inventory": inv,
+        "distinct_model_families": len(families),
+        "mixing_vector_spaces": len(families) > 1,
+        "drift": drift,
+        "drift_detected": bool(drift),
+        "quantization_protocol": field.QUANTIZATION_PROTOCOL,
+        "boundary": ("quantization makes model output exact FROM THAT POINT "
+                     "ON; it cannot make the model deterministic. Drift here "
+                     "is detectable, not preventable."),
     }
 
 

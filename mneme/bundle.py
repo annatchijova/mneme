@@ -112,21 +112,12 @@ that makes disagreement loud):
            appears in one of the two lists, and that event's memory
            appears in that decision's used list.
 
-Replay state machine (B4), the single normative statement — the
-standalone verifier transcribes it verbatim:
-
-  custody_status: starts CLEAN at STORED.
-      QUARANTINED      -> QUARANTINED
-      SUPERSEDED_BY    -> SUPERSEDED
-      TAINT_FLAGGED    -> TAINT_FLAGGED only if currently CLEAN
-                          (stronger statuses are retained; the event
-                          still exists — the chain records that the
-                          sweep saw the memory)
-      REHABILITATED    -> CLEAN, valid only from TAINT_FLAGGED
-  field_state: starts NEUTRAL; STATE_CHANGED applies payload["to"] and
-      its payload["from"] must equal the current state.
-  confidence: starts 0.5000000000; each REINFORCED must declare
-      confidence_before equal to current, and sets confidence_after.
+Replay state machine (B4): the single normative statement now lives in
+custody.replay_state's docstring, next to the event vocabulary it
+interprets — "what does this chain mean" is custody semantics, and B4 is
+the check that compares its output against what a bundle declares. The
+standalone verifier transcribes it verbatim; field.recall's as-of
+snapshot runs the same machine over a truncated chain.
 
 Authority replay (B7) has its own normative statement, in
 authority.replay_authority's docstring, for the same reason: one place
@@ -234,11 +225,11 @@ def export_bundle(cur, *, memory_ids: list[str] | None = None) -> str:
     for mid in memory_ids:
         cur.execute(
             "SELECT content, content_sha256, custody_status, field_state, "
-            "confidence FROM memories WHERE memory_id = ?", (mid,))
+            "confidence, embedding_json FROM memories WHERE memory_id = ?", (mid,))
         row = cur.fetchone()
         if row is None:
             raise ValueError(f"Unknown memory {mid!r} — a bundle does not invent evidence.")
-        content, csha, status, fstate, conf = row
+        content, csha, status, fstate, conf, emb_json = row
         cur.execute(
             "SELECT memory_id, seq, event_type, actor_id, reason, created_at, "
             "payload_json, prev_hash, entry_hash FROM custody_chain "
@@ -251,6 +242,12 @@ def export_bundle(cur, *, memory_ids: list[str] | None = None) -> str:
             "memory_id": mid,
             "content": content,
             "content_sha256": csha,
+            # The vector's identity, not the vector: an auditor checking an
+            # embedding provenance record needs to know WHICH vector was
+            # stored, and shipping 384 fixed-point strings per memory would
+            # make bundles unreadable for a claim a hash settles.
+            "embedding_sha256": hashlib.sha256(
+                emb_json.encode("utf-8")).hexdigest(),
             "custody_status": status,
             "field_state": fstate,
             "confidence": conf,
@@ -354,51 +351,12 @@ def export_bundle(cur, *, memory_ids: list[str] | None = None) -> str:
 # Verification (package side; the state-machine replay is shared logic)
 # ---------------------------------------------------------------------------
 
-def replay_state(chain: list[dict[str, Any]]) -> tuple[str, str, str, list[str]]:
-    """
-    Replay a verified chain's events through the normative state machine
-    (module header). Returns (custody_status, field_state, confidence,
-    errors). Pure; the standalone verifier transcribes this function.
-    """
-    errors: list[str] = []
-    status, fstate, conf = "CLEAN", "NEUTRAL", INITIAL_CONFIDENCE
-    for r in chain:
-        et = r["event_type"]
-        where = f"{r['memory_id']} seq {r['seq']}"
-        payload = json.loads(r["payload_json"])
-        if et == "QUARANTINED":
-            status = "QUARANTINED"
-        elif et == "SUPERSEDED_BY":
-            status = "SUPERSEDED"
-        elif et == "TAINT_FLAGGED":
-            if status == "CLEAN":
-                status = "TAINT_FLAGGED"
-        elif et == "REHABILITATED":
-            if status != "TAINT_FLAGGED":
-                errors.append(f"{where}: REHABILITATED from {status}, "
-                              "valid only from TAINT_FLAGGED.")
-            status = "CLEAN"
-        elif et == "STATE_CHANGED":
-            if payload.get("from") != fstate:
-                errors.append(f"{where}: STATE_CHANGED claims from="
-                              f"{payload.get('from')!r} but replay says {fstate!r}.")
-            to = payload.get("to")
-            if to not in ("REINFORCED", "NEUTRAL", "FORGOTTEN"):
-                errors.append(f"{where}: STATE_CHANGED to unknown state {to!r}.")
-            else:
-                fstate = to
-        elif et == "REINFORCED":
-            before = payload.get("confidence_before")
-            after = payload.get("confidence_after")
-            if before != conf:
-                errors.append(f"{where}: REINFORCED claims before={before!r} "
-                              f"but replay says {conf!r}.")
-            if not isinstance(after, str):
-                errors.append(f"{where}: REINFORCED without confidence_after.")
-            else:
-                conf = after
-    return status, fstate, conf, errors
-
+# The B4 replay lives in custody.py, next to the event vocabulary it
+# interprets: "what does this chain mean" is custody semantics, and B4 is
+# the CHECK that uses it. Re-exported here because the bundle header is
+# where auditors look for the rule, and because field.recall's as-of
+# snapshot needs the same machine without importing this module.
+replay_state = custody.replay_state
 
 def verify_authority(
     body: dict[str, Any],
@@ -580,6 +538,57 @@ def verify_authority(
     return errors, notes
 
 
+SUPPORTED_QUANTIZATION = frozenset({
+    "canonical-decimal/scale=10/rounding=ROUND_HALF_EVEN",
+})
+
+
+def check_embedding_provenance(mid: str, prov: dict[str, Any],
+                               mem: dict[str, Any], born: str) -> list[str]:
+    """
+    B3's embedding half. Pure; the standalone verifier transcribes it.
+
+    What this proves: the vector shipped in this bundle is the vector the
+    provenance record describes, under a quantization this verifier
+    implements, and — when the record claims no preprocessing — that the
+    model was given exactly the content the bundle carries.
+
+    What it still does NOT prove, unchanged from the day the boundary was
+    first named: that the model computed the vector honestly, or that it
+    is deterministic. The record makes drift DETECTABLE across memories
+    and makes a model change a formal migration. It does not make the
+    model trustworthy, and no hash can.
+    """
+    errors: list[str] = []
+    required = ("provider", "model", "revision", "dimension", "preprocessing",
+                "input_content_hash", "output_vector_hash",
+                "quantization_protocol")
+    missing = [k for k in required if k not in prov]
+    if missing:
+        return [f"{mid}: embedding provenance is missing {missing}."]
+    if prov["quantization_protocol"] not in SUPPORTED_QUANTIZATION:
+        errors.append(
+            f"{mid}: embedding quantized as {prov['quantization_protocol']!r}, "
+            "which this verifier does not implement — two quantizations are "
+            "two vectors.")
+    if not (isinstance(prov["dimension"], int) and prov["dimension"] > 0):
+        errors.append(f"{mid}: embedding provenance dimension "
+                      f"{prov['dimension']!r} is not a positive integer.")
+    declared_vec = mem.get("embedding_sha256")
+    if prov["output_vector_hash"] != declared_vec:
+        errors.append(
+            f"{mid}: embedding provenance names vector "
+            f"{str(prov['output_vector_hash'])[:16]}… but the bundle carries "
+            f"{str(declared_vec)[:16]}… — the record describes a different "
+            "vector than the one shipped.")
+    if prov["preprocessing"] == "none" and prov["input_content_hash"] != born:
+        errors.append(
+            f"{mid}: embedding provenance declares preprocessing 'none' but "
+            "its input_content_hash is not this memory's content. Either the "
+            "model saw something else — in which case name the preprocessing "
+            "— or the record is wrong.")
+    return errors
+
 def verify_causality(
     body: dict[str, Any],
     memory_chains: list[tuple[str, list[dict[str, Any]]]],
@@ -752,6 +761,8 @@ def verify_bundle_verbose(bundle_json: str) -> tuple[bool, list[str], list[str]]
     stored_supersedes: dict[str, str] = {}   # successor -> claimed predecessor
     successors: dict[str, set[str]] = {}     # predecessor -> SUPERSEDED_BY names
     verified_chains: list[tuple[str, list[dict[str, Any]]]] = []
+    declared_provenance = 0
+    undeclared_provenance = 0
 
     for mem in body.get("memories", []):
         mid = mem["memory_id"]
@@ -778,6 +789,13 @@ def verify_bundle_verbose(bundle_json: str) -> tuple[bool, list[str], list[str]]
             errors.append(f"B3: {mid}: content does not hash to the STORED seal.")
         if mem.get("content_sha256") != born:
             errors.append(f"B3: {mid}: declared content_sha256 disagrees with birth event.")
+        prov = birth.get("embedding_provenance")
+        if isinstance(prov, dict):
+            declared_provenance += 1
+            errors.extend(f"B3: {e}" for e in
+                          check_embedding_provenance(mid, prov, mem, born))
+        else:
+            undeclared_provenance += 1
 
         # B4 — state replay
         status, fstate, conf, rerrs = replay_state(chain)
@@ -842,6 +860,13 @@ def verify_bundle_verbose(bundle_json: str) -> tuple[bool, list[str], list[str]]
     for sid in sorted(set(tf_by_sweep) - included_ids - excluded_ids):
         errors.append(f"B5: sweep {sid}: TAINT_FLAGGED events reference it but "
                       "the bundle neither carries it nor declares it excluded.")
+
+    if undeclared_provenance:
+        notes.append(
+            f"{undeclared_provenance} of "
+            f"{declared_provenance + undeclared_provenance} memories declare no "
+            "embedding provenance: for those, the embedding boundary is "
+            "trusted and its drift undetectable. Stated, not hidden.")
 
     for sw in excluded:
         notes.append(f"sweep {sw['sweep_id']} declared excluded — its seal was "

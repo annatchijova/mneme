@@ -203,6 +203,9 @@ CREATE TABLE IF NOT EXISTS recall_receipts (
     -- counterfactual receipt cannot be laundered into evidence about the
     -- actual field, and record_decision refuses to let a decision cite one.
     custody_override_json TEXT NOT NULL DEFAULT '{"override":[]}',
+    -- The INSTANT this recall reconstructed, or NULL for "now". A receipt
+    -- that does not say when it was looking cannot be replayed either.
+    as_of              TEXT,
     persisted_at       TEXT NOT NULL
 );
 

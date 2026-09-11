@@ -23,7 +23,13 @@ Checks (normative statement in mneme/bundle.py's header):
   B2  every custody chain: genesis bound to memory_id, dense seq,
       linkage, entry hashes recompute, closed vocabulary, canonical
       payload bytes, canonical UTC timestamps that never run backwards
-  B3  content hashes to the seal in its STORED (birth) event
+  B3  content hashes to the seal in its STORED (birth) event; and where
+      a memory declares embedding provenance, the vector shipped is the
+      vector that record describes, under a quantization this verifier
+      implements, with the model's input matching the content whenever
+      the record claims no preprocessing. Memories that declare none are
+      COUNTED and named on success: the boundary is trusted there, and
+      that is stated rather than hidden
   B4  declared custody_status / field_state / confidence reproduce
       from replaying the chain's events; supersession lineage is
       bilateral when both parties travel in the bundle (a STORED
@@ -131,6 +137,9 @@ SUPPORTED_PROTOCOLS = {
     "receipt_protocol": frozenset({"2.0.0"}),
 }
 GRANT_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_\-.:]{1,64}$")
+SUPPORTED_QUANTIZATION = frozenset({
+    "canonical-decimal/scale=10/rounding=ROUND_HALF_EVEN",
+})
 INITIAL_CONFIDENCE = "0.5000000000"
 # Canonical timestamp shape (UTC, microseconds, +00:00). Verification
 # re-asserts it so lexicographic order equals chronological order.
@@ -581,6 +590,44 @@ def verify_authority(body: dict, memory_chains: list) -> tuple[list, list]:
     return errors, notes
 
 
+# --- B3: embedding provenance (transcribed from mneme/bundle.py) -----------
+
+def check_embedding_provenance(mid: str, prov: dict, mem: dict, born: str) -> list:
+    """
+    Proves: the vector shipped is the vector the record describes, under a
+    quantization this verifier implements, and — when the record claims no
+    preprocessing — that the model was given exactly the carried content.
+
+    Does NOT prove the model computed it honestly or deterministically.
+    The record makes drift detectable and a model change a formal
+    migration; it does not make the model trustworthy, and no hash can.
+    """
+    errors: list = []
+    required = ("provider", "model", "revision", "dimension", "preprocessing",
+                "input_content_hash", "output_vector_hash",
+                "quantization_protocol")
+    missing = [k for k in required if k not in prov]
+    if missing:
+        return [f"{mid}: embedding provenance is missing {missing}."]
+    if prov["quantization_protocol"] not in SUPPORTED_QUANTIZATION:
+        errors.append(f"{mid}: embedding quantized as "
+                      f"{prov['quantization_protocol']!r}, which this verifier "
+                      "does not implement — two quantizations are two vectors.")
+    if not (isinstance(prov["dimension"], int) and prov["dimension"] > 0):
+        errors.append(f"{mid}: embedding provenance dimension "
+                      f"{prov['dimension']!r} is not a positive integer.")
+    if prov["output_vector_hash"] != mem.get("embedding_sha256"):
+        errors.append(f"{mid}: embedding provenance names vector "
+                      f"{str(prov['output_vector_hash'])[:16]}… but the bundle "
+                      f"carries {str(mem.get('embedding_sha256'))[:16]}… — the "
+                      "record describes a different vector than the one shipped.")
+    if prov["preprocessing"] == "none" and prov["input_content_hash"] != born:
+        errors.append(f"{mid}: embedding provenance declares preprocessing "
+                      "'none' but its input_content_hash is not this memory's "
+                      "content.")
+    return errors
+
+
 # --- B8: causal provenance (transcribed from mneme/bundle.py) --------------
 
 def receipt_digest_from_row(row: dict, served: list) -> str:
@@ -596,6 +643,7 @@ def receipt_digest_from_row(row: dict, served: list) -> str:
         "hops": int(row["hops"]),
         "ranking_protocol": row["ranking_protocol"],
         "custody_override": json.loads(row["custody_override_json"])["override"],
+        "as_of": row["as_of"],
     }
     return sha256_hex(canonical_json(body).encode("utf-8"))
 
@@ -775,6 +823,8 @@ def verify(bundle_json: str) -> tuple[bool, list[str], list[str]]:
     stored_supersedes: dict[str, str] = {}   # successor -> claimed predecessor
     successors: dict[str, set[str]] = {}     # predecessor -> SUPERSEDED_BY names
     verified_chains: list = []
+    declared_provenance = 0
+    undeclared_provenance = 0
 
     for mem in body.get("memories", []):
         mid = mem["memory_id"]
@@ -792,6 +842,13 @@ def verify(bundle_json: str) -> tuple[bool, list[str], list[str]]:
             errors.append(f"B3: {mid}: content does not hash to the STORED seal.")
         if mem.get("content_sha256") != born:
             errors.append(f"B3: {mid}: declared content_sha256 disagrees with birth event.")
+        prov = birth.get("embedding_provenance")
+        if isinstance(prov, dict):
+            declared_provenance += 1
+            errors.extend(f"B3: {e}" for e in
+                          check_embedding_provenance(mid, prov, mem, born))
+        else:
+            undeclared_provenance += 1
 
         status, fstate, conf = replay_state(chain, errors)
         if mem.get("custody_status") != status:
@@ -851,6 +908,13 @@ def verify(bundle_json: str) -> tuple[bool, list[str], list[str]]:
     for sid in sorted(set(tf_by_sweep) - included_ids - excluded_ids):
         errors.append(f"B5: sweep {sid}: TAINT_FLAGGED events reference it but "
                       "the bundle neither carries it nor declares it excluded.")
+
+    if undeclared_provenance:
+        notes.append(f"{undeclared_provenance} of "
+                     f"{declared_provenance + undeclared_provenance} memories "
+                     "declare no embedding provenance: for those, the embedding "
+                     "boundary is trusted and its drift undetectable. Stated, "
+                     "not hidden.")
 
     for sw in excluded:
         notes.append(f"sweep {sw['sweep_id']} declared excluded — its seal was "
