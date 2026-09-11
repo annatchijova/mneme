@@ -243,7 +243,8 @@ carries, never proof that its lineage is complete.
 
 ## Recommended protocol changes
 
-These are recommendations, not applied changes in this audit branch.
+These were recommendations when this audit was written. All four have
+since been applied; where each one landed is recorded after the list.
 
 1. **Make actor status a transactional write gate.** `store`, `reinforce`,
    supersession, and every future mutator must refuse a `QUARANTINED` actor
@@ -259,6 +260,18 @@ These are recommendations, not applied changes in this audit branch.
 4. **For partial lineage exports, consider `excluded_lineage` declarations.**
    This would mirror B5's honest partial-sweep contract if consumers need to
    distinguish “counterpart not included” from “lineage ended here.”
+
+## Where the recommendations landed
+
+| Recommendation | Landed as |
+|---|---|
+| 1. Actor status as a transactional write gate | `authority.gate()`, called by every mutator before any state change, in the caller's transaction. Invariant A5: a QUARANTINED actor's effective capability set is empty, and the check is re-run at verification against the event's own timestamp (B7). |
+| 2. Explicit authority, not stringly actor identity | `mneme/authority.py`: a closed capability vocabulary (STORE, REINFORCE, SUPERSEDE, QUARANTINE_ACTOR, QUARANTINE_MEMORY, REHABILITATE, GRANT, REVOKE, DECIDE, and later ASSERT and ADJUDICATE), granted by hash-chained, revocable grants on per-actor chains. No amplification (A3) makes every capability traceable to one root act. Capabilities rather than roles because a role is a claim about a person and a capability is a claim about an act — and only the second fits in an evidence bundle. |
+| 3. A defined post-quarantine protocol | Refuse all writes from the actor, chosen explicitly and tested: `tests/test_authority_pure.py` asserts the store, reinforce, rehabilitate and re-sweep paths. `authority.reinstate_actor()` gives the reversal path this file's own error message promised and never had — and it deliberately does NOT rehabilitate the memories the sweep flagged, because those are separate claims with separate evidence. |
+| 4. `excluded_lineage` for partial exports | NOT done as named, and worth saying so plainly. B4's bilateral lineage check still skips when one party is absent, and R2-04 stands as written. What the same honesty contract now covers is broader: sweeps (B5), decisions (B8) and claim sets (B9) all declare what they cannot evidence rather than implying it. Lineage is the remaining gap, and it is listed in `KNOWN_LIMITATIONS.md` rather than quietly closed. |
+
+The audit's own closing observation — that "audited" does not imply
+"authorized" — became the project's next invariant rather than a ticket.
 
 ## Implications for STIGMERGY
 

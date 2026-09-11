@@ -16,6 +16,23 @@ Python file**.
 The question MNEME answers is the one a poisoned-RAG incident actually
 asks: *why does your agent remember this, and can you prove the answer?*
 
+And then the three that follow it, because "we found the poison and
+excluded it" says what was done, not what it did:
+
+- **who was ALLOWED to cause this?** Custody proves an event happened.
+  It says nothing about permission — an audit trail is not an
+  authorization system. Every mutation now carries two separable proofs
+  over different evidence: integrity provenance (the memory's chain) and
+  authority provenance (the actor's capability ledger).
+- **which DECISIONS did this memory contaminate?** A recall receipt
+  proves what an agent was shown. A decision record proves what it did
+  with it, bilaterally, and `mneme impact` reconstructs the blast radius
+  graded DIRECT / DERIVED / POSSIBLE — because equating contact with
+  contamination is how one quarantine silences a whole field.
+- **what did the poison actually DO?** Two sealed worlds, one query, an
+  exact enumerated delta. Sometimes the answer is *nothing* — damage
+  measured at zero rather than assumed at unknown.
+
 ## The incident, in sixty seconds
 
 No dependencies. If anything below imports something you had to
@@ -27,7 +44,7 @@ python3 demo.py                      # one poisoned-RAG incident, end to
                                      #   gated recall, sealed export,
                                      #   hostile audit
 python3 verify_offline.py bundle.json
-# VERIFIED: every check (B1-B6) passed.        (exit 0)
+# VERIFIED: every check (B0-B9) passed.        (exit 0)
 # FAILED: N problem(s). + one line per lie     (exit 1)
 ```
 
@@ -42,14 +59,23 @@ open ui/index.html                   # the Field Viewer (below) — a
 And the pure test suites (SQLite `:memory:` only, no infrastructure):
 
 ```bash
-python3 tests/test_custody_pure.py   # 37 checks: chains, grafting, forks,
-                                     #   temporal plausibility
-python3 tests/test_field_pure.py     # 41 checks: gate (serving AND
-                                     #   influence), exact ranking, rescue,
-                                     #   supersession, receipts
-python3 tests/test_bundle_pure.py    # 87 checks: bundles, declared partial
-                                     #   exports, lineage, backward-time,
-                                     #   verifier agreement
+python3 tests/test_custody_pure.py       # chains, grafting, forks, temporal
+python3 tests/test_field_pure.py         # gate (serving AND influence),
+                                         #   exact ranking, rescue, receipts
+python3 tests/test_bundle_pure.py        # bundles, declared partial exports,
+                                         #   lineage, verifier agreement
+python3 tests/test_authority_pure.py     # what acting WITHOUT PERMISSION
+                                         #   looks like, and protocol versions
+python3 tests/test_causality_pure.py     # decision records, blast radius
+python3 tests/test_counterfactual_pure.py# non-interference, measured
+python3 tests/test_influence_pure.py     # the influence budget, on a graph
+                                         #   built to punish a naive walk
+python3 tests/test_provenance_pure.py    # embedding drift, "what did MNEME
+                                         #   know at T?"
+python3 tests/test_claims_pure.py        # propositions vs documents, n-ary
+                                         #   contradiction
+python3 tests/test_semantic_mutants.py   # 12 protocol mutants, 12 killed,
+                                         #   2 boundaries declared
 ```
 
 ## What lying looks like
@@ -72,6 +98,17 @@ caught, in both verifiers:
 | Ship partial sweep evidence without declaring it | B5 — a referenced sweep is carried in full or declared excluded, never implied absent |
 | Dodge a sweep's seal check by declaring it excluded | B5 — a fully-evidenced sweep may not be excluded |
 | Forge the cross-memory commitment | B6 — Merkle root over heads |
+| Write as an actor you quarantined an hour ago | B7 — a QUARANTINED actor holds no capability, at that event's timestamp |
+| Nominate yourself the rehabilitation authority | B7 — the grant must exist, be live, and confer REHABILITATE |
+| Grant a capability you never held | B7 — no amplification, re-derived offline |
+| Claim a decision used a memory the recall never served | B8 — the subset check, at write and at verification |
+| Delete the decision but leave its custody evidence | B8 — the causal link is bilateral |
+| Cite a recall against a world that never existed | B8 — a counterfactual receipt declares its own world |
+| Over-flag or under-flag a sweep and seal it consistently | B5 — the flagged set is re-derived from custody evidence |
+| Promote a memory that was never arithmetically due | B4 — replay checks the threshold, not just derivability |
+| Rewrite a proposition under its own seal | B9 — the statement hashes to what its assertion sealed |
+| Declare a constraint satisfied while the shipped claims violate it | B9 — the status is recomputed, not read |
+| Change a rule and let old bundles acquire it | B0 — a bundle declares the semantics it was checked under |
 
 ## The disciplines, in one paragraph
 
@@ -103,9 +140,14 @@ legitimate one; recall serves the lie; **CONTAIN INCIDENT** runs the
 sealed sweep and everything the actor touched loses its light,
 disconnects and sinks — flagged, never deleted; the custody gate
 withholds it from recall and the receipt counts it; the false positive
-returns by audited event; the bundle ships and the auditor runs B1–B6;
-a forged status column fails B4 on screen. Click any memory at any time
-to read its chain.
+returns by audited event; the bundle ships and the auditor runs its
+checks; a forged status column fails B4 on screen. Click any memory at
+any time to read its chain.
+
+The Viewer replays the Phase 1 incident and has not been extended to the
+authority, causal, counterfactual or epistemic layers. It was accurate
+when it was written and is now a partial picture, which is worth saying
+here rather than letting a demo imply completeness.
 
 Two modes: **director** (auto-plays the whole incident, timed for a
 demo recording) and **manual** (you fire each beat — built for live
@@ -154,11 +196,40 @@ What neither had, and MNEME adds:
    `field_state` and `confidence` must reproduce from replaying its
    chain. Hand-editing a status column without its event is
    self-revealing (bundle check B4).
+5. **Authority provenance, separable from integrity.** Capabilities, not
+   roles: "Anna is an admin" does not fit in an evidence bundle; "grant
+   g-4f2 conferred REHABILITATE at 14:02:11, issued by someone who held
+   it, unrevoked at 14:03:17" is arithmetic an auditor checks offline.
+6. **Causal closure.** Recall → decision → blast radius, each link
+   bilateral and sealed, so "which decisions were contaminated by X" has
+   an answer made of rows rather than inference.
+7. **Counterfactual containment.** The observable effect of a poisoned
+   memory, enumerated exactly and sealed — including the case where the
+   effect is nothing at all.
+8. **Propositions separate from documents.** A claim has its own chain
+   and its own state; its standing is derived from evidence every time it
+   is asked for, because a stored confidence is a number whose
+   derivation has been thrown away.
 
 ## Layout
 
     mneme/canonical.py    canonical JSON + Fraction→Decimal quantization
                           (floats rejected, not serialized carefully)
+    mneme/protocol.py     the seven protocol versions a seal commits to;
+                          a verifier meeting a version it does not
+                          implement refuses instead of assuming
+    mneme/authority.py    the capability ledger: per-actor hash-chained
+                          grants and revocations, no amplification,
+                          quarantine as a write barrier
+    mneme/causality.py    decision records binding receipt + decision hash
+                          + policy version, and blast-radius
+                          reconstruction graded DIRECT/DERIVED/POSSIBLE
+    mneme/counterfactual.py
+                          two sealed worlds, one query, an exact delta —
+                          non-interference proven rather than asserted
+    mneme/claims.py       propositions as first-class objects with their
+                          own chains, n-ary contradiction sets, standing
+                          derived from evidence and never stored
     mneme/custody.py      per-memory hash chains: closed event vocabulary,
                           genesis bound to memory_id, append (caller owns
                           the transaction), pure verification
@@ -171,7 +242,7 @@ What neither had, and MNEME adds:
                           custody-gated recall with exact ranking and
                           sealed recall receipts, persisted only by the
                           caller's explicit act
-    mneme/bundle.py       evidence bundle export + verification (B1–B6)
+    mneme/bundle.py       evidence bundle export + verification (B0–B9)
     mneme/schema.sql      SQLite WAL, Phase 1; written to port to
                           CockroachDB mechanically
     verify_offline.py     standalone stdlib-only verifier — send this
@@ -189,7 +260,9 @@ What neither had, and MNEME adds:
                           a falsified rollback vector, and the guarantees
                           that must transfer to distributed memory systems
     tests/                pure suites: no pip installs, no infrastructure,
-                          SQLite :memory: only
+                          SQLite :memory: only — including
+                          test_semantic_mutants.py, which mutates the
+                          PROTOCOL rather than the operators
 
 ## MCP Server (Model Context Protocol)
 
@@ -203,13 +276,29 @@ python3 mcp_server.py    # stdio transport
 
 | Tool | Description |
 |------|-------------|
+| `mneme_bootstrap_root` | Start this field's authority ledger. Once, ever |
+| `mneme_register_actor` | Register an identity — it holds nothing until granted |
+| `mneme_grant` / `mneme_revoke` | Confer or end capabilities, hash-chained |
+| `mneme_reinstate_actor` | Close a quarantine interval, on the record |
+| `mneme_authority` | Who may cause what, and on whose word |
 | `mneme_store` | Store a memory with custody chain from genesis |
-| `mneme_recall` | Custody-gated recall with exact Fraction ranking |
+| `mneme_recall` | Custody-gated recall; `as_of` reconstructs history |
 | `mneme_reinforce` | Increase confidence (exact closed-form arithmetic) |
-| `mneme_quarantine_actor` | Taint-flag every memory an actor touched |
+| `mneme_quarantine_actor` | Sweep the past AND bar the actor from writing |
 | `mneme_rehabilitate` | Restore TAINT_FLAGGED memory to CLEAN |
+| `mneme_exposure` | Influence budget: DIRECT_TAINT / INFLUENCE_EXPOSED / CLEAN |
+| `mneme_record_decision` | Close recall → action, bilaterally |
+| `mneme_impact` | Blast radius, graded DIRECT / DERIVED / POSSIBLE |
+| `mneme_counterfactual` | What excluding these memories actually changes |
+| `mneme_assert_claim` | Assert a proposition, distinct from any document |
+| `mneme_link_evidence` | A memory supports or contradicts a claim |
+| `mneme_relate_claims` | SUPPORTS / CONTRADICTS / SUPERSEDES / DERIVED_FROM |
+| `mneme_claim_set` | N-ary contradiction: AT_MOST_ONE / EXACTLY_ONE / INCOMPATIBLE |
+| `mneme_resolve_set` | Decide between hypotheses, as one audited act |
+| `mneme_claim` | A proposition's standing, recomputed from evidence |
+| `mneme_embeddings` | Inventory and drift across the vector boundary |
 | `mneme_export_bundle` | Export sealed evidence bundle (self-contained) |
-| `mneme_verify_bundle` | Verify B1-B6 checks on any bundle |
+| `mneme_verify_bundle` | Verify B0-B9 checks on any bundle |
 | `mneme_custody_chain` | View full per-memory custody history |
 | `mneme_info` | Architecture, invariants, and stats |
 
@@ -236,10 +325,20 @@ provider.
 
 ## Status
 
-Phase 1: core complete, 165/165 pure checks passing, demo harness, the
-Field Viewer, and two adversarial security-audit rounds
-(`SECURITY_AUDIT.md`, `SECURITY_AUDIT_ROUND_2.md`)
-included. Not yet built: HTTP API, k-NN graph for large corpora, STDP
-synaptic dynamics, stylometric authorship checks (see
-`KNOWN_LIMITATIONS.md` — every absence there is a decision with a
-rationale, not an oversight).
+Phase 1 core complete. Phase 1.5 adds the authority ledger, causal
+decision receipts, counterfactual contamination analysis, the influence
+budget, embedding provenance, temporal replay, the epistemic claims
+layer, and protocol versioning — 554/554 pure checks passing, plus 12/12
+semantic mutants killed with 2 boundaries explicitly declared.
+
+Round 2's findings are closed: a quarantined actor can no longer write
+(R2-01), and nobody can nominate themselves the rehabilitation authority
+by choosing a string (R2-02). The audit's own closing line — *you found
+that "audited" does not imply "authorized"* — became the next invariant.
+
+Not yet built: HTTP API, k-NN graph for large corpora, STDP synaptic
+dynamics, stylometric authorship checks. And ten or so new limitations
+that these additions CREATED, each named in `KNOWN_LIMITATIONS.md` with
+what it costs — including the two mutants that survive on purpose,
+because a metric that improves by lowering its standards is not a
+metric.

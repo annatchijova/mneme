@@ -6,22 +6,32 @@ consolidated ledger. The organizing principle is unchanged from
 STIGMERGY: a limitation named is a decision; a limitation hidden is a
 bug waiting for a better moment.
 
-## Transitive taint is advisory, not automatic
+## Transitive taint is graded, and still never automatic
 
-(Source: `trust.py` header.) Direct taint — actor X appears in a
-chain — is flagged automatically. Transitive taint — memory A is
-tainted and A's RESONANT links may have inflated B — is real but
-unbounded: resonance graphs are connected in practice, and automatic
-propagation without a fixpoint bound turns one quarantine into a
-self-inflicted denial of service on the whole field. Phase 1 therefore
-*reports* the one-hop RESONANT neighbourhood of every sweep's flagged
-set (`TaintSweep.advisory_resonant_neighbours`) for analyst review and
-flags nothing beyond direct contact. If a principled bound is designed
-later (hop-limited with decay-weighted thresholds is the obvious
-candidate), it must arrive with its own invariant, not as a loop
-someone added.
+(Source: `trust.py`.) This entry used to say the bound was undesigned
+and would have to arrive with its own invariant. It has:
+`trust.influence_exposure()` spends an exact rational INFLUENCE BUDGET
+outward from the tainted set — a RESONANT edge conveys
+`INFLUENCE_TRANSFER` (1/2) of whatever reaches its source, anything
+below `EXPOSURE_FLOOR` (1/64) is dropped, and `MAX_INFLUENCE_DEPTH` is
+DERIVED from the floor rather than configured beside it. Termination is
+structural, not a visited-set trick: influence strictly decreases per
+edge, so cycles are harmless and no path beyond the depth bound can
+contribute. INHIBITORY edges convey nothing (the CONTRADICTED_BY
+carve-out, applied to the graph).
 
-## Recall receipts persist only by the caller's explicit act
+WHAT REMAINS, named. `INFLUENCE_EXPOSED` is a finding and NOT a custody
+status: nothing is flagged, nothing is written, and the sweep still
+flags only what it can demonstrate. That is the point — a system that
+quarantined on contact would have an incident response
+indistinguishable from the incident — but it does mean an analyst must
+still act. And the two constants are a POLICY CHOICE, not a
+measurement: 1/2 per edge and a floor of 1/64 are defensible and
+arbitrary, they are sealed into every exposure report so two reports are
+comparable, and changing them is a `taint_protocol` bump, not a config
+flip.
+
+## Recall receipts persist only by the caller's explicit act — and now bind to decisions
 
 `recall()` returns a sealed `RecallReceipt` and stays read-only by
 design — serving is not a state transition, so forcing a write into
@@ -31,12 +41,26 @@ path: `field.persist_receipt()` writes the receipt into the
 append-only `recall_receipts` table (digest recomputed before insert;
 a receipt that does not recompute is refused), and
 `field.verify_receipts()` re-derives every stored digest from its own
-columns. What it still does not provide: receipts are not custody
-events, not in evidence bundles, and not linked to the decisions they
-served — that is the Phase 2 CRONOS integration, where receipts become
-first-class trace events. Until then, "why did the agent remember
-this" is answerable for any recall whose receipt the caller persisted
-or kept, and for the memory's full history always.
+columns. Receipts now travel in evidence bundles and are re-derived there (B8),
+and `causality.record_decision()` closes the loop the previous version
+of this entry deferred to Phase 2: a decision record commits
+receipt_sha256 + decision_sha256 + policy_version + the subset of the
+served set it used, bilaterally (each used memory's chain carries a
+`DECISION_USED_MEMORY` event naming it back).
+
+WHAT REMAINS, named. `decision_sha256` is OPAQUE. MNEME commits to the
+hash of a decision artifact it never sees, so it can prove the decision
+is a fixed object and that it cited this recall — and it cannot prove
+the artifact was actually PRODUCED from that recall. An agent that
+recalls honestly and then answers from somewhere else leaves a perfect
+record of a causal link that did not happen. Closing that needs the
+reasoning trace itself (the CRONOS integration), not a bigger hash.
+
+And recall is still read-only by default: a decision can only cite a
+receipt the caller chose to persist. An agent that never persists
+receipts leaves blast-radius reconstruction with nothing to reconstruct
+from, and MNEME will not silently start writing on the read path to
+prevent that.
 
 ## Linear exact scan; no k-NN graph, no vector index
 
@@ -88,7 +112,7 @@ REHABILITATED is valid only from TAINT_FLAGGED, so a chain that
 reversal path is designed it arrives as a protocol change (new replay
 rule, both verifiers, agreement tests), not as a loosened check.
 
-## Timestamps: order enforced, causal truth not proven
+## Timestamps: order enforced, causal truth not proven — and more now rests on them
 
 (Source: security audit Round 1, H1.) Chain verification now requires
 `created_at` to be canonical UTC (`…+00:00`) and non-decreasing along
@@ -103,16 +127,43 @@ only to read-time too; binding time to an external, harder-to-forge
 reference (a notarised clock, a CRONOS trace) is a Phase-2 decision, not
 a Phase-1 promise.
 
-## The embedding boundary is trusted
+MORE NOW RESTS ON THIS, which is the honest cost of the newer layers.
+Authority provenance (B7) decides whether a grant was live *at an
+event's timestamp*; the pre-authority carve-out excuses events *earlier
+than the declared genesis*; `recall(as_of=T)` reconstructs history *by
+timestamp comparison*. Each of those is exact and checkable against the
+evidence, and each of them inherits this boundary whole: an adversary
+who controls every write controls every timestamp, and can emit a
+monotonic, canonical, internally consistent history that verifies
+perfectly and never happened. `tests/test_semantic_mutants.py` carries
+that as a declared surviving mutant, so the limit is executable rather
+than merely written down.
+
+## The embedding boundary is trusted — drift is now detectable, not prevented
 
 `quantize_embedding()` makes model output exact *from that point on*;
 it cannot make the model deterministic. Two runs of a nondeterministic
 embedding model produce two different (each exactly-stored) vectors.
 MNEME's guarantees are about what happens to a vector after ingestion,
-never about the model that produced it. `embedding_model` is recorded
-in every STORED event; mixing models in one field is semantically
-meaningless even when dimensions coincide, and changing models is a
-migration event, not a config flip (STIGMERGY's rule, unchanged).
+never about the model that produced it. That has not changed and cannot.
+
+What HAS changed is that the boundary is now instrumented.
+`field.declare_embedding()` records provider, model, revision,
+dimension, preprocessing, input_content_hash, output_vector_hash and
+quantization_protocol, and `detect_embedding_drift()` reports any group
+agreeing on (provider, model, revision, preprocessing, input) while
+disagreeing on the output vector. That is a fact, not a heuristic: the
+same declared model was given the same declared input and produced two
+different vectors. `embedding_inventory()` makes mixing models a
+visible migration rather than an accident.
+
+WHAT REMAINS, named, and demonstrated rather than asserted:
+`tests/test_semantic_mutants.py` carries a mutant in which the provider
+returns a vector it never computed. It SURVIVES every check, by design,
+and is declared there as a boundary. MNEME records what a provider
+handed it. It cannot witness the model's arithmetic, and no hash can.
+Provenance is also OPTIONAL: memories that declare none verify fine, and
+every passing verdict counts and names them.
 
 ## SQLite Phase 1 concurrency
 
@@ -159,3 +210,140 @@ it entirely rather than declare it; `export_bundle()` always declares,
 but the verifier cannot detect that omission. Partial exports prove
 what they carry, never what they omit — the full-field export is the
 only bundle that proves the absence of further sweeps.
+
+
+## Authority begins with an act authority cannot authorize
+
+(Source: `authority.py`.) The ledger is a tree rooted at
+`bootstrap_root()`, and that call is refused once any authority chain
+exists — so it happens exactly once per field and every capability
+traces back to it by checkable grants (A3). What it does NOT prove is
+that the right party performed it. **Whoever bootstraps an empty field
+is its root.** Binding that to an external identity — an operator key, a
+notarised ceremony, a hardware token — is a deployment decision, and
+MNEME deliberately does not pretend to have made it.
+
+A related and smaller boundary: a field with no ledger at all still
+accepts writes. Those fields declare every event UNAUTHORIZED BY
+DECLARATION in their bundles and every passing verdict says so in words,
+which is the honest handling of pre-authority history — but it is
+handling, not prevention. The regime is one-way: once a field is
+bootstrapped, nothing removes a chain, so it can never return.
+
+## Non-interference is proven per QUERY, and only over recall
+
+(Source: `counterfactual.py`.) An empty delta licenses exactly this
+sentence: *for this query, under this sealed state, the excluded
+memories exerted no observable influence.* It does not license "no
+interference", and the module refuses to extrapolate. Generalising
+honestly means stating a query set and sealing a delta for each one;
+MNEME gives you the primitive and no license to skip that work.
+
+Two further bounds. The comparison is over RECALL OUTPUTS, not the
+agent's reasoning: if two different served sets would have produced the
+same decision anyway, that is a fact about the policy, not about MNEME.
+And `decision_dependency_changed` names decisions whose INPUT moves — it
+does not re-run them, because MNEME holds a decision's hash and never
+its reasoning. It is reported beside the query-scoped verdict and
+deliberately not folded into it; folding them made non-interference
+unreachable for any memory that had ever informed a decision.
+
+## Blast radius: DIRECT and DERIVED are evidence, POSSIBLE is a perimeter
+
+(Source: `causality.py`.) DIRECT is rows — persisted receipts that
+served a memory, decisions that used it. DERIVED follows declared
+edges: supersession lineage, and memories whose STORED payload names a
+contaminated decision (`derived_from_decision`), which the AGENT
+declares rather than MNEME inferring.
+
+POSSIBLE is neither. It is co-service in the same recall plus one-hop
+RESONANT neighbours — contact, reported so an analyst can see the
+perimeter, never acted on and never a custody status. It is also NOT
+COMPLETE: a memory influenced through some path MNEME does not model
+will not appear. Treat POSSIBLE as "start looking here", never as "this
+is the boundary of the damage".
+
+And a DERIVED edge exists only if the agent declared it. An agent that
+writes a memory because of a contaminated decision and does not say so
+leaves a derivation MNEME cannot see. The alternative — inferring
+descent from timing or authorship — is the indiscriminate propagation
+this project refuses everywhere else.
+
+## Claims: evidence is one-sided, and standing waits for a human
+
+(Source: `claims.py`.) Evidence links live on the CLAIM's chain and not
+the memory's, breaking the bilaterality that contradiction, lineage and
+decisions all follow. The reason is stated in the module and worth
+repeating here: a claim is about memories, memories are not about
+claims, and a document whose history grew with every proposition that
+ever cited it would be carrying the epistemic unit's weight again. The
+cost is real: a partial export of MEMORIES alone cannot show which
+propositions cite them. Bundles carry claims whole, so this bites only
+if someone builds a memory-only export path.
+
+STANDING WAITS FOR AN ADJUDICATION. A claim "holds" only when it is
+VALIDATED — adjudicated, by an actor holding ADJUDICATE. A claim with
+overwhelming supporting evidence and no ruling is ASSERTED, and its set
+evaluates to UNDETERMINED. That is deliberate: reading "nobody has
+objected yet" as "true" is how a memory system manufactures agreement.
+It does mean MNEME never concludes anything on its own, which is a
+feature until you wanted an autonomous field, and then it is this
+limitation.
+
+Also: `field.store()`'s original topic+claim contradiction rule (raven's)
+still exists and still creates INHIBITORY links. It is the cheap path
+for the one-proposition-per-document case and is NOT wired to the claims
+layer. Two mechanisms describe disagreement, at different levels, and
+reconciling them is deferred rather than done.
+
+## Bundle format V1 is unreadable, on purpose
+
+`MNEME_BUNDLE_V1` bundles are refused, not reinterpreted. They were
+sealed over bytes without sealing the SEMANTICS those bytes were checked
+under, which is precisely the retroactive-semantics problem
+`protocol.py` exists to close — so applying today's rules to them would
+be the bug rather than a courtesy. The same rule bites inside V2:
+`receipt_protocol` 1.0.0 is NOT in the supported table, because the
+digest body changed and this build genuinely cannot check one.
+
+If V1 or receipt-1.0.0 evidence ever needs verifying, the answer is a
+verifier of its era, or those rules ported forward deliberately as code,
+in both implementations, with tests. Never a widened `SUPPORTED_PROTOCOLS`
+entry — that table is a claim about implemented behaviour, and an entry
+without the code behind it is the one lie it exists to prevent.
+
+## Sweep re-derivation covers what the bundle carries
+
+(Source: `bundle.py` B5, taint_protocol 2.0.0.) An included sweep's
+flagged set is now re-derived from custody evidence — for every memory
+the bundle carries, an influencing event by the quarantined actor at or
+before the sweep must correspond to a flag, and vice versa. This killed
+the over-flagging and under-flagging mutants that passed every 1.x
+check.
+
+It is total on PRESENCE and silent on ABSENCE: a partial export cannot
+be asked about memories it does not ship, so a sweep that under-flagged
+a memory left out of the bundle is invisible there. The full-field
+export is the only one that proves a sweep flagged everything it should
+have — the same shape as the existing partial-export limitation below,
+for the same reason.
+
+## Semantic mutants: 12 killed, 2 declared survivors
+
+`tests/test_semantic_mutants.py` patches MNEME's SEMANTICS, lets the
+patched code produce real evidence, and asks whether anything refuses
+it. The metric is mutants killed over total, and an UNDECLARED survivor
+fails the suite — a metric that improves by lowering its standards is
+not a metric.
+
+The two declared survivors are the entries above: a model that returns a
+vector it never computed, and an adversary who fabricates a coherent
+field. Both were prose in this file for a long time. They are now
+executable.
+
+Writing that suite found two real gaps, both since closed and both
+visible in the protocol versions: `replay_protocol` 1.1.0 (a promotion
+must be arithmetically DUE, not merely recorded — a writer that quietly
+narrowed the comparison satisfied every check MNEME had) and
+`taint_protocol` 2.0.0 (the sweep re-derivation above). The suite is
+worth keeping mainly because it will do that again.
