@@ -84,7 +84,13 @@ CREATE TABLE IF NOT EXISTS custody_chain (
     seq           INTEGER NOT NULL CHECK (seq >= 0),
     event_type    TEXT NOT NULL CHECK (event_type IN (
                       'STORED','REINFORCED','CONTRADICTED_BY','SUPERSEDED_BY',
-                      'QUARANTINED','TAINT_FLAGGED','REHABILITATED','STATE_CHANGED')),
+                      'QUARANTINED','TAINT_FLAGGED','REHABILITATED','STATE_CHANGED',
+                      -- custody_protocol 1.1.0: the agent's explicit act of
+                      -- recording that a decision consumed this memory. It
+                      -- changes no state (replay treats it as a no-op); it
+                      -- closes recall -> action so blast radius is evidence,
+                      -- not inference.
+                      'DECISION_USED_MEMORY')),
     actor_id      TEXT NOT NULL REFERENCES actors(actor_id),
     reason        TEXT NOT NULL CHECK (length(trim(reason)) > 0),
     created_at    TEXT NOT NULL,
@@ -97,6 +103,99 @@ CREATE TABLE IF NOT EXISTS custody_chain (
 );
 
 CREATE INDEX IF NOT EXISTS idx_custody_actor ON custody_chain (actor_id);
+
+-- -----------------------------------------------------------------------------
+-- authority_chain — THE OTHER table. Per-ACTOR tamper-evident hash chain
+-- recording who was allowed to cause what (mneme/authority.py).
+--
+-- custody_chain answers "what happened to this memory". This answers "who
+-- was authorized to cause it". The two are separable proofs over different
+-- evidence, and bundle check B7 demands both: a perfect chain of an
+-- unauthorized act is exactly the hole Round 2 confirmed.
+--
+-- subject_id is WHOSE authority the row describes; issuer_id is WHO wrote
+-- it. They coincide only in the root bootstrap, which is refused once any
+-- chain exists — so the ledger is a tree rooted at one auditable act.
+--
+-- Same structural disciplines as custody_chain: genesis bound to the
+-- subject id (a grant history cannot be grafted between actors), seq dense
+-- from 0, UNIQUE (subject_id, prev_hash) so a fork is a constraint
+-- violation rather than a race outcome, reason NOT NULL so an unreasoned
+-- grant cannot exist, and no ON DELETE anywhere (A4: revocation is an
+-- event, never a row removal).
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS authority_chain (
+    subject_id    TEXT NOT NULL REFERENCES actors(actor_id),
+    seq           INTEGER NOT NULL CHECK (seq >= 0),
+    event_type    TEXT NOT NULL CHECK (event_type IN (
+                      'ACTOR_REGISTERED','GRANTED','REVOKED',
+                      'ACTOR_QUARANTINED','ACTOR_REINSTATED')),
+    issuer_id     TEXT NOT NULL REFERENCES actors(actor_id),
+    reason        TEXT NOT NULL CHECK (length(trim(reason)) > 0),
+    created_at    TEXT NOT NULL,
+    payload_json  TEXT NOT NULL,            -- canonical bytes, exactly what was hashed
+    prev_hash     TEXT NOT NULL CHECK (length(prev_hash) = 64),
+    entry_hash    TEXT NOT NULL CHECK (length(entry_hash) = 64),
+    PRIMARY KEY (subject_id, seq),
+    UNIQUE (subject_id, prev_hash),
+    UNIQUE (entry_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_authority_issuer ON authority_chain (issuer_id);
+
+-- -----------------------------------------------------------------------------
+-- ledger_root — the root act, made unrepeatable by a CONSTRAINT rather than
+-- by a check that a second writer could pass.
+--
+-- bootstrap_root() reads COUNT(authority_chain) and then writes. Two writers
+-- can both pass that read before either commits, and the result is a field
+-- with two self-issued root grants — each chain internally perfect, no
+-- constraint violated. This table is the structural answer, in the idiom the
+-- rest of the schema already uses: the PRIMARY KEY pinned to the literal 1
+-- makes a second root a constraint violation, not a race outcome.
+--
+-- It holds no authority of its own. It is a cache of "which chain carries the
+-- root grant", derivable from the chains themselves — exactly as actors.status
+-- is a cache of the authority replay — and B7 re-derives the root from
+-- evidence and never from here.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS ledger_root (
+    singleton  INTEGER PRIMARY KEY CHECK (singleton = 1),
+    actor_id   TEXT NOT NULL REFERENCES actors(actor_id),
+    created_at TEXT NOT NULL
+);
+
+-- -----------------------------------------------------------------------------
+-- governance — Invariant A6, as a CONSTRAINT instead of a promise.
+--
+-- A6 says the field always retains at least one ACTIVE actor holding GRANT:
+-- a field nobody can ever authorize anything in, including its own repair,
+-- is indistinguishable from a successful attack. The first implementation
+-- checked it with a read inside revoke() and nowhere else, which left two
+-- holes an audit found:
+--
+--   * QUARANTINE was not guarded at all. Quarantining the last GRANT holder
+--     emptied governance silently, and a following self-revocation by the
+--     responder left a field that could never grant, register, or reinstate
+--     again — permanently bricked, by two individually legitimate acts.
+--   * The revoke check was read-then-write. Two concurrent revokes each
+--     skipping a different holder both pass; only SQLite's single-writer
+--     lock serialised them, and an engine at READ COMMITTED would not.
+--
+-- One counter on one row answers both. The CHECK makes zero a constraint
+-- violation; the conditional UPDATE (`WHERE holders > 1`) makes the
+-- decrement atomic, because two transactions touching the SAME ROW
+-- serialise on its lock under every engine worth porting to, rather than
+-- relying on an isolation level a config flip can change.
+--
+-- It holds no authority. It is a cache of a fact the chains already carry,
+-- like actors.status, and B7 re-derives governance from evidence — never
+-- from here.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS governance (
+    singleton     INTEGER PRIMARY KEY CHECK (singleton = 1),
+    grant_holders INTEGER NOT NULL CHECK (grant_holders >= 1)
+);
 
 -- -----------------------------------------------------------------------------
 -- cell_links — raven-memory's ternary links between memories.
@@ -146,5 +245,131 @@ CREATE TABLE IF NOT EXISTS recall_receipts (
     excluded_custody   INTEGER NOT NULL CHECK (excluded_custody >= 0),
     excluded_forgotten INTEGER NOT NULL CHECK (excluded_forgotten >= 0),
     excluded_inhibited INTEGER NOT NULL CHECK (excluded_inhibited >= 0),
+    -- receipt_protocol 2.0.0: the question, not only the answer. Without
+    -- top_k / hops / ranking_protocol a receipt cannot be replayed, and a
+    -- receipt that cannot be replayed cannot anchor a counterfactual.
+    top_k              INTEGER NOT NULL CHECK (top_k > 0),
+    hops               INTEGER NOT NULL CHECK (hops >= 0),
+    ranking_protocol   TEXT NOT NULL,
+    -- The WORLD the recall was taken in: canonical {"override": [[id, status]…]}.
+    -- Empty for a real recall; non-empty for a counterfactual run against a
+    -- hypothetical custody state. It is inside the receipt digest so a
+    -- counterfactual receipt cannot be laundered into evidence about the
+    -- actual field, and record_decision refuses to let a decision cite one.
+    custody_override_json TEXT NOT NULL DEFAULT '{"override":[]}',
+    -- The INSTANT this recall reconstructed, or NULL for "now". A receipt
+    -- that does not say when it was looking cannot be replayed either.
+    as_of              TEXT,
     persisted_at       TEXT NOT NULL
+);
+
+-- -----------------------------------------------------------------------------
+-- decisions — the causal closure: recall -> action (mneme/causality.py).
+--
+-- A recall receipt proves what the agent was SHOWN. It does not prove what
+-- the agent DID with it, so "why did it remember X" was answerable while
+-- "which decisions were contaminated by X" was not. A decision record is
+-- the agent's own explicit, authorized act of committing that link:
+-- receipt_sha256 (what it was shown) + decision_sha256 (what it produced,
+-- by hash — MNEME never sees the artifact and does not pretend to) +
+-- policy_version (under which rules) + the subset of the served set it
+-- actually used.
+--
+-- used_json is a canonical, sorted claim that must be a SUBSET of the
+-- cited receipt's served list: a decision cannot claim to have used a
+-- memory the recall never served it. Bilateral, like contradiction and
+-- lineage: each used memory's custody chain carries a matching
+-- DECISION_USED_MEMORY event, so neither side can hide the link alone.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS decisions (
+    decision_id     TEXT PRIMARY KEY,
+    receipt_sha256  TEXT NOT NULL REFERENCES recall_receipts(receipt_sha256),
+    decision_sha256 TEXT NOT NULL CHECK (length(decision_sha256) = 64),
+    policy_version  TEXT NOT NULL CHECK (length(trim(policy_version)) > 0),
+    actor_id        TEXT NOT NULL REFERENCES actors(actor_id),
+    reason          TEXT NOT NULL CHECK (length(trim(reason)) > 0),
+    used_json       TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    record_sha256   TEXT NOT NULL UNIQUE CHECK (length(record_sha256) = 64)
+);
+
+CREATE INDEX IF NOT EXISTS idx_decisions_receipt ON decisions (receipt_sha256);
+
+-- -----------------------------------------------------------------------------
+-- claims — the PROPOSITION, separated from the document (mneme/claims.py).
+--
+-- A memory used to do two jobs: the container (this text was stored, with
+-- this chain) and the epistemic unit (this is what the field believes).
+-- raven's topic+claim contradiction rule works only while every
+-- proposition lives in exactly one document and every document asserts
+-- exactly one proposition; neither is true of anything real.
+--
+-- statement is immutable (C1) — revision is supersession, an event, never
+-- an edit, the same rule M1 holds memories to. No confidence column
+-- exists anywhere here ON PURPOSE (C3): a claim's STANDING is recomputed
+-- from evidence, because a stored confidence is a number whose derivation
+-- has been thrown away.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS claims (
+    claim_id         TEXT PRIMARY KEY,
+    statement        TEXT NOT NULL CHECK (length(trim(statement)) > 0),
+    statement_sha256 TEXT NOT NULL CHECK (length(statement_sha256) = 64),
+    topic            TEXT,
+    created_by       TEXT NOT NULL REFERENCES actors(actor_id),
+    created_at       TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_claims_topic ON claims (topic);
+
+-- -----------------------------------------------------------------------------
+-- claim_chain — per-CLAIM tamper-evident hash chain. Third of its kind, and
+-- deliberately the same shape as the other two: genesis bound to claim_id,
+-- seq dense from 0, forks a constraint violation, reason NOT NULL, nothing
+-- deleted. Evidence links live HERE and not on the memory's chain: a claim
+-- is about memories, memories are not about claims, and a document whose
+-- history grew with every proposition that ever cited it would be carrying
+-- the epistemic unit's weight again.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS claim_chain (
+    claim_id      TEXT NOT NULL REFERENCES claims(claim_id),
+    seq           INTEGER NOT NULL CHECK (seq >= 0),
+    event_type    TEXT NOT NULL CHECK (event_type IN (
+                      'CLAIM_ASSERTED','EVIDENCE_LINKED','RELATED_TO',
+                      'SET_MEMBERSHIP','CLAIM_VALIDATED','CLAIM_REFUTED',
+                      'CLAIM_WITHDRAWN','CLAIM_SUPERSEDED')),
+    actor_id      TEXT NOT NULL REFERENCES actors(actor_id),
+    reason        TEXT NOT NULL CHECK (length(trim(reason)) > 0),
+    created_at    TEXT NOT NULL,
+    payload_json  TEXT NOT NULL,
+    prev_hash     TEXT NOT NULL CHECK (length(prev_hash) = 64),
+    entry_hash    TEXT NOT NULL CHECK (length(entry_hash) = 64),
+    PRIMARY KEY (claim_id, seq),
+    UNIQUE (claim_id, prev_hash),
+    UNIQUE (entry_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_claim_chain_actor ON claim_chain (actor_id);
+
+-- -----------------------------------------------------------------------------
+-- claim_sets — n-ary contradiction. "A contradicts B" is too poor for most
+-- real conflicts: a date is one of three candidates, a policy is one of
+-- several readings. A set is a CONSTRAINT over many hypotheses —
+-- AT_MOST_ONE, EXACTLY_ONE, or the weaker INCOMPATIBLE (they cannot all
+-- hold), which is often the only thing actually known.
+--
+-- members_sha256 seals the sorted member list, like a taint sweep, and
+-- every member's chain carries a SET_MEMBERSHIP event so the membership is
+-- RE-DERIVABLE from evidence rather than trusted to this row — the lesson
+-- taint_protocol 2.0.0 learned the hard way.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS claim_sets (
+    set_id          TEXT PRIMARY KEY,
+    constraint_type TEXT NOT NULL CHECK (constraint_type IN (
+                        'AT_MOST_ONE','EXACTLY_ONE','INCOMPATIBLE')),
+    topic           TEXT,
+    reason          TEXT NOT NULL CHECK (length(trim(reason)) > 0),
+    created_by      TEXT NOT NULL REFERENCES actors(actor_id),
+    created_at      TEXT NOT NULL,
+    members_json    TEXT NOT NULL,
+    members_sha256  TEXT NOT NULL CHECK (length(members_sha256) = 64)
 );

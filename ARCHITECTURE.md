@@ -1,6 +1,7 @@
 # MNEME — Architecture
 
-**Status**: Phase 1 core frozen; API and demo pending.
+**Status**: Phase 1 core frozen. Phase 1.5 adds the authority,
+causal, counterfactual and epistemic layers described below.
 **License**: Apache 2.0
 
 ## Thesis
@@ -19,6 +20,21 @@ custody, make every state transition an audited event in the same
 transaction, make quarantine a deterministic sealed sweep over custody
 evidence, and make the whole field exportable as a bundle that a
 distrusting third party verifies offline with one short stdlib file.
+
+Round 2's audit then found the sentence that shaped everything after it:
+**an audit trail is not an authorization system.** A perfect chain of an
+unauthorized act is still a perfect chain. So a mutation now carries TWO
+separable proofs over different evidence — integrity provenance (the
+per-memory custody chain) and authority provenance (the per-actor
+capability ledger) — and neither implies the other.
+
+Three further questions follow from taking that seriously, and the same
+discipline answers all three. *Which decisions did this memory
+contaminate?* — a decision record, bilaterally bound to the recall that
+fed it. *What did the poison actually DO?* — a counterfactual delta
+between two sealed worlds, exact because the ranking is exact. *What is
+the field's belief, as opposed to its contents?* — a claim, with its own
+chain, whose standing is derived from evidence and never stored.
 
 The adaptive-field mechanics (states, links, decay, rescue) are
 inherited from raven-memory and are not the contribution. The
@@ -45,8 +61,9 @@ decision, not a quiet patch.
   0.** `PRIMARY KEY (memory_id, seq)` plus
   `UNIQUE (memory_id, prev_hash)` make both duplication and forking a
   constraint violation, not a race outcome. The event vocabulary is
-  CLOSED (eight types); a verifier meeting an unknown type fails, it
-  does not shrug.
+  CLOSED and VERSIONED; a verifier meeting a word outside the
+  vocabulary of the protocol version a bundle DECLARES fails, it does
+  not shrug.
 
 - **M4 — Nothing is deleted.** QUARANTINED, TAINT_FLAGGED and
   SUPERSEDED are states that preserve evidence. No foreign key declares
@@ -54,6 +71,31 @@ decision, not a quiet patch.
   cascading destruction through the evidence. Rehabilitation is an
   audited event with a stated reason, never a row removal or column
   edit.
+
+- **A1–A8 — Authority is delegated, never invented.** Every mutation
+  names the grant it acted under (A1). Authority chains are per-actor,
+  append-only, genesis bound to actor_id (A2). A grantor may only grant
+  what it holds (A3), so every capability traces back by checkable
+  grants to one root act. Revocation is an event, never a deletion, and
+  acts authorized before it stay authorized (A4). A QUARANTINED actor
+  holds NO capability — a write barrier enforced in the same transaction
+  as the mutation, not a note in the margin (A5). And the last grant
+  conferring GRANT cannot be revoked, because a field nobody can ever
+  authorize anything in is indistinguishable from a successful attack
+  (A6). And widening the custody gate — the counterfactual's one
+  privilege — is itself an authorized read, because a gate with a
+  documented bypass is a gate with a bypass (A7, found by Round 3 in
+  this project's own new code).
+
+- **C1–C6 — A proposition is not a document.** A claim's statement is
+  immutable; revision is supersession (C1). Claim chains are per-claim
+  and genesis-bound (C2). A claim's STANDING is derived from evidence
+  and never stored (C3) — a persisted confidence is a number whose
+  derivation has been thrown away. Claim-to-claim relations are
+  bilateral (C4). A resolution must leave its constraint satisfied,
+  checked in the same transaction that writes it (C5). And re-opening a
+  settled question is an adjudication: binding an already-VALIDATED claim
+  into a new constraint costs ADJUDICATE, not ASSERT (C6).
 
 - **M5 — Floats never decide.** Confidence arithmetic, promotion
   thresholds and recall ranking are exact `Fraction`; `Decimal` at
@@ -98,7 +140,18 @@ requires nothing but the chain and the memory_id it claims to describe
 — and grafting one memory's internally-consistent history onto another
 fails at seq 0 by construction.
 
-### Event vocabulary (closed)
+### Event vocabulary (closed, and VERSIONED)
+
+Closing a vocabulary and then quietly widening it is the same lie in slow
+motion, so each `custody_protocol` version names exactly the words that
+existed under it. A bundle sealed under 1.0.0 is checked against 1.0.0's
+eight words; one that declares 1.0.0 while carrying a 1.1.0 event is
+refused rather than silently accepted by a newer verifier that happens to
+know the word.
+
+Every event at or after a field's authority genesis also carries
+`grant_id` — the authority proof, checked in B7 against the actor's own
+chain.
 
 | Event | Semantics | Payload contract |
 |---|---|---|
@@ -107,9 +160,10 @@ fails at seq 0 by construction.
 | `CONTRADICTED_BY` | conflict detected | `other_memory_id`, `topic` — written on BOTH chains |
 | `SUPERSEDED_BY` | newer memory replaces this | `successor_memory_id` — written together with the successor's STORED, one transaction |
 | `QUARANTINED` | direct action against this memory | — |
-| `TAINT_FLAGGED` | transitive: an actor in this chain was quarantined | `sweep_id` (ties evidence to its sweep, B5) |
+| `TAINT_FLAGGED` | transitive: an actor in this chain was quarantined | `sweep_id` (ties evidence to its sweep, B5, and under taint 2.0.0 the flagged set is re-derived from evidence rather than trusted to its own seal) |
 | `REHABILITATED` | audited reversal of TAINT_FLAGGED | `from_status` |
-| `STATE_CHANGED` | field-state transition | `from`, `to` (replayed, B4) |
+| `STATE_CHANGED` | field-state transition | `from`, `to` (replayed, B4; under replay 1.1.0 a promotion must also be arithmetically DUE) |
+| `DECISION_USED_MEMORY` (1.1.0) | a decision consumed this memory; changes no state | `decision_id`, `receipt_sha256`, `decision_sha256`, `policy_version` — bilateral with the decision record, B8 |
 
 Contradictions are recorded on *both* chains because a contradiction is
 a fact about both parties' history; recording it on one only would let
@@ -118,8 +172,8 @@ the other party's export hide it.
 ## Taint model
 
 **Definition of "touched"** (deliberately broad): a memory is tainted
-by actor X if any event in its custody chain names X — except
-`CONTRADICTED_BY`. Not only STORED — a poisoned source that REINFORCED
+by actor X if any event in its custody chain names X — except the
+NON_INFLUENCE_EVENTS, `CONTRADICTED_BY` and `DECISION_USED_MEMORY`. Not only STORED — a poisoned source that REINFORCED
 a legitimate memory inflated its confidence, and that inflation is
 part of the incident. The remedy for over-flagging is audited
 rehabilitation; there is no remedy for under-flagging.
@@ -136,11 +190,36 @@ raised its standing); being attacked by X is not influence by X. X's
 own contradicting memory is still flagged via its STORED event, and
 V's chain keeps the CONTRADICTED_BY evidence in plain sight.
 
+`DECISION_USED_MEMORY` joins the carve-out for the same reason, one
+level up: recording that a decision consumed a memory does not influence
+that memory. Without it, a quarantined agent's own decision records
+would taint everything they cite — a second version of the same lever
+the first carve-out already denies.
+
 **Determinism and sealing**: the flagged set is one SQL query with a
 total ORDER BY; the sweep row seals
 `sha256(canonical_json({"memory_ids": sorted_ids}))`, so "we flagged
 exactly these" is a checkable claim (B5), and two replays of the same
-database state produce byte-identical sweep evidence.
+database state produce byte-identical sweep evidence. Under taint 2.0.0
+B5 goes further and RE-DERIVES the flagged set from the custody events
+the bundle carries — because a sweep that over-flagged or under-flagged
+was internally consistent with its own seal, and passed every 1.x check.
+
+**Quarantine has two halves.** The retrospective sweep above, and the
+prospective write barrier: the quarantined actor's authority chain gains
+an `ACTOR_QUARANTINED` event, from which instant its effective
+capability set is empty (A5). Both land in one transaction. Flagging the
+past while the present stays open is not containment — Round 2's R2-01,
+confirmed by induction and closed here.
+
+**Graded exposure, never automatic.** `influence_exposure()` spends an
+exact rational budget outward from the tainted set: a RESONANT edge
+conveys 1/2, anything under the floor is dropped, the depth bound is
+derived from the floor. Termination is structural, cycles are harmless,
+INHIBITORY edges convey nothing. The result grades memories
+DIRECT_TAINT / INFLUENCE_EXPOSED / CLEAN — and INFLUENCE_EXPOSED is a
+finding, not a custody status. A system that quarantined on contact
+would have an incident response indistinguishable from the incident.
 
 **Precedence**: TAINT_FLAGGED applies only to CLEAN memories; stronger
 statuses (QUARANTINED, SUPERSEDED) are retained — but the event is
@@ -198,7 +277,22 @@ exact; promotion to REINFORCED occurs at confidence ≥ 3/4 exactly, with
 its own STATE_CHANGED event. Reinforcing a non-CLEAN memory is refused:
 it would launder taint into confidence.
 
-## Evidence bundles (B1–B6)
+## Protocol versions: the semantics a seal commits to
+
+A hash proves bytes did not change. It says nothing about what they
+MEAN, and that left exactly one lie available: change a rule tomorrow,
+and every bundle sealed today silently acquires it when a new verifier
+reads it. So the rule goes in the bundle. A `MNEME_BUNDLE_V2` body
+declares, by version, all seven semantics its checks depend on —
+custody, replay, ranking, taint, authority, receipt, claim — and a
+verifier meeting a version it does not implement REFUSES, naming it,
+instead of assuming.
+
+The table is a claim about implemented behaviour. A version stays
+supported only while the code to check it is actually present; an entry
+without that code is the one lie the mechanism exists to prevent.
+
+## Evidence bundles (B0–B9)
 
 One canonical JSON file: memories (content + declared final state +
 full chains), sweeps — partitioned into `sweeps` (flagged evidence
@@ -219,6 +313,32 @@ with one root, an ambiguity we refuse), and a bundle seal.
 
 The normative replay state machine is stated once, in
 `mneme/bundle.py`'s header; `verify_offline.py` transcribes it.
+
+### B7–B9, added in Phase 1.5
+
+**B7 — authority provenance.** Every authority chain verifies and
+replays; the declared actor status reproduces from it; exactly one
+self-issued root grant confers the whole vocabulary; no-amplification is
+re-derived offline (every authority event's issuer held, at that
+instant, the capability it required and every capability it conferred);
+and every custody event at or after the declared authority genesis names
+a grant that was live for its actor and conferred the right capability.
+Events before the genesis — and every event in a ledgerless field — are
+UNAUTHORIZED BY DECLARATION: counted, named on a passing verdict, never
+passed as authorized.
+
+**B8 — causal provenance.** Receipts recompute from their own columns
+under the bundle's declared ranking semantics. Every decision re-derives
+its seal, cites a non-counterfactual receipt carried here, and claims
+only memories that recall actually SERVED. Included decisions are
+bilateral — each used memory's chain names the decision back — and
+excluded ones must be genuinely partial.
+
+**B9 — epistemic provenance.** Claim chains verify and replay, declared
+states reproduce, statements hash to what their assertions sealed,
+relations are bilateral, set membership is re-derived from the member
+chains, and a declared constraint status is recomputed from the carried
+claims and must agree.
 
 ## The two-verifier decision
 
@@ -243,6 +363,29 @@ than intent (the original partial-bundle B5 failure), it was examined,
 judged correct, promoted to documented behaviour — and later replaced
 by design (the `excluded_sweeps` declaration), the full arc a
 limitation is supposed to travel.
+
+## Semantic mutation testing
+
+Line coverage says which code ran; operator mutation says which
+arithmetic a test would notice. Neither asks the question this system
+lives on: if someone reimplemented MNEME and got a RULE wrong, would the
+evidence still verify?
+
+`tests/test_semantic_mutants.py` patches the semantics, lets the patched
+code produce real evidence, and asks whether anything refuses it. A
+survivor is acceptable only when declared with the boundary it
+demonstrates; an undeclared survivor fails the suite. The two declared
+survivors are the embedding boundary and a coherently fabricated field —
+both of which were prose in KNOWN_LIMITATIONS and are now executable.
+
+Writing it produced `replay_protocol` 1.1.0 and `taint_protocol` 2.0.0.
+That is the argument for keeping it.
+
+And it found neither of Round 3's two confirmed vulnerabilities, which is
+the argument for not mistaking it for an audit. The same author wrote the
+mutants and the defenses; a mutation score is a floor on what a suite
+would notice, never a ceiling on what is there. Both findings are mutants
+now, kept as markers of the blind spot.
 
 ## Phase 2 sketch (not designed, only reserved)
 

@@ -1,0 +1,441 @@
+{
+  "conformance_format": "MNEME_CONFORMANCE_V1",
+  "protocols": {
+    "custody_protocol": "1.1.0",
+    "replay_protocol": "1.1.0",
+    "ranking_protocol": "1.0.0",
+    "taint_protocol": "2.0.0",
+    "authority_protocol": "1.3.0",
+    "receipt_protocol": "2.0.0",
+    "claim_protocol": "1.1.0"
+  },
+  "spec": "SPEC.md",
+  "operations": [
+    {
+      "op": "bootstrap_root",
+      "args": {
+        "actor_id": "root",
+        "display_name": "Root",
+        "kind": "HUMAN",
+        "reason": "field genesis",
+        "root_grant_id": "grant-0000",
+        "at": "2026-01-01T00:00:01.000000+00:00"
+      }
+    },
+    {
+      "op": "register_actor",
+      "args": {
+        "actor_id": "scribe",
+        "display_name": "scribe",
+        "kind": "HUMAN",
+        "issuer_id": "root",
+        "reason": "staffing",
+        "at": "2026-01-01T00:00:02.000000+00:00"
+      }
+    },
+    {
+      "op": "grant",
+      "args": {
+        "subject_id": "scribe",
+        "capabilities": [
+          "STORE",
+          "REINFORCE",
+          "SUPERSEDE",
+          "ASSERT",
+          "DECIDE"
+        ],
+        "issuer_id": "root",
+        "reason": "duty",
+        "grant_id": "grant-0001",
+        "at": "2026-01-01T00:00:03.000000+00:00"
+      }
+    },
+    {
+      "op": "register_actor",
+      "args": {
+        "actor_id": "judge",
+        "display_name": "judge",
+        "kind": "HUMAN",
+        "issuer_id": "root",
+        "reason": "staffing",
+        "at": "2026-01-01T00:00:04.000000+00:00"
+      }
+    },
+    {
+      "op": "grant",
+      "args": {
+        "subject_id": "judge",
+        "capabilities": [
+          "ADJUDICATE",
+          "QUARANTINE_MEMORY",
+          "COUNTERFACTUAL"
+        ],
+        "issuer_id": "root",
+        "reason": "duty",
+        "grant_id": "grant-0002",
+        "at": "2026-01-01T00:00:05.000000+00:00"
+      }
+    },
+    {
+      "op": "store",
+      "args": {
+        "memory_id": "m-1",
+        "content": "the gate is required",
+        "embedding": [
+          "1.0000000000",
+          "0.0000000000"
+        ],
+        "embedding_model": "acme/embed-3",
+        "provenance": {
+          "provider": "acme",
+          "model": "embed-3",
+          "revision": "2026-01-01",
+          "model_input": "the gate is required"
+        },
+        "actor_id": "scribe",
+        "reason": "runbook",
+        "topic": "policy",
+        "claim": "required",
+        "at": "2026-01-01T00:00:06.000000+00:00"
+      }
+    },
+    {
+      "op": "store",
+      "args": {
+        "memory_id": "m-2",
+        "content": "the gate is optional",
+        "embedding": [
+          "0.9000000000",
+          "0.1000000000"
+        ],
+        "embedding_model": "acme/embed-3",
+        "actor_id": "scribe",
+        "reason": "feed",
+        "topic": "policy",
+        "claim": "optional",
+        "at": "2026-01-01T00:00:07.000000+00:00"
+      }
+    },
+    {
+      "op": "reinforce",
+      "args": {
+        "memory_id": "m-1",
+        "actor_id": "scribe",
+        "reason": "corroborated",
+        "at": "2026-01-01T00:00:08.000000+00:00"
+      }
+    },
+    {
+      "op": "reinforce",
+      "args": {
+        "memory_id": "m-1",
+        "actor_id": "scribe",
+        "reason": "corroborated",
+        "at": "2026-01-01T00:00:09.000000+00:00"
+      }
+    },
+    {
+      "op": "reinforce",
+      "args": {
+        "memory_id": "m-1",
+        "actor_id": "scribe",
+        "reason": "corroborated",
+        "at": "2026-01-01T00:00:10.000000+00:00"
+      }
+    },
+    {
+      "op": "supersede",
+      "args": {
+        "old_memory_id": "m-2",
+        "memory_id": "m-3",
+        "content": "the gate is optional for hotfixes",
+        "embedding": [
+          "0.8500000000",
+          "0.1500000000"
+        ],
+        "embedding_model": "acme/embed-3",
+        "actor_id": "scribe",
+        "reason": "narrowed",
+        "at": "2026-01-01T00:00:11.000000+00:00"
+      }
+    },
+    {
+      "op": "quarantine_memory",
+      "args": {
+        "memory_id": "m-3",
+        "actor_id": "judge",
+        "reason": "poisoned feed",
+        "at": "2026-01-01T00:00:12.000000+00:00"
+      }
+    },
+    {
+      "op": "commit",
+      "args": {}
+    },
+    {
+      "op": "recall",
+      "args": {
+        "query": [
+          "1.0000000000",
+          "0.0000000000"
+        ],
+        "top_k": 3
+      }
+    },
+    {
+      "op": "persist_receipt",
+      "args": {
+        "at": "2026-01-01T00:00:13.000000+00:00"
+      }
+    },
+    {
+      "op": "record_decision",
+      "args": {
+        "used_memory_ids": [
+          "m-1"
+        ],
+        "decision_artifact": "ship it",
+        "policy_version": "deploy@1",
+        "actor_id": "scribe",
+        "reason": "answered",
+        "decision_id": "decision-0001",
+        "at": "2026-01-01T00:00:14.000000+00:00"
+      }
+    },
+    {
+      "op": "assert_claim",
+      "args": {
+        "statement": "The gate is required.",
+        "actor_id": "scribe",
+        "reason": "from the runbook",
+        "topic": "policy",
+        "claim_id": "claim-0001",
+        "at": "2026-01-01T00:00:15.000000+00:00"
+      }
+    },
+    {
+      "op": "assert_claim",
+      "args": {
+        "statement": "The gate is optional.",
+        "actor_id": "scribe",
+        "reason": "from the feed",
+        "topic": "policy",
+        "claim_id": "claim-0002",
+        "at": "2026-01-01T00:00:16.000000+00:00"
+      }
+    },
+    {
+      "op": "link_evidence",
+      "args": {
+        "claim_id": "claim-0001",
+        "memory_id": "m-1",
+        "stance": "SUPPORTS",
+        "actor_id": "scribe",
+        "reason": "states it",
+        "at": "2026-01-01T00:00:17.000000+00:00"
+      }
+    },
+    {
+      "op": "relate_claims",
+      "args": {
+        "from_claim": "claim-0001",
+        "to_claim": "claim-0002",
+        "relation": "CONTRADICTS",
+        "actor_id": "scribe",
+        "reason": "one policy",
+        "at": "2026-01-01T00:00:18.000000+00:00"
+      }
+    },
+    {
+      "op": "declare_set",
+      "args": {
+        "members": [
+          "claim-0001",
+          "claim-0002"
+        ],
+        "constraint_type": "EXACTLY_ONE",
+        "actor_id": "scribe",
+        "reason": "one policy",
+        "set_id": "claimset-0001",
+        "at": "2026-01-01T00:00:19.000000+00:00"
+      }
+    },
+    {
+      "op": "resolve_set",
+      "args": {
+        "set_id": "claimset-0001",
+        "validate": [
+          "claim-0001"
+        ],
+        "refute": [
+          "claim-0002"
+        ],
+        "actor_id": "judge",
+        "reason": "runbook wins",
+        "at": "2026-01-01T00:00:20.000000+00:00"
+      }
+    },
+    {
+      "op": "commit",
+      "args": {}
+    }
+  ],
+  "vectors": [
+    {
+      "name": "genesis.custody.m-1",
+      "value": "c92384af132847121bdda4dfd4723e93d8b46e98f7562f4be703eb5ffab893b9",
+      "requires": [
+        "custody_protocol"
+      ]
+    },
+    {
+      "name": "genesis.authority.root",
+      "value": "92c99f0abd4f57f2f88735690404b417510975f1501e82109264fc2b53ebc7e4",
+      "requires": [
+        "authority_protocol"
+      ]
+    },
+    {
+      "name": "genesis.claim.claim-0001",
+      "value": "b816f2c50bb2dd33beea71ce5c868a28cf99c94f55f7983edc3786e0c52e3d2a",
+      "requires": [
+        "claim_protocol"
+      ]
+    },
+    {
+      "name": "head.custody.m-1",
+      "value": "47f0d58dfcdf0bef7e098ebac431597035db68869f9abe725346fbabb5d67603",
+      "requires": [
+        "custody_protocol"
+      ]
+    },
+    {
+      "name": "head.custody.m-2",
+      "value": "2077a1077be5218e7c9cf3c174718c7a73a558a22a6d1b08e9fa01fc3c74df93",
+      "requires": [
+        "custody_protocol"
+      ]
+    },
+    {
+      "name": "head.custody.m-3",
+      "value": "948a6eb53c0448e1447bc6a37e28be11e57216c95eb7d8efe0b010250d867356",
+      "requires": [
+        "custody_protocol"
+      ]
+    },
+    {
+      "name": "head.authority.root",
+      "value": "6379199e74746bbcbad3fcc485d573d6951bde83abb8635215b4d338edcfd06b",
+      "requires": [
+        "authority_protocol"
+      ]
+    },
+    {
+      "name": "head.authority.scribe",
+      "value": "8175d85c08c5c08f7117cfb514c1dfdc45b0ccfe3d9e8de2f294f4041601ed94",
+      "requires": [
+        "authority_protocol"
+      ]
+    },
+    {
+      "name": "head.authority.judge",
+      "value": "81627c15dabd4867ce102eea3ab11c72ff53eecd660c7b90565718c0658d174b",
+      "requires": [
+        "authority_protocol"
+      ]
+    },
+    {
+      "name": "head.claim.claim-0001",
+      "value": "73aec007edde2ddac29e355d8b32a6be30638dfe85559dd1f872439a307f960f",
+      "requires": [
+        "claim_protocol"
+      ]
+    },
+    {
+      "name": "head.claim.claim-0002",
+      "value": "a609a8e49512c30278648b8a61aa317978dd957b172c2899375eaba7416a8854",
+      "requires": [
+        "claim_protocol"
+      ]
+    },
+    {
+      "name": "seal.receipt",
+      "value": "32a31b259d122859b16e58e5119266e2f9606def384bfaab8cf271df8497a005",
+      "requires": [
+        "ranking_protocol",
+        "receipt_protocol"
+      ]
+    },
+    {
+      "name": "seal.decision",
+      "value": "56b2fad458c100edb7db61db7f94cce8f5f161c7f013931eb0e2fa38e9ded295",
+      "requires": [
+        "receipt_protocol"
+      ]
+    },
+    {
+      "name": "seal.impact.m-1",
+      "value": "e8d61d22c7617f05405ebf4142b20d24a19bee81ef52860e2eae9ee77024ba7e",
+      "requires": [
+        "receipt_protocol",
+        "custody_protocol"
+      ]
+    },
+    {
+      "name": "seal.exposure.m-3",
+      "value": "c96e1191115f203f2a19540eb31dea6fdec0198bf7007c4db76face075b4766e",
+      "requires": [
+        "taint_protocol"
+      ]
+    },
+    {
+      "name": "seal.standing.claim-0001",
+      "value": "2290c8f93dbea113af95e1ad0eef1c5538f5bfa5b1182d7120e7cd53ed8dba57",
+      "requires": [
+        "claim_protocol"
+      ]
+    },
+    {
+      "name": "seal.counterfactual.exclude-m-1",
+      "value": "33fdd37852bf5fc7333b6130a9f1a159b24fce176ca5c7541070cd201ea7c935",
+      "requires": [
+        "ranking_protocol",
+        "receipt_protocol"
+      ]
+    },
+    {
+      "name": "root.heads_merkle",
+      "value": "fb796f3d0f915aaa3600007fa685727b1fff362f92575d4606dfece5709e29fe",
+      "requires": [
+        "custody_protocol"
+      ]
+    },
+    {
+      "name": "root.authority_merkle",
+      "value": "be31d7bf1b94b7ade6970e2c370cb9b69b21b4b42ac56ad930c0df42f3c0b4dd",
+      "requires": [
+        "authority_protocol"
+      ]
+    },
+    {
+      "name": "seal.bundle_body",
+      "value": "c0e82fccb033ece49e6a33f733f6d29dd9aa9e5dd2e4eefcb1b749e8945314f6",
+      "requires": [
+        "custody_protocol",
+        "replay_protocol",
+        "ranking_protocol",
+        "taint_protocol",
+        "authority_protocol",
+        "receipt_protocol",
+        "claim_protocol"
+      ],
+      "note": "the export's created_at is removed before sealing: it is the one wall-clock field, and a vector over it would test the clock"
+    },
+    {
+      "name": "table.protocols",
+      "value": "7606951289558d3c9e6e0fa34293fe5d01fd51dfb4279084b5385e6048e0c5e9",
+      "requires": [],
+      "note": "a change to any declared version changes this digest"
+    }
+  ]
+}

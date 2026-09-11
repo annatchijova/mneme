@@ -60,7 +60,8 @@ from mcp.server.fastmcp import FastMCP
 # Ensure the package resolves regardless of the invoking CWD
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from mneme import custody, field, trust, bundle
+from mneme import (authority, bundle, causality, claims, counterfactual,
+                   custody, field, protocol, trust)
 from mneme.canonical import canonical_json, quantize, CANONICAL_SCALE
 
 log = logging.getLogger("mneme.mcp")
@@ -141,20 +142,371 @@ def _deterministic_embedding(text: str) -> list[Decimal]:
 # -- Ensure default actor exists ---------------------------------------------
 
 def _ensure_actor(conn, actor_id: str, kind: str = "AGENT"):
-    """Register actor if not already known."""
+    """
+    Register an actor if not already known — ONLY in a field with no
+    authority ledger.
+
+    Security audit Round 2, R2-02: this function auto-registering an
+    unknown caller as an AGENT, on the same call the caller then used to
+    spend authority, was the confused-deputy root. Once a field has an
+    authority ledger, minting an identity is itself an authorized act
+    (it requires GRANT), so this function refuses and the caller is told
+    to use mneme_register_actor with an issuer that actually holds the
+    capability.
+
+    In a ledgerless field the legacy behaviour is kept, deliberately and
+    visibly: those fields declare every event UNAUTHORIZED BY DECLARATION
+    in their bundles, so nothing here is quietly presented as authorized.
+    """
     cur = conn.cursor()
     cur.execute("SELECT 1 FROM actors WHERE actor_id = ?", (actor_id,))
-    if cur.fetchone() is None:
-        ts = custody.now_ts()
-        cur.execute(
-            "INSERT INTO actors (actor_id, display_name, kind, status, created_at) "
-            "VALUES (?, ?, ?, 'ACTIVE', ?)",
-            (actor_id, actor_id, kind, ts),
+    if cur.fetchone() is not None:
+        return
+    if authority.ledger_exists(cur):
+        raise ValueError(
+            f"Unknown actor {actor_id!r}. This field has an authority ledger, "
+            "so identities are registered by an actor holding GRANT "
+            "(mneme_register_actor) and empowered by an explicit grant "
+            "(mneme_grant). Minting an identity on the same call that spends "
+            "it is the pattern Round 2 confirmed."
         )
+    ts = custody.now_ts()
+    cur.execute(
+        "INSERT INTO actors (actor_id, display_name, kind, status, created_at) "
+        "VALUES (?, ?, ?, 'ACTIVE', ?)",
+        (actor_id, actor_id, kind, ts),
+    )
+    conn.commit()
+
+
+# -- MCP tools: authority ----------------------------------------------------
+
+@mcp.tool()
+def mneme_bootstrap_root(
+    actor_id: str,
+    display_name: str = "",
+    kind: str = "HUMAN",
+    reason: str = "field genesis",
+) -> dict:
+    """
+    Create this field's authority ledger and its root actor. ONE TIME.
+
+    Authority has to start somewhere and the first grant cannot itself be
+    authorized. This is that act: refused if any authority chain already
+    exists, so it happens exactly once per field and the entire ledger
+    hangs from it as a single named, timestamped, hash-chained event.
+
+    Until you call this, the field is in the LEDGERLESS regime: writes
+    proceed and every evidence bundle it produces says, in words, that all
+    of its events are UNAUTHORIZED BY DECLARATION. After you call it, every
+    mutator requires a grant, permanently — nothing deletes a chain.
+
+    What this does NOT prove: that the right party performed it. Whoever
+    bootstraps an empty field is its root. Binding that to an external
+    identity is a deployment concern.
+
+    Args:
+        actor_id: The root identity.
+        display_name: Human-readable name (defaults to actor_id).
+        kind: AGENT, PIPELINE, HUMAN or SYSTEM.
+        reason: Why (mandatory — least of all skippable here).
+
+    Returns:
+        The root grant id and the full capability vocabulary it confers.
+    """
+    actor_id = _sanitize_id(actor_id, "actor_id")
+    if not reason.strip():
+        return {"error": "reason must be non-empty."}
+    conn = _get_conn()
+    cur = conn.cursor()
+    try:
+        grant_id = authority.bootstrap_root(
+            cur, actor_id=actor_id, display_name=display_name or actor_id,
+            kind=kind, reason=_trunc(reason, 512))
         conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        conn.close()
+        return {"error": str(exc)}
+    conn.close()
+    return {"root_actor": actor_id, "grant_id": grant_id,
+            "capabilities": sorted(authority.CAPABILITIES)}
 
 
-# -- MCP tools ---------------------------------------------------------------
+@mcp.tool()
+def mneme_register_actor(
+    actor_id: str,
+    issuer_id: str,
+    kind: str = "AGENT",
+    display_name: str = "",
+    reason: str = "registered via MCP",
+) -> dict:
+    """
+    Register an identity. It holds NOTHING until mneme_grant empowers it.
+
+    Requires the issuer to hold GRANT: minting identities is the first
+    half of minting power, so it is held to the same bar as the second.
+
+    Args:
+        actor_id: The identity to create.
+        issuer_id: Who is registering it — must hold GRANT.
+        kind: AGENT, PIPELINE, HUMAN or SYSTEM.
+        display_name: Human-readable name (defaults to actor_id).
+        reason: Why (mandatory).
+
+    Returns:
+        Confirmation, and the (empty) capability set the new identity holds.
+    """
+    actor_id = _sanitize_id(actor_id, "actor_id")
+    issuer_id = _sanitize_id(issuer_id, "issuer_id")
+    if not reason.strip():
+        return {"error": "reason must be non-empty."}
+    conn = _get_conn()
+    cur = conn.cursor()
+    try:
+        authority.register_actor(
+            cur, actor_id=actor_id, display_name=display_name or actor_id,
+            kind=kind, issuer_id=issuer_id, reason=_trunc(reason, 512))
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        conn.close()
+        return {"error": str(exc)}
+    conn.close()
+    return {"actor_id": actor_id, "registered_by": issuer_id,
+            "capabilities": []}
+
+
+@mcp.tool()
+def mneme_grant(
+    subject_id: str,
+    capabilities: str,
+    issuer_id: str,
+    reason: str = "granted via MCP",
+) -> dict:
+    """
+    Confer capabilities on an actor, as a hash-chained, revocable grant.
+
+    Capability vocabulary (closed): STORE, REINFORCE, SUPERSEDE,
+    QUARANTINE_ACTOR, QUARANTINE_MEMORY, REHABILITATE, GRANT, REVOKE,
+    DECIDE.
+
+    NO AMPLIFICATION (Invariant A3): the issuer must itself hold every
+    capability it confers. Authority is delegated, never invented — which
+    is what makes every capability in the field traceable, by a path of
+    checkable grants, back to the root bootstrap.
+
+    Args:
+        subject_id: Who receives the capabilities.
+        capabilities: Comma-separated capability names.
+        issuer_id: Who is granting — must hold GRANT and every capability listed.
+        reason: Why (mandatory — an unreasoned grant is one nobody can review).
+
+    Returns:
+        The grant id, which every custody event written under it will name.
+    """
+    subject_id = _sanitize_id(subject_id, "subject_id")
+    issuer_id = _sanitize_id(issuer_id, "issuer_id")
+    caps = [c.strip().upper() for c in capabilities.split(",") if c.strip()]
+    if not caps:
+        return {"error": "capabilities must name at least one capability."}
+    if not reason.strip():
+        return {"error": "reason must be non-empty."}
+    conn = _get_conn()
+    cur = conn.cursor()
+    try:
+        gid = authority.grant(cur, subject_id=subject_id, capabilities=caps,
+                              issuer_id=issuer_id, reason=_trunc(reason, 512))
+        conn.commit()
+        effective = sorted(authority.effective_capabilities(cur, subject_id))
+    except Exception as exc:
+        conn.rollback()
+        conn.close()
+        return {"error": str(exc)}
+    conn.close()
+    return {"grant_id": gid, "subject_id": subject_id,
+            "granted": sorted(set(caps)), "effective_capabilities": effective}
+
+
+@mcp.tool()
+def mneme_revoke(
+    subject_id: str,
+    grant_id: str,
+    issuer_id: str,
+    reason: str = "revoked via MCP",
+) -> dict:
+    """
+    End a grant. The grant stays on the chain forever with the instant it
+    died (Invariant A4), so every act it authorized BEFORE that instant
+    stays authorized and every bundle sealed then keeps verifying.
+
+    Refused if it would revoke the last grant conferring GRANT (A6): a
+    field nobody can ever authorize anything in again — including its own
+    repair — is indistinguishable from a successful attack.
+
+    Args:
+        subject_id: Whose grant is being ended.
+        grant_id: Which grant.
+        issuer_id: Who is revoking — must hold REVOKE.
+        reason: Why (mandatory).
+
+    Returns:
+        The subject's remaining effective capabilities.
+    """
+    subject_id = _sanitize_id(subject_id, "subject_id")
+    issuer_id = _sanitize_id(issuer_id, "issuer_id")
+    grant_id = _sanitize_id(grant_id, "grant_id")
+    if not reason.strip():
+        return {"error": "reason must be non-empty."}
+    conn = _get_conn()
+    cur = conn.cursor()
+    try:
+        authority.revoke(cur, subject_id=subject_id, grant_id=grant_id,
+                         issuer_id=issuer_id, reason=_trunc(reason, 512))
+        conn.commit()
+        effective = sorted(authority.effective_capabilities(cur, subject_id))
+    except Exception as exc:
+        conn.rollback()
+        conn.close()
+        return {"error": str(exc)}
+    conn.close()
+    return {"subject_id": subject_id, "revoked_grant": grant_id,
+            "effective_capabilities": effective}
+
+
+@mcp.tool()
+def mneme_reinstate_actor(
+    subject_id: str,
+    issuer_id: str,
+    reason: str = "investigation cleared the actor",
+) -> dict:
+    """
+    Close a quarantine interval: the actor may write again.
+
+    Requires QUARANTINE_ACTOR — the capability to contain is the
+    capability to release. Self-reinstatement is refused: an actor under
+    investigation is not its own reviewer.
+
+    The memories the sweep flagged STAY flagged. Reinstating the actor and
+    rehabilitating its memories are separate claims with separate
+    evidence; conflating them would let one call quietly reverse a whole
+    sweep.
+
+    Args:
+        subject_id: The quarantined actor.
+        issuer_id: Who is reinstating — must hold QUARANTINE_ACTOR.
+        reason: Why (mandatory).
+
+    Returns:
+        The actor's restored capabilities.
+    """
+    subject_id = _sanitize_id(subject_id, "subject_id")
+    issuer_id = _sanitize_id(issuer_id, "issuer_id")
+    if not reason.strip():
+        return {"error": "reason must be non-empty."}
+    conn = _get_conn()
+    cur = conn.cursor()
+    try:
+        authority.reinstate_actor(cur, subject_id=subject_id,
+                                  issuer_id=issuer_id,
+                                  reason=_trunc(reason, 512))
+        conn.commit()
+        effective = sorted(authority.effective_capabilities(cur, subject_id))
+    except Exception as exc:
+        conn.rollback()
+        conn.close()
+        return {"error": str(exc)}
+    conn.close()
+    return {"subject_id": subject_id, "status": "ACTIVE",
+            "effective_capabilities": effective}
+
+
+@mcp.tool()
+def mneme_authority(actor_id: str = "") -> dict:
+    """
+    Inspect authority provenance: who may cause what, and on whose word.
+
+    With no actor_id, describes the whole ledger. With one, returns that
+    actor's full authority chain — every grant, every revocation, every
+    quarantine interval — plus its effective capabilities right now.
+
+    This is the authority half of mneme_custody_chain. Custody answers
+    "what happened to this memory"; this answers "who was allowed to
+    cause it".
+
+    Args:
+        actor_id: Optional — one actor's chain instead of the summary.
+
+    Returns:
+        The ledger summary, or one actor's chain and effective capabilities.
+    """
+    conn = _get_conn()
+    cur = conn.cursor()
+    try:
+        if not authority.ledger_exists(cur):
+            conn.close()
+            return {
+                "ledger": False,
+                "note": ("This field has NO authority ledger. Writes proceed "
+                         "and every bundle it exports declares its events "
+                         "UNAUTHORIZED BY DECLARATION. Call "
+                         "mneme_bootstrap_root to start one."),
+            }
+        if not actor_id:
+            cur.execute("SELECT DISTINCT subject_id FROM authority_chain "
+                        "ORDER BY subject_id ASC")
+            subjects = [r[0] for r in cur.fetchall()]
+            summary = []
+            for sid in subjects:
+                state = authority.load_state(cur, sid)
+                summary.append({
+                    "actor_id": sid,
+                    "status": state.status,
+                    "is_root": state.is_root,
+                    "effective_capabilities": sorted(
+                        authority.capabilities_at(state, custody.now_ts())),
+                    "grants": len(state.grants),
+                })
+            result = {
+                "ledger": True,
+                "root_actor": authority.root_subject(cur),
+                "genesis_at": authority.genesis_at(cur),
+                "capability_vocabulary": sorted(authority.CAPABILITIES),
+                "actors": summary,
+            }
+        else:
+            actor_id = _sanitize_id(actor_id, "actor_id")
+            rows = authority.load_authority_rows(cur, actor_id)
+            if not rows:
+                conn.close()
+                return {"error": f"{actor_id} has no authority chain."}
+            state = authority.load_state(cur, actor_id)
+            result = {
+                "ledger": True,
+                "actor_id": actor_id,
+                "status": state.status,
+                "is_root": state.is_root,
+                "registered_at": state.registered_at,
+                "registered_by": state.registered_by,
+                "effective_capabilities": sorted(
+                    authority.capabilities_at(state, custody.now_ts())),
+                "grants": {gid: {"capabilities": list(g["capabilities"]),
+                                 "granted_at": g["granted_at"],
+                                 "granted_by": g["granted_by"],
+                                 "revoked_at": g["revoked_at"],
+                                 "root": g["root"]}
+                           for gid, g in sorted(state.grants.items())},
+                "quarantine_intervals": state.quarantine_intervals,
+                "chain": rows,
+            }
+    except Exception as exc:
+        conn.close()
+        return {"error": str(exc)}
+    conn.close()
+    return result
+
+
+# -- MCP tools: memory -------------------------------------------------------
 
 @mcp.tool()
 def mneme_store(
@@ -204,7 +556,11 @@ def mneme_store(
     embedding = _deterministic_embedding(content)
 
     conn = _get_conn()
-    _ensure_actor(conn, actor_id)
+    try:
+        _ensure_actor(conn, actor_id)
+    except ValueError as exc:
+        conn.close()
+        return {"error": str(exc)}
     cur = conn.cursor()
     try:
         result = field.store(
@@ -239,6 +595,8 @@ def mneme_recall(
     query: str,
     top_k: int = 5,
     hops: int = 2,
+    persist_receipt: bool = False,
+    as_of: str = "",
 ) -> dict:
     """
     Custody-gated, exactly-ranked recall.
@@ -257,6 +615,20 @@ def mneme_recall(
         query: Text to search for (embedded deterministically).
         top_k: Maximum results (1-20).
         hops: BFS expansion depth (0=seed only, 2=default).
+        as_of: Optional canonical UTC instant
+            ("2026-03-01T12:30:00.000000+00:00"). Reconstructs the field
+            as it logically WAS then, from custody chains alone, without
+            looking at anything later: memories not yet born are absent
+            (not "withheld"), statuses are replayed rather than read from
+            today's columns, and links created afterwards are not
+            traversed. The forensic question this answers is "with what
+            the agent legitimately had at that instant, what would it
+            have retrieved?" — not "why does this look absurd today?".
+        persist_receipt: Keep the receipt as evidence. Recall stays
+            read-only by default — serving is not a state transition, and
+            forcing a write into the hottest read path would invert that.
+            Set this when the recall is about to inform a decision:
+            mneme_record_decision can only cite a receipt the field kept.
 
     Returns:
         Ranked results with scores, receipt digest, and exclusion counts.
@@ -278,8 +650,13 @@ def mneme_recall(
             query_embedding=query_embedding,
             top_k=top_k,
             hops=hops,
+            as_of=as_of.strip() or None,
         )
+        if persist_receipt:
+            field.persist_receipt(cur, receipt)
+            conn.commit()
     except Exception as exc:
+        conn.rollback()
         conn.close()
         return {"error": str(exc)}
     conn.close()
@@ -304,6 +681,11 @@ def mneme_recall(
             "excluded_custody": receipt.excluded_custody,
             "excluded_forgotten": receipt.excluded_forgotten,
             "excluded_inhibited": receipt.excluded_inhibited,
+            "top_k": receipt.top_k,
+            "hops": receipt.hops,
+            "ranking_protocol": receipt.ranking_protocol,
+            "as_of": receipt.as_of,
+            "persisted": bool(persist_receipt),
         },
         "embedding_model": "deterministic-sha256-v1",
         "is_semantic": False,
@@ -336,7 +718,11 @@ def mneme_reinforce(
     actor_id = _sanitize_id(actor_id, "actor_id")
 
     conn = _get_conn()
-    _ensure_actor(conn, actor_id)
+    try:
+        _ensure_actor(conn, actor_id)
+    except ValueError as exc:
+        conn.close()
+        return {"error": str(exc)}
     cur = conn.cursor()
     try:
         conf, state = field.reinforce(
@@ -479,6 +865,677 @@ def mneme_rehabilitate(
 
 
 @mcp.tool()
+def mneme_record_decision(
+    receipt_sha256: str,
+    used_memory_ids: str,
+    decision_text: str,
+    policy_version: str,
+    actor_id: str,
+    reason: str = "decision recorded via MCP",
+) -> dict:
+    """
+    Close the loop from recall to action: commit that THIS decision used
+    THESE memories, from THAT recall, under THIS policy. Requires DECIDE.
+
+    Without this, MNEME can answer "why did the agent remember X" and
+    cannot answer the question an incident actually asks: "which
+    decisions were causally contaminated by X". A receipt is evidence
+    about a read; a decision record is evidence about an act.
+
+    The decision's TEXT never leaves your process in a form MNEME stores:
+    the field commits to sha256(decision_text) so the decision becomes a
+    fixed object that cannot be quietly rewritten later, while its
+    content stays yours.
+
+    The cited receipt must already be persisted (mneme_recall with
+    persist_receipt=true), and used_memory_ids must be a subset of what
+    that recall actually served — a decision cannot claim a memory the
+    recall never handed it.
+
+    Args:
+        receipt_sha256: The persisted recall receipt this decision consumed.
+        used_memory_ids: Comma-separated ids the decision actually used.
+        decision_text: The decision artifact. Hashed, never stored.
+        policy_version: Which rules produced it (e.g. "deploy-policy@3").
+        actor_id: Who decided — must hold DECIDE.
+        reason: Why (mandatory).
+
+    Returns:
+        The decision id and its sealed record digest.
+    """
+    actor_id = _sanitize_id(actor_id, "actor_id")
+    used = [_sanitize_id(m.strip(), "memory_id")
+            for m in used_memory_ids.split(",") if m.strip()]
+    if not used:
+        return {"error": "used_memory_ids must name at least one memory."}
+    if not decision_text.strip():
+        return {"error": "decision_text must be non-empty."}
+    if not reason.strip():
+        return {"error": "reason must be non-empty."}
+    conn = _get_conn()
+    cur = conn.cursor()
+    try:
+        rec = causality.record_decision(
+            cur, receipt=receipt_sha256.strip(), used_memory_ids=used,
+            decision_sha256=causality.decision_hash(_trunc(decision_text)),
+            policy_version=_trunc(policy_version, 128), actor_id=actor_id,
+            reason=_trunc(reason, 512))
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        conn.close()
+        return {"error": str(exc)}
+    conn.close()
+    return {
+        "decision_id": rec.decision_id,
+        "receipt_sha256": rec.receipt_sha256,
+        "decision_sha256": rec.decision_sha256,
+        "policy_version": rec.policy_version,
+        "used_memory_ids": list(rec.used_memory_ids),
+        "record_sha256": rec.record_sha256,
+    }
+
+
+@mcp.tool()
+def mneme_impact(memory_id: str) -> dict:
+    """
+    Blast radius: everything that depended on one memory, reconstructed
+    from evidence and GRADED — because equating contact with
+    contamination is how one quarantine becomes a denial of service on
+    your own field.
+
+    Three levels, and the distinction is the whole point:
+
+      DIRECT    rows, not inference: persisted recalls that served this
+                memory, and decisions that used it.
+      DERIVED   could not be what it is without it: supersession
+                successors, and memories the agent itself declared it
+                wrote because of a contaminated decision. Descent is
+                SELF-ASSERTED and cannot be bilateral — the decision was
+                written before the derived memory existed and cannot name
+                it back — so the level is GRADED: DERIVED when the
+                declaring actor is the cited decision's own actor, and
+                DERIVED_UNATTESTED when a third party claims descent from
+                someone else's decision. The second is strictly weaker
+                and says so rather than sitting in the strong bucket.
+      POSSIBLE  contact only: memories co-served in the same recall, and
+                RESONANT neighbours. Reported so an analyst sees the
+                perimeter; never acted on, never a custody status.
+
+    This measures and does not contain. Quarantining what it finds is a
+    separate, authorized, audited act — a function that both measured and
+    contained would make its own measurement impossible to trust.
+
+    Args:
+        memory_id: The memory to trace.
+
+    Returns:
+        The graded causal DAG and its reproducible seal.
+    """
+    memory_id = _sanitize_id(memory_id, "memory_id")
+    conn = _get_conn()
+    cur = conn.cursor()
+    try:
+        r = causality.impact(cur, memory_id)
+    except Exception as exc:
+        conn.close()
+        return {"error": str(exc)}
+    conn.close()
+    return {
+        "memory_id": r.memory_id,
+        "DIRECT": {"receipts": list(r.direct_receipts),
+                   "decisions": list(r.direct_decisions)},
+        "DERIVED": {"memories": list(r.derived_memories),
+                    "decisions": list(r.derived_decisions)},
+        "DERIVED_UNATTESTED": {
+            "memories": list(r.derived_unattested),
+            "note": ("a third party claimed descent from a decision it did "
+                     "not make — weaker than DERIVED, and reported apart "
+                     "from it so a shaped report cannot borrow its weight"),
+        },
+        "POSSIBLE": {"memories": list(r.possible_memories),
+                     "note": ("contact, not contamination — reported for "
+                              "analyst review, never auto-flagged")},
+        "edges": [list(e) for e in r.edges],
+        "impact_sha256": r.impact_sha256,
+    }
+
+
+@mcp.tool()
+def mneme_counterfactual(
+    query: str,
+    memory_ids: str,
+    direction: str = "containment",
+    actor_id: str = "",
+    top_k: int = 5,
+    hops: int = 2,
+) -> dict:
+    """
+    Measure what excluding a set of memories ACTUALLY changes — the exact,
+    sealed, reproducible causal delta between two worlds.
+
+    Containment usually ends with "we found the poison and excluded it",
+    which says what was done and not what it did. This answers the
+    counterfactual instead: given this sealed state, does removing those
+    memories change the agent's behaviour, and in exactly which outputs?
+
+    direction="containment"  W = as if those memories had never been
+        contained; W' = the field as it stands. Use AFTER an incident:
+        "this was the exact observable effect of the poison." This
+        direction WIDENS the custody gate, so it requires an actor_id
+        holding COUNTERFACTUAL — asking what the poison would have shown
+        is asking to see what containment took away.
+    direction="exclusion"    W = the field as it stands; W' = the same
+        field with those memories quarantined. Use BEFORE containing:
+        a forecast of the blast radius of your own quarantine.
+
+    The delta names removed_from_serving, entered_top_k, rank_changed,
+    score_changed, claim_outcome_changed (a topic whose winning claim
+    flips) and decision_dependency_changed. The first five are about THIS
+    query; the last is a field-wide fact about recorded decisions whose
+    evidence base moves, reported beside the verdict and never folded
+    into it.
+
+    An empty query-scoped delta is a real and unusual finding:
+    NON-INTERFERENCE — the poison was there, it was excluded, and for
+    this query it had changed nothing. Damage measured at zero rather
+    than assumed at unknown.
+
+    Changes nothing: no write, no status moved. A measurement that could
+    perturb its own subject would not be worth sealing.
+
+    Args:
+        query: The query text to compare the two worlds on.
+        memory_ids: Comma-separated ids to exclude / un-exclude.
+        direction: "containment" (default) or "exclusion".
+        actor_id: Required for "containment" — must hold COUNTERFACTUAL.
+            Not needed for "exclusion", which can only show you less than
+            you could already see.
+        top_k: Results compared (1-20).
+        hops: BFS expansion depth (0-4).
+
+    Returns:
+        The enumerated delta, both worlds' receipts, and the seal.
+    """
+    if not query.strip():
+        return {"error": "query must be non-empty."}
+    ids = [_sanitize_id(m.strip(), "memory_id")
+           for m in memory_ids.split(",") if m.strip()]
+    if not ids:
+        return {"error": "memory_ids must name at least one memory."}
+    if direction not in ("containment", "exclusion"):
+        return {"error": "direction must be 'containment' or 'exclusion'."}
+    top_k = max(1, min(int(top_k), 20))
+    hops = max(0, min(int(hops), 4))
+    q = _deterministic_embedding(_trunc(query))
+
+    conn = _get_conn()
+    cur = conn.cursor()
+    try:
+        if direction == "containment":
+            d = counterfactual.containment_effect(
+                cur, query_embedding=q, contained=ids, top_k=top_k, hops=hops,
+                actor_id=_sanitize_id(actor_id, "actor_id") if actor_id else None)
+        else:
+            d = counterfactual.exclusion_effect(
+                cur, query_embedding=q, excluded=ids, top_k=top_k, hops=hops)
+    except Exception as exc:
+        conn.close()
+        return {"error": str(exc)}
+    conn.close()
+    return {
+        "direction": direction,
+        "verdict": d.summary(),
+        "interference": d.interference,
+        "query_scoped": {
+            "removed_from_serving": list(d.removed_from_serving),
+            "entered_top_k": list(d.entered_top_k),
+            "rank_changed": [list(x) for x in d.rank_changed],
+            "score_changed": [list(x) for x in d.score_changed],
+            "claim_outcome_changed": [list(x) for x in d.claim_outcome_changed],
+        },
+        "field_wide": {
+            "decision_dependency_changed": list(d.decision_dependency_changed),
+            "note": ("recorded decisions whose evidence base this change "
+                     "moves — most from other queries; reported beside the "
+                     "verdict, never folded into it"),
+        },
+        "worlds": {
+            "A": {"override": [list(p) for p in d.world_a_override],
+                  "served": list(d.served_a),
+                  "receipt_sha256": d.receipt_a_sha256},
+            "B": {"override": [list(p) for p in d.world_b_override],
+                  "served": list(d.served_b),
+                  "receipt_sha256": d.receipt_b_sha256},
+        },
+        "delta_sha256": d.delta_sha256,
+    }
+
+
+@mcp.tool()
+def mneme_exposure(memory_ids: str = "") -> dict:
+    """
+    Influence exposure: spend an exact rational budget outward from the
+    tainted set and grade what it reaches.
+
+    Transitive taint is real, and propagating it automatically is how one
+    quarantine silences a whole field — resonance graphs are connected in
+    practice. The answer is not to propagate more carefully but to stop
+    equating contact with contamination:
+
+      DIRECT_TAINT       evidence names this memory (a sweep flagged it,
+                         or an analyst quarantined it).
+      INFLUENCE_EXPOSED  a RESONANT path carries at least the floor of
+                         influence to it, reported WITH its exact budget
+                         ("1/2", "1/8") so "how exposed" is a number.
+      CLEAN              neither.
+
+    A RESONANT edge conveys half of whatever reaches its source; anything
+    below the floor is dropped. Termination is structural, not a
+    visited-set trick: influence strictly decreases per edge, so no path
+    beyond the derived depth bound can contribute, and cycles are
+    harmless. INHIBITORY edges convey nothing — being disagreed with by a
+    poisoned memory is not being influenced by it.
+
+    Writes nothing and flags nothing. INFLUENCE_EXPOSED is a finding for
+    an analyst, never a custody status; quarantining on contact would
+    make the response indistinguishable from the incident.
+
+    Args:
+        memory_ids: Optional comma-separated hypothetical sources ("if
+            THESE were poisoned, who is exposed"). Empty uses the field's
+            own evidence: everything currently TAINT_FLAGGED or
+            QUARANTINED.
+
+    Returns:
+        The graded sets with exact budgets, and a reproducible seal.
+    """
+    ids = [_sanitize_id(m.strip(), "memory_id")
+           for m in memory_ids.split(",") if m.strip()] or None
+    conn = _get_conn()
+    cur = conn.cursor()
+    try:
+        r = trust.influence_exposure(cur, sources=ids)
+    except Exception as exc:
+        conn.close()
+        return {"error": str(exc)}
+    conn.close()
+    return {
+        "DIRECT_TAINT": list(r.direct_taint),
+        "INFLUENCE_EXPOSED": [{"memory_id": m, "influence": b}
+                              for m, b in r.exposed],
+        "CLEAN": list(r.clean),
+        "budget": {"transfer_per_resonant_edge": r.transfer,
+                   "floor": r.floor, "max_depth": r.max_depth,
+                   "note": ("INHIBITORY edges convey nothing; the depth bound "
+                            "is derived from the floor, not configured apart")},
+        "taint_protocol": r.taint_protocol,
+        "exposure_sha256": r.exposure_sha256,
+        "note": ("INFLUENCE_EXPOSED is a finding, not a custody status — "
+                 "nothing here was flagged, and nothing was written"),
+    }
+
+
+@mcp.tool()
+def mneme_embeddings() -> dict:
+    """
+    Embedding provenance: what produced the vectors this field ranks on,
+    and whether any of it has drifted underneath you.
+
+    The boundary has not moved and this tool does not pretend otherwise:
+    nothing here proves a model computed a vector honestly, and no hash
+    can. What the provenance record makes possible is the one thing a
+    bare model-name string could not. For a fixed (provider, model,
+    revision, preprocessing) and a fixed input, the output vector is
+    supposed to be a FUNCTION. Two memories agreeing on the left and
+    differing on the right are proof that something changed underneath —
+    a silent model update, a changed tokenizer, nondeterministic
+    inference — and the field can now say so instead of ranking two
+    incomparable vectors against each other and calling it similarity.
+
+    More than one (provider, model, revision) in the inventory means the
+    field is mixing vector spaces. That is a migration whether or not
+    anyone called it one.
+
+    Returns:
+        The inventory, any detected drift, and the quantization protocol.
+    """
+    conn = _get_conn()
+    cur = conn.cursor()
+    try:
+        inv = field.embedding_inventory(cur)
+        drift = field.detect_embedding_drift(cur)
+    except Exception as exc:
+        conn.close()
+        return {"error": str(exc)}
+    conn.close()
+    families = {(r["provider"], r["model"], r["revision"])
+                for r in inv if r["model"] is not None}
+    return {
+        "inventory": inv,
+        "distinct_model_families": len(families),
+        "mixing_vector_spaces": len(families) > 1,
+        "drift": drift,
+        "drift_detected": bool(drift),
+        "quantization_protocol": field.QUANTIZATION_PROTOCOL,
+        "boundary": ("quantization makes model output exact FROM THAT POINT "
+                     "ON; it cannot make the model deterministic. Drift here "
+                     "is detectable, not preventable."),
+    }
+
+
+@mcp.tool()
+def mneme_assert_claim(
+    statement: str,
+    actor_id: str,
+    reason: str,
+    topic: str = "",
+    claim_id: str = "",
+) -> dict:
+    """
+    Assert a PROPOSITION, as an object distinct from any document.
+
+    A memory is a container: this text was stored, by this actor, with
+    this chain. A claim is what someone says is true. Conflating them
+    works only while every proposition lives in exactly one document and
+    every document asserts exactly one proposition — neither of which is
+    true of anything real.
+
+    The claim gets its own hash chain, genesis-bound to its id, and its
+    statement is immutable (revision is supersession, an event, never an
+    edit). Requires ASSERT — a capability distinct from STORE, because
+    saying something is true is not the same act as filing a document.
+
+    Args:
+        statement: The proposition, in words.
+        actor_id: Who asserts it — must hold ASSERT.
+        reason: Why (mandatory — an unreasoned epistemic act cannot exist).
+        topic: Optional grouping, e.g. "release-date".
+        claim_id: Optional explicit id.
+
+    Returns:
+        The claim id and its statement hash.
+    """
+    actor_id = _sanitize_id(actor_id, "actor_id")
+    if not statement.strip():
+        return {"error": "statement must be non-empty."}
+    if not reason.strip():
+        return {"error": "reason must be non-empty."}
+    conn = _get_conn()
+    cur = conn.cursor()
+    try:
+        cid = claims.assert_claim(
+            cur, statement=_trunc(statement), actor_id=actor_id,
+            reason=_trunc(reason, 512), topic=topic or None,
+            claim_id=_sanitize_id(claim_id, "claim_id") if claim_id else None)
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        conn.close()
+        return {"error": str(exc)}
+    conn.close()
+    return {"claim_id": cid,
+            "statement_sha256": claims.statement_sha256(_trunc(statement)),
+            "state": "ASSERTED"}
+
+
+@mcp.tool()
+def mneme_link_evidence(
+    claim_id: str,
+    memory_id: str,
+    stance: str,
+    actor_id: str,
+    reason: str,
+) -> dict:
+    """
+    Record that a memory supports or contradicts a claim.
+
+    Links live on the CLAIM's chain, not the memory's: a claim is about
+    memories, memories are not about claims, and a document whose history
+    grew with every proposition that ever cited it would be carrying the
+    epistemic unit's weight all over again.
+
+    A tainted memory may be linked — "this claim rests on material we
+    later quarantined" is exactly what an incident review needs to say.
+    What the gate does is refuse to COUNT it: standing reads only CLEAN
+    evidence and reports the rest separately.
+
+    Args:
+        claim_id: The proposition.
+        memory_id: The artifact.
+        stance: SUPPORTS or CONTRADICTS.
+        actor_id: Who links it — must hold ASSERT.
+        reason: Why (mandatory).
+
+    Returns:
+        The claim's recomputed standing.
+    """
+    conn = _get_conn()
+    cur = conn.cursor()
+    try:
+        claims.link_evidence(
+            cur, claim_id=_sanitize_id(claim_id, "claim_id"),
+            memory_id=_sanitize_id(memory_id, "memory_id"),
+            stance=stance.strip().upper(),
+            actor_id=_sanitize_id(actor_id, "actor_id"),
+            reason=_trunc(reason, 512))
+        conn.commit()
+        st = claims.standing(cur, claim_id)
+    except Exception as exc:
+        conn.rollback()
+        conn.close()
+        return {"error": str(exc)}
+    conn.close()
+    return {"claim_id": st.claim_id, "state": st.state,
+            "supporting": list(st.supporting),
+            "contradicting": list(st.contradicting),
+            "withheld_evidence": [list(x) for x in st.withheld_evidence]}
+
+
+@mcp.tool()
+def mneme_relate_claims(
+    from_claim: str,
+    to_claim: str,
+    relation: str,
+    actor_id: str,
+    reason: str,
+) -> dict:
+    """
+    Relate two propositions: SUPPORTS, CONTRADICTS, SUPERSEDES or
+    DERIVED_FROM. Bilateral — the event lands on both chains, one marked
+    OUT and one IN, so neither party's export can hide a relationship the
+    other records. Requires ASSERT.
+
+    Args:
+        from_claim: The subject claim.
+        to_claim: The object claim.
+        relation: SUPPORTS, CONTRADICTS, SUPERSEDES or DERIVED_FROM.
+        actor_id: Who relates them — must hold ASSERT.
+        reason: Why (mandatory).
+
+    Returns:
+        Confirmation of the bilateral relation.
+    """
+    conn = _get_conn()
+    cur = conn.cursor()
+    try:
+        claims.relate(cur, from_claim=_sanitize_id(from_claim, "from_claim"),
+                      to_claim=_sanitize_id(to_claim, "to_claim"),
+                      relation=relation.strip().upper(),
+                      actor_id=_sanitize_id(actor_id, "actor_id"),
+                      reason=_trunc(reason, 512))
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        conn.close()
+        return {"error": str(exc)}
+    conn.close()
+    return {"from_claim": from_claim, "to_claim": to_claim,
+            "relation": relation.strip().upper(), "bilateral": True}
+
+
+@mcp.tool()
+def mneme_claim_set(
+    claim_ids: str,
+    constraint_type: str,
+    actor_id: str,
+    reason: str,
+    topic: str = "",
+) -> dict:
+    """
+    Declare that a group of claims is mutually constrained — n-ary
+    contradiction, because "A contradicts B" is too poor for a date that
+    is one of three candidates.
+
+      AT_MOST_ONE   at most one member may hold
+      EXACTLY_ONE   exactly one member must hold
+      INCOMPATIBLE  they cannot ALL hold together — weaker, and often the
+                    only thing actually known
+
+    The member list is sealed and every member's chain records its
+    membership, so the set is re-derivable from evidence rather than
+    trusted to one row. Requires ASSERT.
+
+    Args:
+        claim_ids: Comma-separated claim ids (at least two).
+        constraint_type: AT_MOST_ONE, EXACTLY_ONE or INCOMPATIBLE.
+        actor_id: Who declares it — must hold ASSERT for a set of OPEN
+            hypotheses, or ADJUDICATE if any member is already VALIDATED,
+            because binding a settled claim back into dispute re-opens an
+            adjudicated question. Without that price, anyone holding
+            ASSERT could fill a reviewer's queue for free.
+        reason: Why these are mutually constrained (mandatory).
+        topic: Optional grouping.
+
+    Returns:
+        The set id and its current evaluation.
+    """
+    ids = [_sanitize_id(c.strip(), "claim_id")
+           for c in claim_ids.split(",") if c.strip()]
+    conn = _get_conn()
+    cur = conn.cursor()
+    try:
+        sid = claims.declare_set(
+            cur, members=ids, constraint_type=constraint_type.strip().upper(),
+            actor_id=_sanitize_id(actor_id, "actor_id"),
+            reason=_trunc(reason, 512), topic=topic or None)
+        conn.commit()
+        ev = claims.evaluate_set(cur, sid)
+    except Exception as exc:
+        conn.rollback()
+        conn.close()
+        return {"error": str(exc)}
+    conn.close()
+    return {"set_id": sid, "constraint_type": ev.constraint_type,
+            "members": list(ev.members), "status": ev.status,
+            "explanation": ev.explanation,
+            "members_sha256": ev.members_sha256}
+
+
+@mcp.tool()
+def mneme_resolve_set(
+    set_id: str,
+    validate: str,
+    refute: str,
+    actor_id: str,
+    reason: str,
+) -> dict:
+    """
+    Decide between hypotheses, as ONE audited operation over the whole
+    set. Requires ADJUDICATE — a capability distinct from ASSERT, because
+    ruling between competing claims is not the same act as making one.
+
+    The resolution must LEAVE THE CONSTRAINT SATISFIED, checked after the
+    writes in the same transaction: a partial resolution that still
+    violates its own constraint is refused, so the field never records an
+    adjudication that settled nothing.
+
+    Rescuing a validated truth used to be surgery on an arbitrary
+    inhibitory pair. Here it is what it always was — choosing among the
+    hypotheses, on the record, with the constraint as the check.
+
+    Args:
+        set_id: The constrained set.
+        validate: Comma-separated members that hold (may be empty).
+        refute: Comma-separated members that do not (may be empty).
+        actor_id: Who adjudicates — must hold ADJUDICATE.
+        reason: The grounds (mandatory — this is the ruling's rationale).
+
+    Returns:
+        The set's evaluation after the resolution.
+    """
+    v = [_sanitize_id(c.strip(), "claim_id") for c in validate.split(",") if c.strip()]
+    r = [_sanitize_id(c.strip(), "claim_id") for c in refute.split(",") if c.strip()]
+    conn = _get_conn()
+    cur = conn.cursor()
+    try:
+        ev = claims.resolve_set(
+            cur, set_id=_sanitize_id(set_id, "set_id"), validate=v, refute=r,
+            actor_id=_sanitize_id(actor_id, "actor_id"),
+            reason=_trunc(reason, 512))
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        conn.close()
+        return {"error": str(exc)}
+    conn.close()
+    return {"set_id": ev.set_id, "status": ev.status,
+            "explanation": ev.explanation,
+            "member_states": [list(x) for x in ev.member_states]}
+
+
+@mcp.tool()
+def mneme_claim(claim_id: str) -> dict:
+    """
+    What the field can say about a proposition, recomputed from evidence.
+
+    Nothing here is stored. A persisted confidence is a number whose
+    derivation has been thrown away, and a number whose derivation is gone
+    is what an audit cannot use — so standing is derived every time it is
+    asked for, from the claim's chain and the current custody status of
+    every artifact linked to it.
+
+    Evidence whose memory is not CLEAN is excluded from the counts and
+    reported separately: the gate that keeps a quarantined memory out of
+    recall keeps it out of the epistemic tally too.
+
+    Args:
+        claim_id: The proposition.
+
+    Returns:
+        Its provenance, its evidence, its constraints, and a seal over
+        the whole standing.
+    """
+    conn = _get_conn()
+    cur = conn.cursor()
+    try:
+        st = claims.standing(cur, _sanitize_id(claim_id, "claim_id"))
+    except Exception as exc:
+        conn.close()
+        return {"error": str(exc)}
+    conn.close()
+    return {
+        "claim_id": st.claim_id,
+        "statement": st.statement,
+        "state": st.state,
+        "provenance": {"asserted_by": st.asserted_by,
+                       "asserted_at": st.asserted_at},
+        "evidence": {"supporting": list(st.supporting),
+                     "contradicting": list(st.contradicting),
+                     "withheld": [list(x) for x in st.withheld_evidence]},
+        "relations": [list(r) for r in st.relations],
+        "constrained_by": [{"set_id": e.set_id,
+                            "constraint_type": e.constraint_type,
+                            "status": e.status,
+                            "explanation": e.explanation}
+                           for e in st.set_evaluations],
+        "standing_sha256": st.standing_sha256,
+        "note": ("derived from evidence, never stored — ask again after the "
+                 "evidence moves and this changes"),
+    }
+
+
+@mcp.tool()
 def mneme_export_bundle(memory_ids: str = "") -> dict:
     """
     Export a sealed evidence bundle as JSON.
@@ -488,7 +1545,7 @@ def mneme_export_bundle(memory_ids: str = "") -> dict:
     sweeps, and a Merkle root over all chain heads.
 
     Send the bundle + verify_offline.py to anyone who distrusts the
-    system. They can verify B1-B6 checks with nothing but stdlib Python.
+    system. They can verify B0-B9 checks with nothing but stdlib Python.
 
     Args:
         memory_ids: Comma-separated list of memory IDs to export.
@@ -522,19 +1579,24 @@ def mneme_export_bundle(memory_ids: str = "") -> dict:
 @mcp.tool()
 def mneme_verify_bundle(bundle_json: str) -> dict:
     """
-    Verify a MNEME evidence bundle (B1-B6 checks).
+    Verify a MNEME evidence bundle (B0-B9 checks).
 
     This is the forensic handoff tool: an auditor who distrusts the
     entire deployment can call this with a bundle received from any
     source and get a structured verdict.
 
     Checks performed:
-      B1 — Content hash matches stored content
-      B2 — Custody chain linkage and temporal ordering
-      B3 — Entry hash recomputes from its fields
-      B4 — State is derivable from replaying the chain
-      B5 — Taint sweep seals match the flagged sets
+      B0 — the bundle declares the VERSION of every semantics its checks
+           depend on, and this verifier implements each one
+      B1 — bundle seal recomputes over the canonical body
+      B2 — custody chain linkage, genesis binding, temporal ordering
+      B3 — content hashes to the seal in its birth event
+      B4 — state is derivable from replaying the chain
+      B5 — taint sweep seals match the flagged sets
       B6 — Merkle root over chain heads
+      B7 — AUTHORITY PROVENANCE: every event was not merely recorded but
+           authorized, by a grant that was live at that instant, issued by
+           someone who held it, traceable to the root
 
     Args:
         bundle_json: The full JSON bundle string to verify.
@@ -545,12 +1607,16 @@ def mneme_verify_bundle(bundle_json: str) -> dict:
     if not bundle_json or not bundle_json.strip():
         return {"error": "bundle_json must be non-empty."}
 
-    ok, errors = bundle.verify_bundle(bundle_json)
+    ok, errors, notes = bundle.verify_bundle_verbose(bundle_json)
     return {
         "verified": ok,
         "errors": errors,
+        # Claims a PASSING verdict must SHOW rather than bury: declared
+        # sweep exclusions, the semantics checked, and any events nobody
+        # was ever authorized to cause.
+        "notes": notes,
         "verdict": (
-            "VERIFIED: every check (B1-B6) passed."
+            "VERIFIED: every check (B0-B9) passed."
             if ok else
             f"FAILED: {len(errors)} problem(s) detected."
         ),
@@ -616,6 +1682,8 @@ def mneme_info() -> dict:
     state_dist = dict(cur.fetchall())
     cur.execute("SELECT COUNT(*) FROM actors")
     actors = cur.fetchone()[0]
+    ledger = authority.ledger_exists(cur)
+    root_actor = authority.root_subject(cur) if ledger else None
     conn.close()
 
     return {
@@ -633,6 +1701,23 @@ def mneme_info() -> dict:
             "M4": "Nothing is deleted. QUARANTINED/TAINT_FLAGGED/SUPERSEDED are states.",
             "M5": "Floats never decide. Confidence is Fraction; Decimal at hash boundary.",
         },
+        "authority": {
+            "model": ("Capabilities, not roles. Every mutation carries two "
+                      "separable proofs: integrity provenance (the per-memory "
+                      "custody chain) and authority provenance (a grant that "
+                      "was live at that instant, on the per-actor authority "
+                      "chain). Neither implies the other."),
+            "A1": "Every event sealed under the ledger names the grant it acted under.",
+            "A2": "Authority chains are per-actor, append-only, genesis-bound to actor_id.",
+            "A3": "No amplification: a grantor may only grant what it holds.",
+            "A4": "Revocation is an event, never a deletion; past acts stay authorized.",
+            "A5": "A QUARANTINED actor holds no capability — a write barrier, not a sweep note.",
+            "A6": "The last grant conferring GRANT cannot be revoked.",
+            "ledger": ledger,
+            "root_actor": root_actor,
+            "capability_vocabulary": sorted(authority.CAPABILITIES),
+        },
+        "protocols": dict(protocol.CURRENT_PROTOCOLS),
         "custody_statuses": {
             "CLEAN": "Servable — visible to recall",
             "TAINT_FLAGGED": "Actor quarantine propagated — invisible, rehabilitable",
