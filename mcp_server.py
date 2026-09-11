@@ -1080,6 +1080,70 @@ def mneme_counterfactual(
 
 
 @mcp.tool()
+def mneme_exposure(memory_ids: str = "") -> dict:
+    """
+    Influence exposure: spend an exact rational budget outward from the
+    tainted set and grade what it reaches.
+
+    Transitive taint is real, and propagating it automatically is how one
+    quarantine silences a whole field — resonance graphs are connected in
+    practice. The answer is not to propagate more carefully but to stop
+    equating contact with contamination:
+
+      DIRECT_TAINT       evidence names this memory (a sweep flagged it,
+                         or an analyst quarantined it).
+      INFLUENCE_EXPOSED  a RESONANT path carries at least the floor of
+                         influence to it, reported WITH its exact budget
+                         ("1/2", "1/8") so "how exposed" is a number.
+      CLEAN              neither.
+
+    A RESONANT edge conveys half of whatever reaches its source; anything
+    below the floor is dropped. Termination is structural, not a
+    visited-set trick: influence strictly decreases per edge, so no path
+    beyond the derived depth bound can contribute, and cycles are
+    harmless. INHIBITORY edges convey nothing — being disagreed with by a
+    poisoned memory is not being influenced by it.
+
+    Writes nothing and flags nothing. INFLUENCE_EXPOSED is a finding for
+    an analyst, never a custody status; quarantining on contact would
+    make the response indistinguishable from the incident.
+
+    Args:
+        memory_ids: Optional comma-separated hypothetical sources ("if
+            THESE were poisoned, who is exposed"). Empty uses the field's
+            own evidence: everything currently TAINT_FLAGGED or
+            QUARANTINED.
+
+    Returns:
+        The graded sets with exact budgets, and a reproducible seal.
+    """
+    ids = [_sanitize_id(m.strip(), "memory_id")
+           for m in memory_ids.split(",") if m.strip()] or None
+    conn = _get_conn()
+    cur = conn.cursor()
+    try:
+        r = trust.influence_exposure(cur, sources=ids)
+    except Exception as exc:
+        conn.close()
+        return {"error": str(exc)}
+    conn.close()
+    return {
+        "DIRECT_TAINT": list(r.direct_taint),
+        "INFLUENCE_EXPOSED": [{"memory_id": m, "influence": b}
+                              for m, b in r.exposed],
+        "CLEAN": list(r.clean),
+        "budget": {"transfer_per_resonant_edge": r.transfer,
+                   "floor": r.floor, "max_depth": r.max_depth,
+                   "note": ("INHIBITORY edges convey nothing; the depth bound "
+                            "is derived from the floor, not configured apart")},
+        "taint_protocol": r.taint_protocol,
+        "exposure_sha256": r.exposure_sha256,
+        "note": ("INFLUENCE_EXPOSED is a finding, not a custody status — "
+                 "nothing here was flagged, and nothing was written"),
+    }
+
+
+@mcp.tool()
 def mneme_export_bundle(memory_ids: str = "") -> dict:
     """
     Export a sealed evidence bundle as JSON.
