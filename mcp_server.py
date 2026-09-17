@@ -50,6 +50,7 @@ import os
 import sqlite3
 import sys
 import uuid
+import anyio
 from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path
@@ -1738,4 +1739,6 @@ def mneme_info() -> dict:
 
 if __name__ == "__main__":
     log.info("MNEME MCP server starting — db=%s", _DB_PATH)
-    mcp.run()
+    # Use Trio for the stdio bridge; the asyncio backend can hang before
+    # initialize completes with the SDK version supported by this server.
+    anyio.run(mcp.run_stdio_async, backend="trio")
